@@ -305,6 +305,27 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
         process.exit(1);
       }
       config.port = port;
+    } else if (arg === "--persist-proxy") {
+      // Run the translation proxy as a detached daemon that outlives this
+      // launcher, so a Claude Code session backgrounded past our exit keeps its
+      // non-native routing instead of reverting to native opus.
+      config.persistProxy = true;
+    } else if (arg === "--proxy-idle-timeout") {
+      // Minutes of no traffic before the persistent daemon self-terminates.
+      const idleArg = args[++i];
+      // parseFloat is too permissive for a value that silently disables the
+      // shutdown timer when it goes wrong: it accepts "Infinity" (which
+      // JSON.stringify then serialises to null, so the daemon installs NO timer
+      // and never exits) and takes the numeric prefix of "10garbage". Require
+      // the whole token to be a finite number, and reject a value that rounds
+      // away to zero milliseconds.
+      const mins = idleArg !== undefined ? Number(idleArg) : Number.NaN;
+      const ms = Math.round(mins * 60 * 1000);
+      if (!idleArg || !Number.isFinite(mins) || mins <= 0 || ms <= 0) {
+        console.error("--proxy-idle-timeout requires a positive, finite number of minutes");
+        process.exit(1);
+      }
+      config.proxyIdleTimeoutMs = ms;
     } else if (arg === "--auto-approve" || arg === "-y") {
       config.autoApprove = true;
     } else if (arg === "--no-auto-approve") {
@@ -791,6 +812,22 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
           writeFileSync(markerFile, new Date().toISOString(), "utf-8");
         } catch {}
       }
+    }
+  } catch {}
+
+  // Persistent-proxy daemon settings: CLI flag > env > config file (default off).
+  try {
+    const fc = loadConfig();
+    if (config.persistProxy === undefined) {
+      const envPersist = process.env.CLAUDISH_PERSIST_PROXY;
+      if (envPersist !== undefined) {
+        config.persistProxy = envPersist === "1" || envPersist.toLowerCase() === "true";
+      } else if (typeof fc.persistProxy === "boolean") {
+        config.persistProxy = fc.persistProxy;
+      }
+    }
+    if (config.proxyIdleTimeoutMs === undefined && typeof fc.proxyIdleTimeoutMs === "number") {
+      config.proxyIdleTimeoutMs = fc.proxyIdleTimeoutMs;
     }
   } catch {}
 
@@ -2116,6 +2153,11 @@ ${h("OPTIONS")}
   ${green("--op")} ${yellow("<glob>")} ${green("--list")}      Preview which fields the glob would import (names only, no values)
   ${green("--op-env")} ${yellow("<id>")}            Load env vars from a 1Password Environment (highest priority)
   ${green("--port")} ${yellow("<port>")}            Proxy server port (default: random)
+  ${green("--persist-proxy")}          Run the proxy as a detached daemon that outlives claudish
+                           ${dim("so a backgrounded Claude Code session keeps its routing (not opus).")}
+                           ${dim('Also: "persistProxy": true in config.json or CLAUDISH_PERSIST_PROXY=1')}
+  ${green("--proxy-idle-timeout")} ${yellow("<min>")} Idle minutes before the persistent daemon self-exits (default 10)
+                           ${dim("Manage daemons with: claudish proxy list | claudish proxy stop [<port>|--all]")}
   ${green("-d, --debug-claudish")}     Enable claudish debug logging to file (logs/claudish_*.log)
                            ${dim('Always-on: CLAUDISH_DEBUG=1 env var or "debug": true in config.json')}
   ${green("--no-debug-claudish")}      Force debug logging off for this run (when globally enabled)

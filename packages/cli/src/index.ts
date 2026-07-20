@@ -43,7 +43,16 @@ function classifyStartupKind(): string {
     "quota",
     "usage",
   ]);
-  if ((first && management.has(first)) || argv.includes("--mcp") || first === "serve") {
+  // `--proxy-daemon` is a long-lived server process, not a launch: it runs until
+  // its idle timer fires, so recording its lifetime as a startup duration would
+  // report a 10-minute "start" and skew the slow-start metrics it feeds.
+  if (
+    (first && management.has(first)) ||
+    argv.includes("--mcp") ||
+    argv.includes("--proxy-daemon") ||
+    first === "serve" ||
+    first === "proxy"
+  ) {
     return "other";
   }
   return "run";
@@ -259,9 +268,28 @@ async function applyConfigOverride(): Promise<void> {
   process.env.CLAUDISH_CONFIG = plan.path;
 }
 
+// Persistent-proxy daemon body (`claudish --proxy-daemon <configJson>`). It
+// inherits the launcher's already-resolved env and runs with no TTY, so it must
+// NOT re-trigger op:// hydration (which could prompt for a 1Password account).
+const isProxyDaemon = process.argv.includes("--proxy-daemon");
+
+// `claudish proxy …` manages daemons; it never routes a request, so it needs no
+// provider credentials. Detected HERE, before op:// hydration, because that
+// hydration can fail hard (desktop app unavailable, account not authorised) —
+// and it would then take down the very command you reach for to inspect or kill
+// a runaway daemon. A recovery path must not depend on the thing that broke.
+const isProxyManagementCommand = process.argv.slice(2).find((a) => !a.startsWith("-")) === "proxy";
+
+// The config override runs for the daemon TOO, unlike the op:// steps below.
+// It is not merely an env var: setConfigFileOverride() installs process-wide
+// in-process state that every config reader consults, and the daemon is a fresh
+// process that inherits CLAUDISH_CONFIG but not that state.
 await traceSpan("startup:config-override", () => applyConfigOverride());
-await traceSpan("startup:op-env-flags", () => applyOpEnvironment());
-await traceSpan("startup:op-import-flag", () => applyOpImport());
+
+if (!isProxyDaemon && !isProxyManagementCommand) {
+  await traceSpan("startup:op-env-flags", () => applyOpEnvironment());
+  await traceSpan("startup:op-import-flag", () => applyOpImport());
+}
 
 // Check for MCP mode before loading heavy dependencies
 const isMcpMode = process.argv.includes("--mcp");
@@ -276,6 +304,36 @@ function handlePromptExit(err: unknown): void {
 }
 
 /**
+ * Read classifier counters from a persistent daemon's health endpoint.
+ *
+ * The daemon is a separate, detached process: it does not share the launcher's
+ * memory, and its stdio goes to /dev/null. `/__claudish/health` is the one
+ * channel that crosses that boundary. Best-effort — a daemon that already idled
+ * out is a normal outcome, not an error worth reporting.
+ */
+async function fetchDaemonClassifierStats(url: string): Promise<ClassifierStats | undefined> {
+  try {
+    const res = await fetch(`${url}/__claudish/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return undefined;
+    const health = (await res.json()) as { classifier?: Partial<ClassifierStats> };
+    if (!health.classifier?.enabled) return undefined;
+    return {
+      enabled: true,
+      model: health.classifier.model,
+      hits: health.classifier.hits ?? 0,
+      shapeMisses: health.classifier.shapeMisses ?? 0,
+      shapeMismatches: health.classifier.shapeMismatches ?? 0,
+      // The daemon logs its own warnings; they do not travel over health.
+      warnings: [],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Surface classifier-passthrough diagnostics once Claude Code has exited.
  *
  * Two failures this makes visible, both otherwise silent:
@@ -287,13 +345,23 @@ function handlePromptExit(err: unknown): void {
  * suppress a security control reporting that it did not fire — and single-shot
  * runs are quiet by default, which is exactly where nobody is watching.
  */
-function reportClassifierOutcome(stats: ClassifierStats | undefined, interactive?: boolean): void {
+function reportClassifierOutcome(
+  stats: ClassifierStats | undefined,
+  interactive?: boolean,
+  sharedProxy?: boolean
+): void {
   if (!stats?.enabled) return;
   const write = interactive ? console.log : console.error;
 
   for (const warning of stats.warnings) {
     write(`\n[claudish] WARNING — classifier passthrough: ${warning}`);
   }
+
+  // A persistent daemon outlives the launcher and can serve several sessions,
+  // so its counters are cumulative for the daemon, not for this run. "Zero"
+  // there means "never, on this daemon" — still worth saying, but only when it
+  // is unambiguous, so skip the claim once any request has been seen.
+  if (sharedProxy && stats.hits > 0) return;
 
   if (stats.hits === 0 && stats.warnings.length === 0) {
     write(
@@ -322,6 +390,8 @@ const isTelemetryCommand = firstPositional === "telemetry";
 const isStatsCommand = firstPositional === "stats";
 // Check for interactive config TUI
 const isConfigCommand = firstPositional === "config";
+// Proxy daemon management: claudish proxy list|stop [<port>|--all]
+const isProxyCommand = firstPositional === "proxy";
 // Serve subcommand: claudish serve --port <n> --models <path> (Claude Desktop redirect gateway)
 const isServeCommand = firstPositional === "serve";
 // Providers subcommand: claudish providers --json (credential presence, no key material)
@@ -342,7 +412,23 @@ const isQuotaCommand = firstPositional === "quota" || firstPositional === "usage
 const isLegacyKimiLogin = args.includes("--kimi-login");
 const isLegacyKimiLogout = args.includes("--kimi-logout");
 
-if (isMcpMode) {
+if (isProxyDaemon) {
+  // Detached persistent-proxy daemon body. Runs createProxyServer with an idle
+  // timeout and keeps the event loop alive via the HTTP server — never falls
+  // through to the normal CLI/Claude Code path.
+  import("./proxy-daemon.js").then((m) =>
+    m.runProxyDaemon(m.daemonConfigFromArgv(process.argv) ?? "{}")
+  );
+} else if (isProxyCommand) {
+  // Proxy daemon management: claudish proxy list|stop [<port>|--all]
+  const proxyArgIndex = args.indexOf("proxy");
+  import("./proxy-command.js").then((m) =>
+    m.proxyCommand(args.slice(proxyArgIndex + 1)).catch((e) => {
+      console.error(`[claudish proxy] ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    })
+  );
+} else if (isMcpMode) {
   // MCP server mode - dynamic import to keep CLI fast. Provider keys (incl.
   // op://) are resolved ON DEMAND by the credential authority when a tool routes
   // a model — no startup hydration, so the server can never die at boot on a
@@ -957,8 +1043,37 @@ async function runCli() {
       }
     }
 
-    const proxy = await traceSpan("startup:proxy-start", () =>
-      createProxyServer(
+    // Persistent-proxy mode: run the proxy as a DETACHED daemon that outlives
+    // this launcher, so a Claude Code session backgrounded past our exit keeps
+    // its non-native routing (e.g. opus→cx@gpt-5.6-sol) instead of reverting to
+    // native opus. Incompatible with monitor mode (a foreground diagnostic path).
+    const persistProxy = Boolean(cliConfig.persistProxy) && !cliConfig.monitor;
+    const idleTimeoutMs = cliConfig.proxyIdleTimeoutMs ?? 10 * 60 * 1000;
+
+    const proxy = await traceSpan("startup:proxy-start", () => {
+      if (persistProxy) {
+        return import("./proxy-daemon.js").then((m) =>
+          m.spawnProxyDaemon({
+            port,
+            model: explicitModel,
+            monitorMode: false,
+            modelMap,
+            summarizeTools: cliConfig.summarizeTools,
+            quiet: cliConfig.quiet,
+            isInteractive: cliConfig.interactive,
+            advisorModels: cliConfig.advisorModels,
+            advisorCollector: cliConfig.advisorCollector,
+            // Present only when `--model` was a pinned chain; the daemon needs it
+            // to build the same FallbackHandler the in-process proxy would.
+            modelChain: cliConfig.modelChain,
+            classifier: resolveClassifierConfig(cliConfig, process.env),
+            anthropicApiKey: cliConfig.anthropicApiKey,
+            idleTimeoutMs,
+            launcherPid: process.pid,
+          })
+        );
+      }
+      return createProxyServer(
         port,
         cliConfig.monitor ? undefined : cliConfig.openrouterApiKey!,
         cliConfig.monitor ? undefined : explicitModel,
@@ -976,8 +1091,15 @@ async function runCli() {
           modelChain: cliConfig.monitor ? undefined : cliConfig.modelChain,
           classifier: resolveClassifierConfig(cliConfig, process.env),
         }
-      )
-    );
+      );
+    });
+
+    if (persistProxy && !cliConfig.quiet) {
+      const write = cliConfig.interactive ? console.log : console.error;
+      write(
+        `[claudish] Persistent proxy daemon running at ${proxy.url} (survives exit; stop with 'claudish proxy stop ${port}')`
+      );
+    }
 
     // Route diagnostic output to log file
     const diag = createDiagOutput({
@@ -1006,14 +1128,27 @@ async function runCli() {
       // than drawing into Claude Code's terminal. Deliberately NOT gated on
       // `quiet`: single-shot runs are quiet by default, and a failed security
       // control has to be audible in exactly that unattended case.
-      reportClassifierOutcome(proxy.classifierStats?.(), cliConfig.interactive);
+      //
+      // In persist mode the counters live in the daemon, so they come over the
+      // health endpoint instead of the in-process accessor.
+      reportClassifierOutcome(
+        proxy.classifierStats?.() ?? (await fetchDaemonClassifierStats(proxy.url)),
+        cliConfig.interactive,
+        persistProxy
+      );
 
-      // Always cleanup proxy. Route claudish's own chatter to stderr in
-      // single-shot mode — stdout there carries Claude Code's machine-readable
-      // output (e.g. --output-format stream-json) that consumers parse line-by-line.
+      // Cleanup proxy. In persist mode `proxy.shutdown()` is a no-op — the
+      // detached daemon is meant to outlive us — so don't claim we're shutting
+      // it down. Route claudish's own chatter to stderr in single-shot mode —
+      // stdout there carries Claude Code's machine-readable output (e.g.
+      // --output-format stream-json) that consumers parse line-by-line.
       if (!cliConfig.quiet) {
         const write = cliConfig.interactive ? console.log : console.error;
-        write("\n[claudish] Shutting down proxy server...");
+        if (persistProxy) {
+          write(`\n[claudish] Leaving persistent proxy daemon running at ${proxy.url}`);
+        } else {
+          write("\n[claudish] Shutting down proxy server...");
+        }
       }
       await proxy.shutdown();
     }

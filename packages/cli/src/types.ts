@@ -106,6 +106,17 @@ export interface ClaudishConfig {
   // Advisor mode
   advisorModels?: string[]; // Advisor models from --advisor flag
   advisorCollector?: string | null; // Collector model (null = no synthesis)
+
+  // Persistent proxy daemon
+  /**
+   * --persist-proxy / config `persistProxy`. Run the translation proxy as a
+   * detached daemon that outlives this launcher, so a Claude Code session
+   * backgrounded past our exit keeps its non-native routing (e.g.
+   * opus→cx@gpt-5.6-sol) instead of reverting to native opus. See proxy-daemon.ts.
+   */
+  persistProxy?: boolean;
+  /** --proxy-idle-timeout <minutes> / config `proxyIdleTimeoutMs`. Idle ms before the daemon self-exits (default 10 min). */
+  proxyIdleTimeoutMs?: number;
 }
 
 // Anthropic API Types

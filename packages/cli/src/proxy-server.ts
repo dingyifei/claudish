@@ -115,6 +115,20 @@ export interface ProxyServerOptions {
    * disabled by default. See classifier-passthrough.ts.
    */
   classifier?: { enabled: boolean; model: string };
+  /**
+   * Idle self-shutdown (persistent-proxy daemon). When set, the proxy tracks
+   * the time of the last real client request (`/v1/*`) and, after this many
+   * ms with no traffic, closes the server and calls `onIdleTimeout` (or, if
+   * that's absent, `process.exit(0)`). Undefined disables the timer entirely —
+   * the default in-process launcher path is unaffected. See proxy-daemon.ts.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * Invoked when the idle timer fires (after the server is closed). The daemon
+   * uses this to remove its registry record before exiting. Only consulted when
+   * `idleTimeoutMs` is set.
+   */
+  onIdleTimeout?: () => void;
 }
 
 /**
@@ -193,6 +207,18 @@ function maybeCaptureClassifierRequest(c: Context, body: any): void {
   } catch {
     // Diagnostic capture is best-effort — never break the request path.
   }
+}
+
+/**
+ * One-line, secret-free description of what a proxy is routing, for the daemon
+ * health endpoint and `claudish proxy list`. Prefers the per-role opus mapping
+ * (the common `--model-opus cx@gpt-5.6-sol` case) then the default model.
+ */
+function healthModelSummary(
+  model?: string,
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; subagent?: string }
+): string {
+  return modelMap?.opus || model || modelMap?.sonnet || modelMap?.haiku || "(native)";
 }
 
 export async function createProxyServer(
@@ -912,6 +938,62 @@ export async function createProxyServer(
     return c.json(wrapAnthropicError(500, `Proxy error: ${err?.message ?? String(err)}`), 500);
   });
 
+  // Idle tracking for the persistent-proxy daemon. `lastRequestAt` advances on
+  // every real client request (paths under /v1/*) — NOT on health polls, so
+  // `claudish proxy list`/readiness checks never keep an idle daemon alive.
+  const startedAt = Date.now();
+  let lastRequestAt = startedAt;
+  // Filled in once serve() reports the actual bound port (below). Held in a ref
+  // so the /__claudish/health handler — which runs after startup — reads it.
+  const resolvedPortRef = { value: port };
+  // In-flight count, so the idle timer cannot shut down on top of live work.
+  // `lastRequestAt` alone is not enough: it advances when a request ARRIVES, so
+  // a long agent turn that started before the idle window would be torn down
+  // mid-response.
+  let inFlightRequests = 0;
+  if (options.idleTimeoutMs && options.idleTimeoutMs > 0) {
+    app.use("/v1/*", async (_c, next) => {
+      lastRequestAt = Date.now();
+      inFlightRequests++;
+      try {
+        await next();
+      } finally {
+        inFlightRequests--;
+        // Restamp on completion too, so the idle clock measures time since work
+        // ENDED rather than since it began.
+        lastRequestAt = Date.now();
+      }
+    });
+  }
+
+  // Daemon health/introspection endpoint. Used by spawnProxyDaemon's readiness
+  // poll and by `claudish proxy list`. Handled before any model routing so it
+  // never hits a provider. Does NOT count as activity (see /v1/* middleware).
+  app.get("/__claudish/health", (c) =>
+    c.json({
+      ok: true,
+      port: resolvedPortRef.value,
+      model: healthModelSummary(model, modelMap),
+      startedAt,
+      lastRequestAt,
+      idleTimeoutMs: options.idleTimeoutMs ?? null,
+      // Classifier counters ride the health endpoint because it is the only
+      // channel that crosses the daemon boundary: a detached daemon has no
+      // stdio and does not share the launcher's process. Consumers must treat
+      // these as CUMULATIVE for the daemon's lifetime — a shared daemon serves
+      // several sessions, so "zero this session" is a delta, not an absolute.
+      classifier: options.classifier?.enabled
+        ? {
+            enabled: true,
+            model: options.classifier.model,
+            hits: classifierHits,
+            shapeMisses: classifierShapeMisses,
+            shapeMismatches: classifierShapeMismatches,
+          }
+        : { enabled: false },
+    })
+  );
+
   app.get("/", (c) =>
     c.json({
       status: "ok",
@@ -1186,8 +1268,34 @@ export async function createProxyServer(
   // Bun types `port` as optional (a unix-socket server has none); for a TCP
   // listen it is always set. `port` 0 means "pick a free one", so read it back.
   const resolvedPort = server.port ?? port;
+  // Publish it for the health endpoint, which is registered before this runs.
+  resolvedPortRef.value = resolvedPort;
 
   log(`[Proxy] Server started on port ${resolvedPort}`);
+
+  // Idle self-shutdown timer (persistent-proxy daemon only). Polls periodically;
+  // when no /v1/* request has arrived for `idleTimeoutMs`, closes the server and
+  // hands off to `onIdleTimeout` (registry cleanup) or exits. Unref'd so the
+  // timer itself never keeps an otherwise-dead process alive.
+  let idleTimer: ReturnType<typeof setInterval> | undefined;
+  if (options.idleTimeoutMs && options.idleTimeoutMs > 0) {
+    const idleMs = options.idleTimeoutMs;
+    const checkEvery = Math.max(250, Math.min(idleMs, 30_000));
+    idleTimer = setInterval(() => {
+      if (Date.now() - lastRequestAt < idleMs) return;
+      // Never tear down on top of live work, however long it has been running.
+      if (inFlightRequests > 0) return;
+      log(`[Proxy] Idle for ${idleMs}ms with no traffic — shutting down.`);
+      if (idleTimer) clearInterval(idleTimer);
+      // Graceful stop (no `true`): let any connection that slipped in between
+      // the check and here finish rather than truncating its response.
+      void server.stop().then(() => {
+        if (options.onIdleTimeout) options.onIdleTimeout();
+        else process.exit(0);
+      });
+    }, checkEvery);
+    idleTimer.unref?.();
+  }
 
   // Warm pricing cache in background (non-blocking)
   warmPricingCache().catch(() => {});
@@ -1206,8 +1314,10 @@ export async function createProxyServer(
     port: resolvedPort,
     url: `http://127.0.0.1:${resolvedPort}`,
     shutdown: async () => {
+      if (idleTimer) clearInterval(idleTimer);
       // `true` = close active connections too, so a streamed request in flight
-      // can't keep the port alive after shutdown resolves.
+      // can't keep the port alive after shutdown resolves. Unlike the idle path,
+      // this is an explicit teardown: the caller is exiting either way.
       await server.stop(true);
     },
     classifierStats: () => ({

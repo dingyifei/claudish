@@ -189,6 +189,18 @@ export interface ClaudishProfileConfig {
   defaultProvider?: string;
 
   /**
+   * Run the translation proxy as a detached daemon that outlives the launcher,
+   * so a Claude Code session backgrounded past claudish's exit keeps its
+   * non-native routing instead of reverting to native opus. Equivalent to
+   * `--persist-proxy` on every run.
+   * Precedence: --persist-proxy flag > CLAUDISH_PERSIST_PROXY env > this field.
+   */
+  persistProxy?: boolean;
+
+  /** Idle ms before a persistent proxy daemon self-exits (default 10 min). Set by --proxy-idle-timeout. */
+  proxyIdleTimeoutMs?: number;
+
+  /**
    * Named custom endpoints. Each entry is either a "simple" config
    * (URL + format + key) or a "complex" config (full provider profile).
    * NOTE: This is distinct from the legacy `endpoints?: Record<string, string>` field
@@ -309,6 +321,12 @@ export function loadConfig(): ClaudishProfileConfig {
     }
     if (config.defaultProvider !== undefined) {
       merged.defaultProvider = config.defaultProvider;
+    }
+    if (config.persistProxy !== undefined) {
+      merged.persistProxy = config.persistProxy;
+    }
+    if (config.proxyIdleTimeoutMs !== undefined) {
+      merged.proxyIdleTimeoutMs = config.proxyIdleTimeoutMs;
     }
     if (config.debug !== undefined) {
       merged.debug = config.debug;
