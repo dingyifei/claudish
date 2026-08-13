@@ -161,18 +161,45 @@ export function shouldHideIncidentalAnthropicKey(
 }
 
 /**
- * Does the environment carry a resolvable Anthropic credential? Used to decide
- * whether classifier passthrough can safely preserve Claude Code's real auth
- * (skipping the placeholder key) without stranding Claude Code at a login gate.
- * Checks, in order: env tokens (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN), Claude
- * Code's OAuth credentials file (~/.claude/.credentials.json), and — on macOS — the
- * login Keychain item Claude Code stores its OAuth in ("Claude Code-credentials",
- * existence-only; the secret is never read). Deps are injectable for hermetic tests.
- *
- * TODO: Windows/Linux may also keep the OAuth in an OS credential store (Credential
- * Manager / libsecret) rather than the file; only the macOS Keychain is covered so far.
+ * The credentials claudish injects in pure-proxy mode. Their only job is to
+ * suppress Claude Code's login dialog; the proxy holds the real provider keys.
+ * Module constants because two places need to agree on them: the injection site
+ * below, and the auth probes, which must never mistake one for a real credential.
  */
-export function hasResolvableAnthropicAuth(
+const PLACEHOLDER_ANTHROPIC_API_KEY =
+  "sk-ant-api03-placeholder-not-used-proxy-handles-auth-with-openrouter-key-xxxxxxxxxxxxxxxxxxxxx";
+const PLACEHOLDER_ANTHROPIC_AUTH_TOKEN = "placeholder-token-not-used-proxy-handles-auth";
+
+/**
+ * Is this value one of claudish's own placeholders rather than a real credential?
+ *
+ * Matters because claudish sessions nest: a claudish-launched Claude Code can
+ * itself run claudish (subagents, `team`, channel sessions), and the inner
+ * process inherits the outer's placeholder env. Reading that as "credentials
+ * are available" would make the inner session preserve the placeholder and
+ * forward it to api.anthropic.com, where it 401s. Substring-matched rather than
+ * compared exactly so a future placeholder edit cannot silently reopen this.
+ */
+function isPlaceholderAnthropicCredential(value: string | undefined): boolean {
+  if (!value) return false;
+  return value.includes("placeholder-not-used") || value.includes("placeholder-token-not-used");
+}
+
+/**
+ * Does a credential exist that reaches Claude Code REGARDLESS of the
+ * API-key-hiding logic below — its OAuth credentials file, the macOS login
+ * Keychain item it stores OAuth in ("Claude Code-credentials", existence-only;
+ * the secret is never read), or a deliberately-set ANTHROPIC_AUTH_TOKEN?
+ *
+ * ANTHROPIC_AUTH_TOKEN counts because nothing bundles one incidentally, so
+ * upstream never strips it — see the native-anthropic branch in runClaudeWithProxy.
+ *
+ * TODO: Windows/Linux may also keep the OAuth in an OS credential store
+ * (Credential Manager / libsecret) rather than the file; only macOS is covered.
+ * A configured `op://` reference is likewise not seen here — this reads the
+ * environment, not the credential authority.
+ */
+export function hasAnthropicOAuth(
   deps: {
     env?: NodeJS.ProcessEnv;
     fileExists?: (path: string) => boolean;
@@ -182,9 +209,59 @@ export function hasResolvableAnthropicAuth(
   const env = deps.env ?? process.env;
   const fileExists = deps.fileExists ?? existsSync;
   const keychainProbe = deps.keychainProbe ?? defaultKeychainAnthropicProbe;
-  if (env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN) return true;
+  if (env.ANTHROPIC_AUTH_TOKEN && !isPlaceholderAnthropicCredential(env.ANTHROPIC_AUTH_TOKEN)) {
+    return true;
+  }
   if (fileExists(join(homedir(), ".claude", ".credentials.json"))) return true;
   return keychainProbe();
+}
+
+/** Is a REAL (non-placeholder) `ANTHROPIC_API_KEY` present in the environment? */
+export function hasAnthropicApiKey(deps: { env?: NodeJS.ProcessEnv } = {}): boolean {
+  const env = deps.env ?? process.env;
+  return !!env.ANTHROPIC_API_KEY && !isPlaceholderAnthropicCredential(env.ANTHROPIC_API_KEY);
+}
+
+/**
+ * Does the environment carry any resolvable Anthropic credential?
+ *
+ * Kept as the disjunction of the two predicates above so existing callers are
+ * unaffected. The split matters for the ones that must distinguish "OAuth will
+ * reach the child" from "there is an API key, which the branch below may hide" —
+ * a plain boolean cannot express that, and reordering the probes inside a single
+ * boolean OR would not have either: it changes which probe runs first, never the
+ * answer.
+ */
+export function hasResolvableAnthropicAuth(
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    fileExists?: (path: string) => boolean;
+    keychainProbe?: KeychainCredentialProbe;
+  } = {}
+): boolean {
+  return hasAnthropicOAuth(deps) || hasAnthropicApiKey(deps);
+}
+
+/**
+ * Does this session's MAIN LOOP run through a claudish provider rather than
+ * talking to Anthropic directly?
+ *
+ * This is the predicate for the context-window clamp and Layer 4's denominator:
+ * a proxied main loop can face a backend whose real window is smaller than the
+ * model's advertised spec, so Claude Code has to be told to compact earlier.
+ *
+ * Named and exported so it cannot silently follow the AUTH branch again.
+ * Classifier passthrough changes where the *credentials* come from without
+ * changing where the *tokens* go, and when the clamp rode along with the auth
+ * decision, enabling the passthrough quietly disabled auto-compaction for
+ * exactly the Codex sessions that need it most.
+ *
+ * (It inherits a pre-existing imprecision worth fixing separately: a session
+ * with a native Opus mapping AND a foreign Sonnet mapping counts as native, so
+ * the proxied Sonnet work gets no clamp.)
+ */
+export function mainLoopIsProxied(config: ClaudishConfig): boolean {
+  return !hasNativeAnthropicMapping(config);
 }
 
 /**
@@ -1363,10 +1440,20 @@ export async function runClaudeWithProxy(
       // not work as expected". So overwrite unconditionally with placeholders —
       // their only job is suppressing the login dialog (#13: a placeholder API
       // key alone still redirected to the payment page, hence the token too).
-      env.ANTHROPIC_API_KEY =
-        "sk-ant-api03-placeholder-not-used-proxy-handles-auth-with-openrouter-key-xxxxxxxxxxxxxxxxxxxxx";
-      env.ANTHROPIC_AUTH_TOKEN = "placeholder-token-not-used-proxy-handles-auth";
+      env.ANTHROPIC_API_KEY = PLACEHOLDER_ANTHROPIC_API_KEY;
+      env.ANTHROPIC_AUTH_TOKEN = PLACEHOLDER_ANTHROPIC_AUTH_TOKEN;
+    }
 
+    // Context-window clamp and telemetry denominator. Gated on whether the MAIN
+    // LOOP is proxied — deliberately NOT on the auth branch above.
+    //
+    // These used to live inside that `else`, which was correct only while the
+    // branch condition was `hasNativeAnthropicMapping`. Classifier passthrough
+    // moves the AUTH decision (placeholder key vs real credentials) without
+    // moving the ROUTING fact, and a proxied main loop still needs the clamp —
+    // so a pure-Codex session that enabled the passthrough would otherwise
+    // silently lose auto-compaction and Layer 4's denominator along with it.
+    if (mainLoopIsProxied(config)) {
       // Drive Claude Code's NATIVE auto-compaction to fire before a backend whose
       // real context window is smaller than the model's advertised spec rejects
       // the request. The ChatGPT Codex OAuth backend caps gpt-5.6-sol at ~372K vs
@@ -1416,8 +1503,19 @@ export async function runClaudeWithProxy(
     }
   };
 
-  if (!config.monitor && hasNativeAnthropicMapping(config)) {
-    log("[claudish] Native Claude model detected — using Claude Code subscription credentials");
+  // Gated on shouldPreserveNativeAuth, not hasNativeAnthropicMapping: a
+  // passthrough-only session also runs on the user's real credentials, and it
+  // is the case where a hidden key is hardest to diagnose — the classifier just
+  // 401s with nothing said.
+  if (!config.monitor && shouldPreserveNativeAuth(config)) {
+    if (hasNativeAnthropicMapping(config)) {
+      log("[claudish] Native Claude model detected — using Claude Code subscription credentials");
+    } else {
+      log(
+        "[claudish] Classifier passthrough enabled — using Claude Code subscription credentials " +
+          "for the permission classifier"
+      );
+    }
     if (hidAnthropicApiKey) {
       log(
         "[claudish]   ANTHROPIC_API_KEY found but hidden so it can't override that subscription · " +

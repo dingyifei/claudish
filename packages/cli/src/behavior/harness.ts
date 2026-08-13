@@ -175,3 +175,125 @@ export function detectHarnessFacts(claudeRequest: any): HarnessFacts {
 
   return facts;
 }
+
+// ---------------------------------------------------------------------------
+// Auto-mode permission classifier
+//
+// In `--permission-mode auto`, Claude Code sends a dedicated security-monitor
+// request to decide whether each tool call is safe to run unattended. claudish
+// can reroute just that request to a real Claude model (see
+// classifier-passthrough.ts); the anchors it is recognised by live here with
+// every other CC prompt string we match on.
+// ---------------------------------------------------------------------------
+
+/**
+ * Opening sentence of the auto-mode permission classifier's system prompt.
+ *
+ * Verified verbatim in the Claude Code 2.1.226 binary and in a live capture at
+ * the same version. Re-verify from a `CLAUDISH_CLASSIFIER_DEBUG=1` capture if
+ * the wording ever drifts — this is a security control that fails OPEN, so a
+ * silent miss sends the classifier to whatever foreign model the tier maps to.
+ */
+const CLASSIFIER_SYSTEM_MARKER = "You are a security monitor for autonomous AI coding agents.";
+
+/**
+ * Upper bound on a classifier request's `max_tokens`, for the shape tripwire
+ * below. Observed at CC 2.1.226: 64 on five of six captured requests and 8192
+ * on the sixth, against 64000 for the main loop — so the ceiling sits well
+ * clear of both. Widen it rather than narrow it if CC starts asking for more.
+ */
+const CLASSIFIER_MAX_TOKENS_CEILING = 16_384;
+
+/**
+ * Allocation-free test for "text, ignoring leading whitespace, starts with the
+ * marker". Avoids `trimStart()`, which would copy the whole block: the captured
+ * security-monitor prompt is ~110 KB, and this runs on every proxied request.
+ */
+function startsWithMarker(text: string): boolean {
+  let i = 0;
+  while (i < text.length) {
+    const ch = text.charCodeAt(i);
+    // space, tab, LF, CR, form feed, vertical tab
+    if (ch !== 32 && ch !== 9 && ch !== 10 && ch !== 13 && ch !== 12 && ch !== 11) break;
+    i++;
+  }
+  return text.startsWith(CLASSIFIER_SYSTEM_MARKER, i);
+}
+
+/**
+ * Extract the text of one Claude Messages `system` content block, or null when
+ * the block carries none. Accepts a bare string element or `{type:"text",text}`.
+ */
+function systemBlockText(block: unknown): string | null {
+  if (typeof block === "string") return block;
+  if (
+    block &&
+    typeof block === "object" &&
+    (block as { type?: unknown }).type === "text" &&
+    typeof (block as { text?: unknown }).text === "string"
+  ) {
+    return (block as { text: string }).text;
+  }
+  return null;
+}
+
+/**
+ * True iff the request body is Claude Code's auto-mode permission classifier —
+ * i.e. ANY of its `system` text blocks starts with CLASSIFIER_SYSTEM_MARKER.
+ *
+ * EVERY block is scanned; the marker's index is deliberately not assumed. The
+ * `system` array is a multi-block composition assembled by Claude Code (a
+ * billing header, CLAUDE.md and project rules, output styles, the monitor
+ * prompt itself) whose order and count are not a contract and have already
+ * changed across CC releases. A full scan is a superset of an index check,
+ * short-circuits on the first hit, and allocates nothing — so pinning an index
+ * would buy nothing and break silently on the next reshuffle.
+ *
+ * (`stripBillingHeader` in transform.ts does not apply here: it runs inside
+ * ComposedHandler → transformOpenAIToClaude, which is downstream of the routing
+ * decision this feeds and never runs on the NativeHandler path.)
+ *
+ * Handles the string-vs-array `system` duality. Never throws.
+ */
+export function isAutoModeClassifierRequest(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const system = (body as { system?: unknown }).system;
+  if (typeof system === "string") return startsWithMarker(system);
+  if (!Array.isArray(system)) return false;
+  for (const block of system) {
+    const text = systemBlockText(block);
+    if (text !== null && startsWithMarker(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * Structural tripwire for a request that LOOKS like the auto-mode classifier
+ * without carrying the marker.
+ *
+ * Exists because marker matching fails OPEN: if Claude Code rewords the prompt
+ * by one character, detection silently stops and every classifier call goes
+ * back to the foreign main-loop provider — the exact bug the passthrough was
+ * written to fix. This never routes anything; it only decides when to shout.
+ *
+ * Deliberately structural rather than content-based, and cheap-test-first.
+ * Thresholds are from a live CC 2.1.226 capture (6 classifier requests vs 10
+ * main-loop): they separated the two sets completely. The `system.length >= 2`
+ * clause is load-bearing rather than decorative — Claude Code's startup
+ * connectivity probe (`max_tokens: 1`, no tools, non-streaming, NO system)
+ * satisfies the other three and is excluded only by that one.
+ */
+export function looksLikeClassifierShape(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const b = body as {
+    stream?: unknown;
+    tools?: unknown;
+    max_tokens?: unknown;
+    system?: unknown;
+  };
+  if (b.stream === true) return false;
+  if (Array.isArray(b.tools) && b.tools.length > 0) return false;
+  if (typeof b.max_tokens !== "number" || b.max_tokens > CLASSIFIER_MAX_TOKENS_CEILING)
+    return false;
+  return Array.isArray(b.system) && b.system.length >= 2;
+}

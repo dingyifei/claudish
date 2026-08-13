@@ -18,8 +18,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildClaudishSettingsOverlay,
+  defaultKeychainAnthropicProbe,
+  hasAnthropicApiKey,
+  hasAnthropicOAuth,
   hasResolvableAnthropicAuth,
   isProxyAuthMode,
+  mainLoopIsProxied,
   managedSettingsForcesClaudeAi,
   shouldHideIncidentalAnthropicKey,
 } from "./claude-runner.js";
@@ -224,5 +228,148 @@ describe("shouldHideIncidentalAnthropicKey", () => {
     expect(
       shouldHideIncidentalAnthropicKey(baseConfig({ model: "x-ai/grok-code-fast-1" }), apiKeyEnv)
     ).toBe(false);
+  });
+});
+
+describe("hasAnthropicOAuth / hasAnthropicApiKey — the split predicate", () => {
+  const noKeychain = () => false;
+  const noFile = () => false;
+
+  test("a real API key is an API key, not OAuth", () => {
+    const deps = {
+      env: { ANTHROPIC_API_KEY: "sk-ant-real" },
+      fileExists: noFile,
+      keychainProbe: noKeychain,
+    };
+    expect(hasAnthropicApiKey(deps)).toBe(true);
+    expect(hasAnthropicOAuth(deps)).toBe(false);
+    expect(hasResolvableAnthropicAuth(deps)).toBe(true);
+  });
+
+  test("the credentials file and the Keychain both count as OAuth", () => {
+    expect(hasAnthropicOAuth({ env: {}, fileExists: () => true, keychainProbe: noKeychain })).toBe(
+      true
+    );
+    expect(hasAnthropicOAuth({ env: {}, fileExists: noFile, keychainProbe: () => true })).toBe(
+      true
+    );
+  });
+
+  test("ANTHROPIC_AUTH_TOKEN counts as OAuth — nothing bundles one incidentally", () => {
+    expect(
+      hasAnthropicOAuth({
+        env: { ANTHROPIC_AUTH_TOKEN: "deliberate-token" },
+        fileExists: noFile,
+        keychainProbe: noKeychain,
+      })
+    ).toBe(true);
+  });
+
+  test("claudish's OWN placeholders are not credentials", () => {
+    // The nested-claudish case: an inner session inherits the outer's env. Reading
+    // the placeholder as a real credential makes the inner session preserve it and
+    // forward it to api.anthropic.com, where it 401s.
+    const deps = {
+      env: {
+        ANTHROPIC_API_KEY:
+          "sk-ant-api03-placeholder-not-used-proxy-handles-auth-with-openrouter-key-xxxxxxxxxxxxxxxxxxxxx",
+        ANTHROPIC_AUTH_TOKEN: "placeholder-token-not-used-proxy-handles-auth",
+      },
+      fileExists: noFile,
+      keychainProbe: noKeychain,
+    };
+    expect(hasAnthropicApiKey(deps)).toBe(false);
+    expect(hasAnthropicOAuth(deps)).toBe(false);
+    expect(hasResolvableAnthropicAuth(deps)).toBe(false);
+  });
+
+  test("hasResolvableAnthropicAuth stays the disjunction of the two", () => {
+    for (const [file, keychain, key] of [
+      [false, false, false],
+      [true, false, false],
+      [false, true, false],
+      [false, false, true],
+    ] as const) {
+      const deps = {
+        env: key ? { ANTHROPIC_API_KEY: "sk-ant-real" } : {},
+        fileExists: () => file,
+        keychainProbe: () => keychain,
+      };
+      expect(hasResolvableAnthropicAuth(deps)).toBe(
+        hasAnthropicOAuth(deps) || hasAnthropicApiKey(deps)
+      );
+    }
+  });
+});
+
+describe("defaultKeychainAnthropicProbe — the real probe", () => {
+  test("never requests the secret: no -w in the argv it would run", () => {
+    // The suite injects a fake probe everywhere else, so nothing else exercises
+    // the real one. What matters most about it is a negative: `security
+    // find-generic-password` WITHOUT `-w` checks that the item exists without
+    // reading the token or raising a Keychain prompt.
+    const source = defaultKeychainAnthropicProbe.toString();
+    expect(source).toContain("find-generic-password");
+    expect(source).toContain("Claude Code-credentials");
+    expect(source).not.toContain('"-w"');
+    expect(source).not.toContain("'-w'");
+  });
+
+  test("returns false off darwin without spawning anything", () => {
+    if (process.platform === "darwin") return; // covered by the argv assertion above
+    expect(defaultKeychainAnthropicProbe()).toBe(false);
+  });
+});
+
+describe("isProxyAuthMode with classifier passthrough", () => {
+  test("passthrough + resolvable creds → NOT proxy mode (real auth preserved)", () => {
+    // No native role mapping at all — pure Codex. The passthrough is what flips
+    // this out of proxy mode, and no test covered that combination before.
+    const config = {
+      modelOpus: "cx@gpt-5.6-sol",
+      classifierProvider: "anthropic",
+    } as unknown as Parameters<typeof isProxyAuthMode>[0];
+    const hadCreds = hasResolvableAnthropicAuth();
+    expect(isProxyAuthMode(config)).toBe(!hadCreds);
+  });
+
+  test("passthrough explicitly disabled → proxy mode, whatever creds exist", () => {
+    const config = {
+      modelOpus: "cx@gpt-5.6-sol",
+      classifierProvider: "anthropic",
+      classifierPassthrough: false,
+    } as unknown as Parameters<typeof isProxyAuthMode>[0];
+    expect(isProxyAuthMode(config)).toBe(true);
+  });
+});
+
+describe("mainLoopIsProxied — auto-compaction gating", () => {
+  const cfg = (o: Record<string, unknown>) => o as unknown as Parameters<typeof isProxyAuthMode>[0];
+
+  test("pure Codex + classifier passthrough STILL gets the context-window clamp", () => {
+    // The regression this pins: the clamp used to live inside the auth branch,
+    // so enabling the passthrough flipped a proxied Codex session onto the
+    // "native" path and silently dropped CLAUDE_CODE_AUTO_COMPACT_WINDOW — on
+    // exactly the backend (gpt-5.6-sol, capped well below its advertised spec)
+    // the clamp was written for.
+    const config = cfg({ modelOpus: "cx@gpt-5.6-sol", classifierProvider: "anthropic" });
+    expect(mainLoopIsProxied(config)).toBe(true);
+    // The auth decision goes the OTHER way for this same config when credentials
+    // resolve — which is the divergence that made the old shared branch wrong.
+    if (hasResolvableAnthropicAuth()) {
+      expect(isProxyAuthMode(config)).toBe(false);
+      expect(mainLoopIsProxied(config)).toBe(true);
+    }
+  });
+
+  test("a native Claude mapping does NOT get the clamp — Anthropic enforces its own window", () => {
+    expect(mainLoopIsProxied(cfg({ modelSonnet: "claude-sonnet-5" }))).toBe(false);
+  });
+
+  test("gating does not change when the passthrough is toggled", () => {
+    const base = { modelOpus: "cx@gpt-5.6-sol" };
+    expect(mainLoopIsProxied(cfg(base))).toBe(
+      mainLoopIsProxied(cfg({ ...base, classifierProvider: "anthropic" }))
+    );
   });
 });

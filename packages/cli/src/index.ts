@@ -14,6 +14,7 @@ import {
   suppressStartupTraceTerminalOutput,
   traceSpan,
 } from "./startup-trace.js";
+import type { ClassifierStats } from "./types.js";
 
 // ── Startup-timing analytics (startup-trace.ts) ─────────────────────────────
 // Every launch appends one JSON line to ~/.claudish/startup-metrics.jsonl; a
@@ -272,6 +273,36 @@ function handlePromptExit(err: unknown): void {
     process.exit(0);
   }
   throw err;
+}
+
+/**
+ * Surface classifier-passthrough diagnostics once Claude Code has exited.
+ *
+ * Two failures this makes visible, both otherwise silent:
+ *   - detection anomalies the proxy recorded but withheld from the live TUI;
+ *   - passthrough enabled for a whole session that saw ZERO classifier requests,
+ *     which means either auto mode never ran or detection is broken.
+ *
+ * Not gated on `--quiet`. Quiet suppresses progress chatter; it must not
+ * suppress a security control reporting that it did not fire — and single-shot
+ * runs are quiet by default, which is exactly where nobody is watching.
+ */
+function reportClassifierOutcome(stats: ClassifierStats | undefined, interactive?: boolean): void {
+  if (!stats?.enabled) return;
+  const write = interactive ? console.log : console.error;
+
+  for (const warning of stats.warnings) {
+    write(`\n[claudish] WARNING — classifier passthrough: ${warning}`);
+  }
+
+  if (stats.hits === 0 && stats.warnings.length === 0) {
+    write(
+      "\n[claudish] classifier passthrough was enabled but NO classifier request was seen this session.\n" +
+        "[claudish]   Either Claude Code never ran in auto mode, or detection is broken (its\n" +
+        "[claudish]   classifier prompt may have changed). Verify with:\n" +
+        "[claudish]     CLAUDISH_CLASSIFIER_DEBUG=1 claudish … → logs/classifier-capture.jsonl"
+    );
+  }
 }
 
 // Check for auth and profile management commands
@@ -969,6 +1000,14 @@ async function runCli() {
       // Clear diagOutput BEFORE cleanup to prevent write-after-end
       setDiagOutput(null);
       diag.cleanup();
+
+      // Classifier-passthrough diagnostics. Reported HERE — after the TUI is
+      // gone — because the proxy deliberately withholds them mid-session rather
+      // than drawing into Claude Code's terminal. Deliberately NOT gated on
+      // `quiet`: single-shot runs are quiet by default, and a failed security
+      // control has to be audible in exactly that unattended case.
+      reportClassifierOutcome(proxy.classifierStats?.(), cliConfig.interactive);
+
       // Always cleanup proxy. Route claudish's own chatter to stderr in
       // single-shot mode — stdout there carries Claude Code's machine-readable
       // output (e.g. --output-format stream-json) that consumers parse line-by-line.

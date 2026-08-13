@@ -103,9 +103,14 @@ on a real Claude model. If your hybrid setup routes it to a non-Claude provider 
 Gemini, …), it over-blocks or times out with *"safety classifier temporarily unavailable"* —
 and even harmless commands get denied.
 
+The classifier request carries an ordinary Claude model id, so claudish resolves it by
+**role** like any other request — and in a hybrid setup that role points at your non-Claude
+provider. (The exact id it arrives with has changed across Claude Code releases; the routing
+behaviour is the part that matters.)
+
 **Classifier passthrough** fixes this: it detects the classifier request by content and
-reroutes **only that request** to native Anthropic (`claude-sonnet-5` by default, via your
-Claude Max OAuth), while your main loop keeps running on whatever provider you mapped.
+reroutes **only that request** to native Anthropic via your Claude Max OAuth, while your main
+loop keeps running on whatever provider you mapped.
 
 ### Enable it
 
@@ -121,12 +126,25 @@ claudish --model-opus cx@gpt-5.6-sol --model-sonnet claude-sonnet-5 \
 export CLAUDISH_CLASSIFIER_PROVIDER=anthropic
 ```
 
-Choose a specific classifier model with `--classifier-model` / `CLAUDISH_CLASSIFIER_MODEL`
-(defaults to `claude-sonnet-5` — fast, cheap, and correct for the classifier):
+Turn it off again for a single run with `--no-classifier-passthrough` — useful when
+`CLAUDISH_CLASSIFIER_PROVIDER` or `CLAUDISH_CLASSIFIER_MODEL` is exported in your shell profile.
+
+Choose a specific classifier model with `--classifier-model` / `CLAUDISH_CLASSIFIER_MODEL`:
 
 ```bash
 claudish --classifier-model claude-sonnet-5 ...
 ```
+
+Left unset, claudish resolves a current Sonnet-tier model rather than a pinned id, in order:
+
+1. `--classifier-model`
+2. `CLAUDISH_CLASSIFIER_MODEL`
+3. your own `--model-sonnet` mapping, when it names a real `claude-sonnet-*` model
+4. the model catalog's current Anthropic Sonnet pointer
+5. a built-in fallback, if the catalog is unavailable (offline, `--models-skip-update`, or a
+   local-model run that skips the catalog warm)
+
+Sonnet is the right tier here: the classifier is a short, structured, latency-sensitive call.
 
 ### Example: main loop on Codex, safety classifier on Claude
 
@@ -152,6 +170,24 @@ rerouted to `claude-sonnet-5` on `api.anthropic.com`.
 - Only the classifier request is rerouted; every other request follows your normal role
   mapping.
 
+> **⚠️ Billing: these calls are your own Anthropic usage.** Anthropic
+> [announced](https://claude.com/blog/auto-mode-default-in-claude-code) that it is "no longer
+> charging Claude Code users on Pro, Max, and Team plans for that classifier overhead." That
+> statement is about Claude Code talking to Anthropic directly.
+>
+> With passthrough on, **claudish** issues the classifier call — forwarding it to
+> `api.anthropic.com` with the credentials your session already carries. The body goes across
+> near-verbatim, but not identically: the model id is rewritten, and only
+> `authorization`/`x-api-key`, `anthropic-version` and `anthropic-beta` are forwarded, so other
+> client-identity headers Claude Code would normally send are absent.
+>
+> **We cannot verify whether Anthropic's exemption still recognises these calls**, and the
+> criteria are not published. Plan for the conservative case: assume each classifier call is
+> ordinary usage on your Anthropic plan or API account — one extra small request **per tool
+> call**, on top of what your main loop spends with the other provider. Check your own usage
+> after a session before relying on it, and leave the feature off (the default) if that is not
+> acceptable.
+
 > **Consent model:** Claude Code's classifier treats a command you *explicitly name* in your
 > prompt (e.g. literally asking it to run `curl … | bash`) as informed consent and allows it.
 > Visible blocks are for dangerous actions the agent formulates on its own, or for
@@ -161,10 +197,25 @@ rerouted to `claude-sonnet-5` on `api.anthropic.com`.
 ### Debugging
 
 Set `CLAUDISH_CLASSIFIER_DEBUG=1` to append each incoming request's model / sampling params /
-system prompt / headers to `logs/classifier-capture.jsonl` — handy for confirming the
-classifier is detected and rerouted. It captures the **full** system prompt (your CLAUDE.md
-and project rules included), so leave it off unless you are actively debugging detection. With `--debug-claudish`, a
-`[Classifier] … → native Anthropic` line is written when the passthrough fires.
+`system` array / relevant headers to `logs/classifier-capture.jsonl` — handy for confirming the
+classifier is detected and rerouted. A `[Proxy] classifier passthrough: …` line is written to
+the claudish log when the passthrough fires.
+
+> **What the capture file contains — read it before sharing it.** `CLAUDISH_CLASSIFIER_DEBUG=1`
+> writes the **complete, unredacted `system` array of every request**, not just the classifier's
+> (it records before detection, so a drifted marker can still be discovered). For a normal
+> Claude Code turn that array is your session's full system prompt: **your `CLAUDE.md`, your
+> project's `.claude/` rules, output styles, and any agent instructions** — whatever your repo
+> puts in front of the model. It also captures Claude Code's `x-anthropic-billing-header` block,
+> which carries your client version and a per-turn hash. API keys and OAuth tokens are **not**
+> written (auth headers are reduced to `<present>`); everything else is verbatim plaintext.
+> `logs/` is gitignored, but the file still sits in your working directory — treat it like a
+> transcript, not a log. The capture stops at 32 MB, and unsetting the flag stops it sooner.
+
+If claudish detects that the classifier's prompt has changed shape — or that passthrough was
+enabled but no classifier request arrived all session — it says so after Claude Code exits.
+Those warnings are printed regardless of `--quiet`: a security control that stopped firing has
+to be audible in unattended runs too.
 
 ---
 

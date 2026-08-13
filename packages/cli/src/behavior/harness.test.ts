@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { detectHarnessFacts, extractAvailableSkills, extractSessionId } from "./harness.js";
+import {
+  detectHarnessFacts,
+  extractAvailableSkills,
+  extractSessionId,
+  isAutoModeClassifierRequest,
+  looksLikeClassifierShape,
+} from "./harness.js";
 
 describe("extractSessionId", () => {
   it("extracts only the session id from Claude Code's JSON-string metadata", () => {
@@ -167,5 +173,125 @@ describe("detectHarnessFacts", () => {
       planFilePath: path,
       planDir: "/tmp/block-system",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto-mode permission classifier
+//
+// Shapes below are taken from a live capture at Claude Code 2.1.226 (6
+// classifier requests, 9 main-loop, 1 startup probe). Fields asserted here are
+// the ones detection depends on; the arriving model id, the marker's block
+// index and the exact max_tokens are recorded in comments rather than pinned,
+// because those are observations that have already drifted once and pinning
+// them buys a permanently red test on the next reshuffle.
+// ---------------------------------------------------------------------------
+
+const MARKER = "You are a security monitor for autonomous AI coding agents.";
+// Real classifier system prompts run ~110 KB; truncated here to the anchor.
+const MONITOR_BLOCK = `${MARKER}\n\n## Context\n\n[…truncated…]`;
+// Claude Code prepends this as system[0]; cc_version + a per-turn hash follow.
+const BILLING_BLOCK = "x-anthropic-billing-header: cc_version=0.0.0; cc_entrypoint=cli;";
+const SESSION_CONTEXT_BLOCK = "\n\n## Session Context\n\n[…redacted…]";
+
+/** A captured classifier request, redacted. Arrived as model `claude-sonnet-5`. */
+const CLASSIFIER_BODY = {
+  model: "claude-sonnet-5",
+  max_tokens: 64,
+  thinking: { type: "disabled" },
+  system: [
+    { type: "text", text: BILLING_BLOCK },
+    { type: "text", text: MONITOR_BLOCK },
+    { type: "text", text: SESSION_CONTEXT_BLOCK },
+  ],
+  messages: [{ role: "user", content: "[…redacted…]" }],
+};
+
+/** A captured main-loop request. */
+const MAIN_LOOP_BODY = {
+  model: "claude-opus-5",
+  max_tokens: 64000,
+  stream: true,
+  thinking: { type: "adaptive" },
+  tools: [{ name: "Bash" }],
+  system: [
+    { type: "text", text: BILLING_BLOCK },
+    { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+    { type: "text", text: "\nYou are an interactive agent that helps users […]" },
+  ],
+};
+
+/** Claude Code's startup connectivity probe: no system at all. */
+const PROBE_BODY = { model: "claude-opus-5", max_tokens: 1 };
+
+describe("isAutoModeClassifierRequest", () => {
+  it("matches the captured classifier request (marker is NOT system[0])", () => {
+    expect(isAutoModeClassifierRequest(CLASSIFIER_BODY)).toBe(true);
+  });
+
+  it("matches system supplied as a plain string", () => {
+    expect(isAutoModeClassifierRequest({ system: MONITOR_BLOCK })).toBe(true);
+  });
+
+  it("tolerates leading whitespace before the marker", () => {
+    expect(
+      isAutoModeClassifierRequest({ system: [{ type: "text", text: `\n  ${MONITOR_BLOCK}` }] })
+    ).toBe(true);
+  });
+
+  it("does NOT match the main-loop request", () => {
+    expect(isAutoModeClassifierRequest(MAIN_LOOP_BODY)).toBe(false);
+  });
+
+  it("does NOT match the marker quoted mid-block", () => {
+    // The vector worth guarding: a CLAUDE.md that quotes the marker lands INSIDE
+    // the instructions block, not at its start, so prefix-anchoring excludes it.
+    expect(
+      isAutoModeClassifierRequest({
+        system: [{ type: "text", text: `Project rules:\n\nDo not write "${MARKER}"` }],
+      })
+    ).toBe(false);
+  });
+
+  it("returns false for empty / missing / malformed system", () => {
+    expect(isAutoModeClassifierRequest({})).toBe(false);
+    expect(isAutoModeClassifierRequest({ system: [] })).toBe(false);
+    expect(isAutoModeClassifierRequest({ system: [{ type: "image", source: {} }] })).toBe(false);
+    expect(isAutoModeClassifierRequest(null)).toBe(false);
+    expect(isAutoModeClassifierRequest("not an object")).toBe(false);
+    expect(isAutoModeClassifierRequest({ system: 42 })).toBe(false);
+  });
+});
+
+describe("looksLikeClassifierShape", () => {
+  it("matches the captured classifier request", () => {
+    expect(looksLikeClassifierShape(CLASSIFIER_BODY)).toBe(true);
+  });
+
+  it("matches the 8192-max_tokens classifier variant seen in the same capture", () => {
+    expect(looksLikeClassifierShape({ ...CLASSIFIER_BODY, max_tokens: 8192 })).toBe(true);
+  });
+
+  it("does NOT match the main-loop request", () => {
+    expect(looksLikeClassifierShape(MAIN_LOOP_BODY)).toBe(false);
+  });
+
+  it("does NOT match the startup connectivity probe", () => {
+    // The probe is non-streaming, tool-less and tiny — it clears every other
+    // gate. Only the multi-block system requirement excludes it, so this test
+    // is what keeps that clause from looking removable.
+    expect(looksLikeClassifierShape(PROBE_BODY)).toBe(false);
+  });
+
+  it("rejects streaming, tool-bearing, and oversized requests individually", () => {
+    expect(looksLikeClassifierShape({ ...CLASSIFIER_BODY, stream: true })).toBe(false);
+    expect(looksLikeClassifierShape({ ...CLASSIFIER_BODY, tools: [{ name: "Bash" }] })).toBe(false);
+    expect(looksLikeClassifierShape({ ...CLASSIFIER_BODY, max_tokens: 64000 })).toBe(false);
+    expect(looksLikeClassifierShape({ ...CLASSIFIER_BODY, max_tokens: undefined })).toBe(false);
+  });
+
+  it("returns false for malformed bodies", () => {
+    expect(looksLikeClassifierShape(null)).toBe(false);
+    expect(looksLikeClassifierShape("nope")).toBe(false);
   });
 });

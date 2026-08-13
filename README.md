@@ -74,7 +74,7 @@ Claudish is a **BYOK AI coding assistant**:
 - ✅ **Autonomous mode** - Bypass all prompts with flags
 - ✅ **Context inheritance** - Runs in current directory with same `.claude` settings
 - ✅ **Claude Code flag passthrough** - Forward any Claude Code flag (`--agent`, `--effort`, `--permission-mode`, etc.) in any order
-- ✅ **Classifier passthrough** - In hybrid setups, keep Claude Code's auto-mode permission classifier on real Claude (Anthropic) while your main loop runs on another provider (`--classifier-provider anthropic`)
+- ✅ **Classifier passthrough** - In hybrid setups, keep Claude Code's auto-mode permission classifier on real Claude (Anthropic) while your main loop runs on another provider (`--classifier-provider anthropic`). Opt-in; the classifier calls bill to your own Anthropic account — see [the billing note](docs/models/model-mapping.md#auto-mode-classifier-passthrough)
 - ✅ **Vision proxy** - Non-vision models automatically get image descriptions via Claude, so every model can "see"
 
 ## Installation
@@ -301,7 +301,8 @@ claudish [OPTIONS] <claude-args...>
 | `--model-haiku <model>` | | Model for Haiku role (fast tasks) | |
 | `--model-subagent <model>` | | Model for sub-agents (Task tool) | |
 | `--classifier-provider <name>` | | Route the auto-mode permission classifier to native Anthropic (`anthropic`) | Off |
-| `--classifier-model <model>` | | Native Claude model for the classifier passthrough (also enables it) | `claude-sonnet-5` |
+| `--classifier-model <model>` | | Native Claude model for the classifier passthrough (also enables it) | Derived Sonnet tier |
+| `--no-classifier-passthrough` | | Force classifier passthrough off, overriding env vars that would enable it | |
 | `--profile <name>` | `-p` | Named profile for model mapping | Default profile |
 | `--config <file>` | | Use this file as the run's ONLY config (replaces global + project) | |
 | `--op-env <id>` | | Load env vars from a 1Password Environment (highest priority) | |
@@ -421,8 +422,8 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 | `CLAUDISH_QWEN_NO_THINK` | Disable thinking for Qwen models (`1`) | |
 | `CLAUDISH_NO_PREDEFINED_ENDPOINTS` | Turn the bundled endpoint catalog off entirely (`1`) | Catalog on |
 | `CLAUDISH_CLASSIFIER_PROVIDER` | Route auto-mode permission classifier to native Anthropic (`anthropic`) — see [Classifier Passthrough](docs/models/model-mapping.md#auto-mode-classifier-passthrough) | Off |
-| `CLAUDISH_CLASSIFIER_MODEL` | Native Claude model for the classifier passthrough (also enables it) | `claude-sonnet-5` |
-| `CLAUDISH_CLASSIFIER_DEBUG` | Dump raw requests to `logs/classifier-capture.jsonl` for classifier-detection debugging (`1`) | Off |
+| `CLAUDISH_CLASSIFIER_MODEL` | Native Claude model for the classifier passthrough (also enables it) | Derived Sonnet tier |
+| `CLAUDISH_CLASSIFIER_DEBUG` | Dump every request's model/params/**unredacted system prompt**/headers to `logs/classifier-capture.jsonl` (`1`) — the system prompt includes your `CLAUDE.md` and project rules; see [Classifier Passthrough](docs/models/model-mapping.md#auto-mode-classifier-passthrough) | Off |
 
 #### Claude Code Compatibility
 

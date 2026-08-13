@@ -97,7 +97,7 @@ runs on another provider. Full guide: [Model Mapping → Auto-Mode Classifier Pa
 
 ### `CLAUDISH_CLASSIFIER_PROVIDER`
 
-Set to `anthropic` to enable classifier passthrough (default off). CLI equivalent: `--classifier-provider anthropic`.
+Set to `anthropic` to enable classifier passthrough (default off). Set to `off`, `0`, or `false` to force it off — which also overrides `CLAUDISH_CLASSIFIER_MODEL`, so an export left in a shell profile can still be switched off for a run. CLI equivalents: `--classifier-provider anthropic` and `--no-classifier-passthrough`.
 
 ```bash
 export CLAUDISH_CLASSIFIER_PROVIDER=anthropic
@@ -105,7 +105,11 @@ export CLAUDISH_CLASSIFIER_PROVIDER=anthropic
 
 ### `CLAUDISH_CLASSIFIER_MODEL`
 
-Native Claude model the classifier request is rewritten onto. Setting it also enables passthrough. Defaults to `claude-sonnet-5`. CLI equivalent: `--classifier-model <id>`.
+Native Claude model the classifier request is rewritten onto. Setting it also enables passthrough. CLI equivalent: `--classifier-model <id>`.
+
+Left unset, claudish resolves a current Sonnet-tier model rather than a pinned id: your own
+`--model-sonnet` mapping when it names a real `claude-sonnet-*` model, then the model catalog's
+current Anthropic Sonnet pointer, then a built-in fallback if the catalog is unavailable.
 
 ```bash
 export CLAUDISH_CLASSIFIER_MODEL=claude-sonnet-5
@@ -113,7 +117,13 @@ export CLAUDISH_CLASSIFIER_MODEL=claude-sonnet-5
 
 ### `CLAUDISH_CLASSIFIER_DEBUG`
 
-Set to `1` to dump each request's raw model / sampling params / system prompt / headers to `logs/classifier-capture.jsonl` for troubleshooting detection. Off by default.
+Set to `1` to dump each request's raw model / sampling params / `system` array / headers to `logs/classifier-capture.jsonl` for troubleshooting detection. Off by default; the file stops growing at 32 MB.
+
+> **Privacy:** the dump is unredacted and covers **every** request, not just the classifier's.
+> The `system` array it records is your session's full system prompt — **`CLAUDE.md`, project
+> `.claude/` rules, output styles, agent instructions** — plus Claude Code's billing header
+> (client version and a per-turn hash). Credentials are masked (`<present>`); prompt content is
+> not. Review the file before sharing it, and unset the flag when you are finished.
 
 Off by default deliberately: the captured `system` array is the **full** system prompt, which carries your CLAUDE.md and project rules, and the classifier request additionally names the command being classified. Credentials are recorded only as `<present>`, never as values. Turn it on to diagnose a drifted detection marker, then turn it back off and delete the file.
 

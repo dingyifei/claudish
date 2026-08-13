@@ -5,12 +5,10 @@ import { cors } from "hono/cors";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
 import { credentials } from "./auth/credentials/authority.js";
+import { isAutoModeClassifierRequest, looksLikeClassifierShape } from "./behavior/harness.js";
 import { loadHookRules } from "./behavior/hooks.js";
 import { parseBehaviorConfig, registerHookRules } from "./behavior/index.js";
-import {
-  isAutoModeClassifierRequest,
-  rewriteClassifierForNative,
-} from "./classifier-passthrough.js";
+import { rewriteClassifierForNative } from "./classifier-passthrough.js";
 import { ComposedHandler, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
@@ -127,10 +125,24 @@ export interface ProxyServerOptions {
  * permission classifier's system marker (and its payload shape) can be verified
  * or discovered. Writes to a purpose-built file — NOT the redacted always-on
  * log — so it never pollutes structural logging. Best-effort; never throws.
+ *
+ * PRIVACY: the capture is UNREDACTED and covers EVERY inbound request, not just
+ * the classifier's — it runs before detection so a drifted marker can still be
+ * discovered. The `system` array it records is the session's full system prompt:
+ * CLAUDE.md, project `.claude/` rules, output styles, agent instructions, plus
+ * Claude Code's `x-anthropic-billing-header` block (client version + a per-turn
+ * hash). Credentials are masked to `<present>`; prompt content is not. Read the
+ * file before sharing it, and unset the flag when finished.
  */
+const CLASSIFIER_CAPTURE_MAX_BYTES = 32 * 1024 * 1024;
+let classifierCaptureBytes = 0;
 let classifierCaptureDirReady = false;
 function maybeCaptureClassifierRequest(c: Context, body: any): void {
-  if (!process.env.CLAUDISH_CLASSIFIER_DEBUG) return;
+  // Truthiness alone would treat `CLAUDISH_CLASSIFIER_DEBUG=0` as ON — a string
+  // "0" is truthy — quietly writing every system prompt to disk for anyone who
+  // set it to turn the capture OFF.
+  const flag = process.env.CLAUDISH_CLASSIFIER_DEBUG?.trim().toLowerCase();
+  if (!flag || flag === "0" || flag === "false" || flag === "off") return;
   try {
     const dir = join(process.cwd(), "logs");
     if (!classifierCaptureDirReady) {
@@ -148,6 +160,13 @@ function maybeCaptureClassifierRequest(c: Context, body: any): void {
       thinking: body?.thinking,
       hasTools: Array.isArray(body?.tools) && body.tools.length > 0,
       tool_choice: body?.tool_choice,
+      output_config: body?.output_config,
+      // Counts and roles only — never message content. Enough to characterise
+      // the request shape for drift analysis without transcribing the session.
+      messageCount: Array.isArray(body?.messages) ? body.messages.length : null,
+      messageRoles: Array.isArray(body?.messages)
+        ? body.messages.map((m: any) => m?.role ?? "?")
+        : null,
       system: body?.system,
       headers: {
         "anthropic-beta": c.req.header("anthropic-beta") ?? null,
@@ -157,7 +176,20 @@ function maybeCaptureClassifierRequest(c: Context, body: any): void {
         "x-api-key": c.req.header("x-api-key") ? "<present>" : null,
       },
     };
-    appendFileSync(join(dir, "classifier-capture.jsonl"), `${JSON.stringify(record)}\n`);
+    const line = `${JSON.stringify(record)}\n`;
+    // Cap the file. One captured classifier request carries a ~110 KB system
+    // prompt, so an unattended session reaches hundreds of MB — and this is a
+    // synchronous write on the request path. Stop cleanly at the cap and say so
+    // once, rather than filling the disk of whoever forgot the flag was set.
+    if (classifierCaptureBytes >= CLASSIFIER_CAPTURE_MAX_BYTES) return;
+    classifierCaptureBytes += line.length;
+    appendFileSync(join(dir, "classifier-capture.jsonl"), line);
+    if (classifierCaptureBytes >= CLASSIFIER_CAPTURE_MAX_BYTES) {
+      appendFileSync(
+        join(dir, "classifier-capture.jsonl"),
+        `${JSON.stringify({ note: "capture stopped: size cap reached", capBytes: CLASSIFIER_CAPTURE_MAX_BYTES })}\n`
+      );
+    }
   } catch {
     // Diagnostic capture is best-effort — never break the request path.
   }
@@ -833,6 +865,38 @@ export async function createProxyServer(
   const app = new Hono();
   app.use("*", cors());
 
+  // Classifier-passthrough observability. Closure-scoped so two proxies in one
+  // process (tests, probes) never share counts.
+  let classifierHits = 0;
+  let classifierShapeMisses = 0;
+  let classifierShapeMismatches = 0;
+  const classifierWarnings: string[] = [];
+  let classifierWarned = false;
+
+  /**
+   * Record a classifier-detection anomaly at most once per proxy lifetime.
+   *
+   * Persist immediately, print later. Writing to the terminal here would land
+   * inside Claude Code's live TUI — which is exactly why DiagOutput exists — so
+   * the durable record goes to the always-on log now (the `[Proxy]` prefix is
+   * what makes it structural-log-worthy; `[Classifier]` is not on that list),
+   * and the launcher surfaces the text after Claude Code exits and the terminal
+   * is free again. Deliberately NOT gated on `quiet`: single-shot runs default
+   * to quiet, so a quiet-guarded security warning would suppress itself in
+   * precisely the unattended case.
+   */
+  function warnClassifierAnomalyOnce(message: string): void {
+    if (classifierWarned) return;
+    try {
+      // Latch before I/O so a broken sink cannot produce a second warning.
+      classifierWarned = true;
+      classifierWarnings.push(message);
+      log(`[Proxy] classifier passthrough: ${message}`);
+    } catch {
+      // A diagnostic must never break the request path.
+    }
+  }
+
   // Terminal-safety backstop. Hono's DEFAULT error handler is literally
   // `console.error(err)` + a text/plain "Internal Server Error" (see
   // hono/dist/hono-base.js). During an interactive session claudish's stderr IS
@@ -1028,21 +1092,54 @@ export async function createProxyServer(
 
       // Classifier passthrough (opt-in, default off): Claude Code's auto-mode
       // permission classifier is identified by CONTENT (a marker in its system
-      // prompt), not model name. When enabled, reroute it to a native Claude
-      // model on api.anthropic.com via nativeHandler (which forwards the inbound
-      // Claude Max OAuth and the system array — incl. the x-anthropic-billing-header
-      // block — verbatim), bypassing role-based routing. This lets the main loop
+      // prompt), not by model name — it arrives carrying an ordinary Claude id,
+      // so role-based routing would hand it to whatever provider that tier maps
+      // to. When enabled, reroute it to a native Claude model on
+      // api.anthropic.com via nativeHandler (which forwards the inbound OAuth
+      // and the body verbatim), bypassing role routing. This lets the main loop
       // run on another provider (e.g. Codex) while the safety classifier still
       // runs on a real Claude model. Skipped in monitor mode (everything is
-      // already native there). See classifier-passthrough.ts.
-      if (!monitorMode && options.classifier?.enabled && isAutoModeClassifierRequest(body)) {
-        log(
-          `[Classifier] auto-mode permission classifier → native Anthropic (model ${body.model} → ${options.classifier.model})`
-        );
-        // Rewrite onto the native Claude model + strip 400-prone fields (see
-        // classifier-passthrough.ts). Log first — it reads the original body.model.
-        rewriteClassifierForNative(body, options.classifier.model);
-        return nativeHandler.handle(c, body);
+      // already native there). Detection lives in behavior/harness.ts.
+      if (!monitorMode && options.classifier?.enabled) {
+        if (isAutoModeClassifierRequest(body)) {
+          classifierHits++;
+          log(
+            `[Proxy] classifier passthrough: auto-mode permission classifier → native Anthropic (model ${body.model} → ${options.classifier.model})`
+          );
+          // A marker hit whose SHAPE does not match is the false-positive
+          // direction: some other request began a system block with the monitor
+          // sentence, and rerouting it would send that conversation to Anthropic
+          // instead of the provider the user chose. Route anyway — the marker is
+          // the stronger signal and refusing would silently degrade the security
+          // control — but say so, because the user cannot otherwise see it.
+          if (!looksLikeClassifierShape(body)) {
+            classifierShapeMismatches++;
+            warnClassifierAnomalyOnce(
+              "a request carried the classifier marker but NOT the classifier shape " +
+                "(expected: non-streaming, no tools, small max_tokens, multi-block system). " +
+                "It was rerouted to api.anthropic.com. If this was ordinary traffic, that " +
+                "conversation went to Anthropic rather than your configured provider."
+            );
+          }
+          // Rewrite onto the native Claude model, preserving its thinking
+          // configuration (see classifier-passthrough.ts — deleting it turns
+          // adaptive thinking ON). Log first: it reads the original body.model.
+          rewriteClassifierForNative(body, options.classifier.model);
+          return await nativeHandler.handle(c, body);
+        }
+        // Marker missed on a classifier-shaped request: detection is a string
+        // match against a prompt Anthropic can reword without notice, and it
+        // fails OPEN — passthrough silently stops and every classifier call goes
+        // back to the foreign main-loop provider. Shout once.
+        if (looksLikeClassifierShape(body)) {
+          classifierShapeMisses++;
+          warnClassifierAnomalyOnce(
+            "a request matched the auto-mode classifier SHAPE but not its system-prompt marker. " +
+              "Claude Code's classifier prompt has most likely changed wording, so passthrough is " +
+              "now failing OPEN and your permission classifier is running on the main-loop provider. " +
+              "Re-capture with CLAUDISH_CLASSIFIER_DEBUG=1 and update the marker in behavior/harness.ts."
+          );
+        }
       }
 
       const handler = await getHandlerForRequest(body.model);
@@ -1113,6 +1210,14 @@ export async function createProxyServer(
       // can't keep the port alive after shutdown resolves.
       await server.stop(true);
     },
+    classifierStats: () => ({
+      enabled: options.classifier?.enabled ?? false,
+      model: options.classifier?.model,
+      hits: classifierHits,
+      shapeMisses: classifierShapeMisses,
+      shapeMismatches: classifierShapeMismatches,
+      warnings: [...classifierWarnings],
+    }),
     invalidateHandlerCache: (providerSlug?: string) => {
       if (!providerSlug) {
         localProviderHandlers.clear();

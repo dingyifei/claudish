@@ -10,6 +10,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isNativeClaudeModelId } from "./classifier-passthrough.js";
 import { ENV } from "./config.js";
 import { buildLegacyHint, resolveDefaultProvider } from "./default-provider.js";
 import {
@@ -402,6 +403,15 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
         console.error("--classifier-model requires a model id");
         process.exit(1);
       }
+      // The classifier is rewritten onto this id and sent to api.anthropic.com,
+      // so a non-Claude id is a guaranteed 400 at request time. Reject it here,
+      // where the message can name the flag, instead of mid-session.
+      if (!isNativeClaudeModelId(cmArg)) {
+        console.error(
+          `--classifier-model must be a native Claude model id (e.g. claude-sonnet-5); got "${cmArg}"`
+        );
+        process.exit(1);
+      }
       config.classifierModel = cmArg;
     } else if (arg === "--classifier-provider") {
       const cpArg = args[++i];
@@ -409,7 +419,20 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
         console.error("--classifier-provider requires a provider name (e.g. anthropic)");
         process.exit(1);
       }
+      // Anthropic is the only provider that can serve the classifier. Silently
+      // ignoring anything else would leave the user believing the passthrough
+      // is on when it is off — the failure mode this feature exists to avoid.
+      if (cpArg.trim().toLowerCase() !== "anthropic") {
+        console.error(
+          `--classifier-provider only supports "anthropic" (the classifier must run on a real Claude model); got "${cpArg}"`
+        );
+        process.exit(1);
+      }
       config.classifierProvider = cpArg;
+    } else if (arg === "--no-classifier-passthrough") {
+      // Explicit off switch: enablement ORs several sources, so without this a
+      // CLAUDISH_CLASSIFIER_MODEL in a shell profile is unswitchable-off.
+      config.classifierPassthrough = false;
     } else if (arg === "--op-env" || arg.startsWith("--op-env=")) {
       // The actual 1Password Environment read happens early in index.ts
       // (highest priority). Here we only consume the flag + its value so it
@@ -2077,6 +2100,14 @@ ${h("OPTIONS")}
                            ${dim("(metered API billing). Default: the key is hidden so Claude Code")}
                            ${dim("uses your claude.ai subscription. Env: CLAUDISH_ANTHROPIC_API_BILLING")}
                            ${dim("Config: anthropicApiBilling: true")}
+  ${green("--classifier-provider")} ${yellow("<p>")}  Run Claude Code's auto-mode permission classifier on native
+                           ${dim("Anthropic while the main loop runs elsewhere. Only 'anthropic'.")}
+                           ${dim("Opt-in. Env: CLAUDISH_CLASSIFIER_PROVIDER")}
+  ${green("--classifier-model")} ${yellow("<model>")}  Claude model the classifier is rewritten onto (also enables it)
+                           ${dim("Default: a current Sonnet tier, derived from --model-sonnet or")}
+                           ${dim("the model catalog. Env: CLAUDISH_CLASSIFIER_MODEL")}
+  ${green("--no-classifier-passthrough")}  Force classifier passthrough OFF, overriding the env vars
+                           ${dim("above — for when CLAUDISH_CLASSIFIER_* lives in a shell profile")}
   ${green("--config")} ${yellow("<file>")}          Use THIS config file for the run, fully replacing the machine
                            ${dim("global (~/.claudish/config.json) AND project (.claudish.json).")}
                            ${dim("A file naming no op:// source never touches 1Password (no prompt).")}

@@ -81,6 +81,10 @@ export interface ClaudishConfig {
   // api.anthropic.com (native OAuth) even when the main loop runs on another provider.
   classifierModel?: string; // --classifier-model <m> (also enables the passthrough)
   classifierProvider?: string; // --classifier-provider anthropic (enables the passthrough)
+  // --no-classifier-passthrough. Explicitly false forces the passthrough off and
+  // outranks every enabling source above — without it, a CLAUDISH_CLASSIFIER_MODEL
+  // left in a shell profile could not be switched back off for a single run.
+  classifierPassthrough?: boolean;
 
   // Cost tracking
   costTracking?: boolean;
@@ -175,11 +179,35 @@ export interface OpenRouterResponse {
   };
 }
 
+/**
+ * Classifier-passthrough counters for one proxy's lifetime, read by the
+ * launcher at exit. `warnings` carries text the proxy deliberately did NOT
+ * print itself, because doing so mid-session would land inside Claude Code's
+ * TUI — see warnClassifierAnomalyOnce in proxy-server.ts.
+ */
+export interface ClassifierStats {
+  enabled: boolean;
+  model?: string;
+  /** Requests matched by the system-prompt marker and rerouted to Anthropic. */
+  hits: number;
+  /** Classifier-SHAPED requests the marker missed — detection has likely drifted. */
+  shapeMisses: number;
+  /** Marker hits that did NOT look classifier-shaped — possible false positive. */
+  shapeMismatches: number;
+  warnings: string[];
+}
+
 // Proxy Server
 export interface ProxyServer {
   port: number;
   url: string;
   shutdown: () => Promise<void>;
+  /**
+   * Classifier-passthrough counters, when this proxy tracks them. OPTIONAL:
+   * the persistent-daemon path returns a hand-built stub that cannot report
+   * in-process counts, and a required member would break it.
+   */
+  classifierStats?: () => ClassifierStats;
   /**
    * Drop any cached per-provider handlers so the next request rebuilds
    * the transport with current config (URL, API key, etc.). Called by the
