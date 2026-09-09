@@ -3,8 +3,10 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type DaemonConfig,
   type DaemonRecord,
   daemonConfigFromArgv,
+  daemonProxyHandle,
   isPidAlive,
   listDaemons,
   readDaemonRecords,
@@ -102,5 +104,43 @@ describe("daemonConfigFromArgv", () => {
 
   test("returns null when the flag is absent", () => {
     expect(daemonConfigFromArgv(["node", "claudish", "--model", "gpt-4o"])).toBeNull();
+  });
+});
+
+describe("daemonProxyHandle", () => {
+  test("reports the model request count as unknown, never as zero", () => {
+    // index.ts prints "Claude Code exited before sending any model request"
+    // when the count is exactly 0. The launcher cannot see the daemon's
+    // counter, so the handle must not answer 0 and trigger that false claim.
+    const handle = daemonProxyHandle(4000);
+    expect(handle.modelRequestCount()).not.toBe(0);
+    expect(handle.modelRequestCount()).toBe(-1);
+  });
+
+  test("shutdown is a no-op so the daemon outlives the launcher", async () => {
+    const handle = daemonProxyHandle(4000);
+    await expect(handle.shutdown()).resolves.toBeUndefined();
+    expect(handle.url).toBe("http://127.0.0.1:4000");
+  });
+});
+
+describe("DaemonConfig argv round-trip", () => {
+  test("carries --effort-override, --model-params and --pro-on-ultracode", () => {
+    // The daemon receives its config as one JSON argv blob. A field missing
+    // from DaemonConfig is dropped silently, so --persist-proxy would change
+    // the request shape. Pin the three v7.67.0 flags survive the trip.
+    const cfg: DaemonConfig = {
+      port: 4000,
+      idleTimeoutMs: 1000,
+      launcherPid: 1,
+      effortOverride: "high",
+      modelParams: { reasoning: { mode: "pro" } },
+      proOnUltracode: true,
+    };
+    const argv = ["node", "claudish", "--proxy-daemon", JSON.stringify(cfg)];
+    const back = JSON.parse(daemonConfigFromArgv(argv) ?? "{}") as DaemonConfig;
+    expect(back.effortOverride).toBe("high");
+    expect(back.modelParams).toEqual({ reasoning: { mode: "pro" } });
+    expect(back.proOnUltracode).toBe(true);
   });
 });

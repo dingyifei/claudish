@@ -1095,6 +1095,12 @@ async function runCli() {
             // to build the same FallbackHandler the in-process proxy would.
             modelChain: cliConfig.modelChain,
             classifier: resolveClassifierConfig(cliConfig, process.env),
+            // Same three flags the in-process path hands createProxyServer;
+            // dropping them here would make --persist-proxy silently change
+            // request shape.
+            effortOverride: cliConfig.effortOverride,
+            modelParams: cliConfig.modelParams,
+            proOnUltracode: cliConfig.proOnUltracode,
             anthropicApiKey: cliConfig.anthropicApiKey,
             idleTimeoutMs,
             launcherPid: process.pid,

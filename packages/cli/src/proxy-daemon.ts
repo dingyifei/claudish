@@ -68,6 +68,12 @@ export interface DaemonConfig {
    *  same FallbackHandler the in-process proxy would. */
   modelChain?: string[];
   classifier?: { enabled: boolean; model: string };
+  /** `--effort-override`: pinned effort level, forwarded verbatim (v7.67.0). */
+  effortOverride?: string;
+  /** `--model-params`: extra payload params; plain JSON, survives argv. */
+  modelParams?: Record<string, unknown>;
+  /** `--pro-on-ultracode`: apply the catalog pro preset during ultracode. */
+  proOnUltracode?: boolean;
   idleTimeoutMs: number;
   launcherPid: number;
 }
@@ -214,15 +220,29 @@ export async function spawnProxyDaemon(input: SpawnDaemonInput): Promise<ProxySe
     throw new Error(`Persistent proxy daemon failed to start on ${url} within timeout`);
   }
 
+  return daemonProxyHandle(cfg.port);
+}
+
+/**
+ * The launcher-side `ProxyServer` handle for a proxy that lives in ANOTHER
+ * process. Every member is a stand-in: the launcher can neither stop the
+ * daemon (it must outlive the launcher by design) nor reach into its caches
+ * or counters. Exported so the contract is testable without spawning.
+ */
+export function daemonProxyHandle(port: number): ProxyServer {
   return {
-    port: cfg.port,
-    url,
+    port,
+    url: `http://127.0.0.1:${port}`,
     // Intentionally a no-op: the daemon must survive launcher exit. Use
     // `claudish proxy stop` (or the idle timeout) to terminate it.
     shutdown: async () => {},
     // The daemon has its own handler caches; the launcher can't reach into
     // another process, so this is a no-op for the persistent path.
     invalidateHandlerCache: () => {},
+    // The counter lives in the daemon process; the launcher cannot read it.
+    // -1 means "unknown" and deliberately fails index.ts's `=== 0` test, so
+    // daemon mode never claims Claude Code contacted no model.
+    modelRequestCount: () => -1,
   };
 }
 
@@ -292,6 +312,9 @@ export async function runProxyDaemon(configJson: string): Promise<void> {
         advisorCollector: cfg.advisorCollector,
         modelChain: cfg.modelChain,
         classifier: cfg.classifier,
+        effortOverride: cfg.effortOverride,
+        modelParams: cfg.modelParams,
+        proOnUltracode: cfg.proOnUltracode,
         idleTimeoutMs: cfg.idleTimeoutMs,
         onIdleTimeout: () => {
           cleanup();
