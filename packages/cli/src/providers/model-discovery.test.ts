@@ -23,6 +23,7 @@ import {
 } from "./model-discovery.js";
 import type { ProviderDefinition } from "./provider-definitions.js";
 import { clearRuntimeRegistry, registerRuntimeProvider } from "./runtime-providers.js";
+import { OpenAIProviderTransport } from "./transport/openai.js";
 
 const realFetch = globalThis.fetch;
 const realGetRequestAuth = credentials.getRequestAuth;
@@ -496,5 +497,50 @@ describe("rankDiscoveredModels", () => {
     ]);
 
     expect(ranked[0]?.id).toBe("k3");
+  });
+});
+
+describe("OpenAI-compatible probe discovery", () => {
+  test("uses an authenticated account roster and advances past excluded models", async () => {
+    const provider: ProviderDefinition = {
+      name: "account-scoped-openai-probe-test",
+      displayName: "Account Scoped Probe Test",
+      transport: "openai",
+      baseUrl: "https://account-scoped.invalid",
+      apiPath: "/v1/chat/completions",
+      apiKeyEnvVar: "ACCOUNT_SCOPED_PROBE_TEST_KEY",
+      apiKeyDescription: "Offline test key",
+      apiKeyUrl: "https://account-scoped.invalid/key",
+      shortcuts: [],
+      legacyPrefixes: [],
+      modelDiscovery: { path: "/v1/models", format: "openai-models-list" },
+      createHandler: { kind: "none", reason: "virtual", note: "Offline test fixture" },
+      isDirectApi: true,
+    };
+    registerRuntimeProvider(provider);
+    stubJsonResponse({
+      data: [
+        { id: "grok-4.5", context_length: 500_000 },
+        { id: "grok-4.6", context_length: 1_000_000 },
+        { id: "grok-imagine-image", context_length: 2_000_000 },
+      ],
+    });
+
+    const transport = new OpenAIProviderTransport(
+      {
+        name: provider.name,
+        baseUrl: provider.baseUrl,
+        apiPath: provider.apiPath,
+        apiKeyEnvVar: provider.apiKeyEnvVar,
+        prefixes: [],
+      },
+      "<discover>",
+      ""
+    );
+
+    expect(await transport.discoverProbeModel()).toEqual({ model: "grok-4.6" });
+    expect(await transport.discoverProbeModel(new Set(["grok-4.6"]))).toEqual({
+      model: "grok-4.5",
+    });
   });
 });

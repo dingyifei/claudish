@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  type AgyRefreshOutcome,
   type AntigravityToken,
   type AntigravityTokenDeps,
   _resetAntigravityTokenState,
@@ -44,7 +45,8 @@ function makeFakeDeps(
   onRefresh: (
     setStore: (raw: string | null) => void,
     getStore: () => string | null
-  ) => void = () => {}
+  ) => void = () => {},
+  refreshOutcome: AgyRefreshOutcome = { kind: "ran" }
 ) {
   let store = initialStore;
   let refreshCallCount = 0;
@@ -67,6 +69,7 @@ function makeFakeDeps(
     runAgyRefresh: () => {
       refreshCallCount += 1;
       onRefresh(setStore, () => store);
+      return refreshOutcome;
     },
     now: () => NOW,
   };
@@ -78,6 +81,16 @@ function makeFakeDeps(
     getRefreshCallCount: () => refreshCallCount,
     getDeleteCallCount: () => deleteCallCount,
   };
+}
+
+async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
+  try {
+    await promise;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  throw new Error("Expected promise to reject");
 }
 
 beforeEach(() => {
@@ -181,13 +194,61 @@ describe("getValidAntigravityAccessToken", () => {
   );
 
   test.skipIf(process.platform !== "darwin")(
-    "throws an actionable error when agy leaves the expired store unchanged",
+    "explains when the Antigravity CLI is not installed",
+    async () => {
+      const fake = makeFakeDeps(encodeStore({ token: makeToken() }), () => {}, {
+        kind: "not-installed",
+      });
+
+      const message = await rejectionMessage(getValidAntigravityAccessToken(fake.deps));
+
+      expect(message).toContain("not installed");
+      expect(message).toContain("claudish login antigravity");
+      expect(fake.getRefreshCallCount()).toBe(1);
+    }
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "reports a timed-out auto-update without claiming the session was revoked",
+    async () => {
+      const fake = makeFakeDeps(encodeStore({ token: makeToken() }), () => {}, { kind: "timeout" });
+
+      const message = await rejectionMessage(getValidAntigravityAccessToken(fake.deps));
+
+      expect(message).toMatch(/did not finish within \d+s/);
+      expect(message).toContain("auto-updates");
+      expect(message).toContain("Try again");
+      expect(message).not.toContain("revoked");
+      expect(message).not.toContain("claudish login antigravity");
+      expect(fake.getRefreshCallCount()).toBe(1);
+    }
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "includes the Antigravity CLI failure detail",
+    async () => {
+      const detail = "refresh command failed: upstream account unavailable";
+      const fake = makeFakeDeps(encodeStore({ token: makeToken() }), () => {}, {
+        kind: "failed",
+        detail,
+      });
+
+      const message = await rejectionMessage(getValidAntigravityAccessToken(fake.deps));
+
+      expect(message).toContain(detail);
+      expect(fake.getRefreshCallCount()).toBe(1);
+    }
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "reports a revoked session when agy runs but leaves the expired store unchanged",
     async () => {
       const fake = makeFakeDeps(encodeStore({ token: makeToken() }));
 
-      await expect(getValidAntigravityAccessToken(fake.deps)).rejects.toThrow(
-        /claudish login antigravity/
-      );
+      const message = await rejectionMessage(getValidAntigravityAccessToken(fake.deps));
+
+      expect(message).toContain("revoked");
+      expect(message).toContain("claudish login antigravity");
       expect(fake.getRefreshCallCount()).toBe(1);
     }
   );

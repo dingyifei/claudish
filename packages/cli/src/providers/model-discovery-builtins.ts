@@ -41,6 +41,23 @@ async function fetchDevinRoster(): Promise<DiscoveredModel[]> {
 }
 
 /**
+ * Ids the backend does not declare, but which are still not chat models.
+ *
+ * `fetchAvailableModels` states unselectability three ways — `isInternal`, the
+ * per-feature role lists, and `deprecatedModelIds` — and those cover everything
+ * except the `tab_*` pair, which appears in no list and carries no flag. They
+ * are the editor's as-you-type completion models: 4096 max output, no thinking,
+ * no images, `recommended: false`. They answer HTTP 200, which is precisely what
+ * made a wrong-host problem look like a rate limit for an entire session.
+ *
+ * Prefix-matched, because the ids carry build numbers that rot on each roster
+ * roll. This is the ONLY guess left in the filter; everything else is declared.
+ */
+function isUndeclaredEditorInternal(id: string): boolean {
+  return id.startsWith("tab_");
+}
+
+/**
  * Antigravity lists over an OAuth POST to a Google internal endpoint, not a GET.
  *
  * The reason it is worth a fetcher at all is `maxTokens`: the response reports
@@ -58,13 +75,24 @@ async function fetchAntigravityRoster(): Promise<DiscoveredModel[]> {
   if (!token) return [];
 
   const { projectId } = await setupAntigravityUser(token);
-  const { servedIds, meta } = await getServedAntigravityModels(token, projectId);
-  return servedIds.map((id) => {
+  const { servedIds, meta, excludedIds } = await getServedAntigravityModels(token, projectId);
+  // Declared first, guess second. `excludedIds` is the backend's own verdict —
+  // internal flags, per-feature role bindings, and retired ids (which look
+  // entirely normal but answer 400).
+  const declaredExcluded = excludedIds ?? new Set<string>();
+  const selectable = servedIds.filter(
+    (id) => !declaredExcluded.has(id) && !isUndeclaredEditorInternal(id)
+  );
+  return selectable.map((id) => {
     const m = meta[id];
     // contextWindow is left UNSET when the backend reported none
     // (gemini-3.1-flash-image does), so the catalog still gets its turn rather
     // than the row rendering a fabricated 0 as "N/A".
-    return m?.contextWindow ? { id, contextWindow: m.contextWindow } : { id };
+    // Every id here is a tuned variant (`-high`, `-tiered`) the catalog does not
+    // carry; see `ignoreCatalogReleaseDate` for the ordering this protects.
+    return m?.contextWindow
+      ? { id, contextWindow: m.contextWindow, ignoreCatalogReleaseDate: true }
+      : { id, ignoreCatalogReleaseDate: true };
   });
 }
 

@@ -14,24 +14,22 @@
     "terminal@magus": true,
     "madbench@magus": true,
     "claudish@magus": true,
-    "mnemex@magus": true,
-    "statusline@magus": true,
-    "kanban@magus": true
+    "mnemex@magus": true
   },
+  "outputStyle": "composed",
   "installedPluginVersions": {
     "skill-creator@claude-plugins-official": "0.0.0",
-    "designer@magus": "0.5.0",
+    "designer@magus": "0.6.1",
     "gtd@magus": "2.0.1",
-    "browser-use@magus": "1.4.0",
-    "kanban@magus": "1.6.0",
-    "claudish@magus": "1.0.0",
+    "browser-use@magus": "1.7.4",
+    "kanban@magus": "1.6.2",
+    "claudish@magus": "2.0.3",
     "mnemex@magus": "1.0.0",
-    "code-analysis@magus": "5.4.0",
-    "multimodel@magus": "3.6.0",
+    "code-analysis@magus": "5.4.3",
+    "multimodel@magus": "4.0.2",
     "statusline@magus": "3.0.0",
-    "dev@magus": "4.1.0",
-    "terminal@magus": "4.1.4",
-    "madbench@magus": "0.1.1"
-  },
-  "outputStyle": "composed"
+    "dev@magus": "7.0.0",
+    "terminal@magus": "5.0.0",
+    "madbench@magus": "0.3.0"
+  }
 }

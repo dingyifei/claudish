@@ -173,6 +173,45 @@ describe("createAssistantTextCapture", () => {
   });
 });
 
+describe("createAssistantTextCapture — protocol frames are not prose", () => {
+  // REGRESSION: `rate_limit_event` was absent from STREAM_JSON_EVENT_TYPES, so it
+  // fell to the passthrough branch and was written into the captured answer.
+  // Measured 2026-08-22: a two-byte reply was recorded as 191 B, which corrupts
+  // outputSize and silently defeats min_output_bytes.
+  const rateLimitFrame =
+    '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed",' +
+    '"isUsingOverage":false},"uuid":"5c30f135","session_id":"7ffb7032"}\n';
+
+  const assistantFrame = (text: string) =>
+    `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }] } })}\n`;
+
+  it("drops rate_limit_event instead of emitting it as text", () => {
+    const cap = createAssistantTextCapture();
+    let out = cap.write(assistantFrame("OK"));
+    out += cap.write(rateLimitFrame);
+    out += cap.end();
+    // Exact value, not trimmed: the capture terminates the answer with a newline,
+    // and asserting the real string keeps that pinned too.
+    expect(out).toBe("OK\n");
+    expect(out).not.toContain("rate_limit_event");
+  });
+
+  it("a rate_limit_event alone captures nothing", () => {
+    const cap = createAssistantTextCapture();
+    const out = cap.write(rateLimitFrame) + cap.end();
+    expect(out).toBe("");
+  });
+
+  it("still passes genuinely unknown JSON through, as the degradation note promises", () => {
+    // The passthrough branch exists for output that is not our protocol at all.
+    // Fixing rate_limit_event must not turn it into a silent dropper.
+    const cap = createAssistantTextCapture();
+    const line = '{"type":"something-we-have-never-seen","x":1}\n';
+    const out = cap.write(line) + cap.end();
+    expect(out).toContain("something-we-have-never-seen");
+  });
+});
+
 describe("resolveCaptureMode", () => {
   it("lets an explicit mode win over the environment", () => {
     expect(resolveCaptureMode("stream-json", { [TEAM_CAPTURE_ENV_VAR]: "print" })).toBe(

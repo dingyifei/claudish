@@ -27,6 +27,11 @@ export interface ModelTokenStats {
   is_free?: boolean;
   is_estimated?: boolean;
   updated_at?: number;
+  /**
+   * Per-tool invocation counts, as the proxy counted them. The distribution,
+   * not just a total — see `TokenTracker.getToolCalls`.
+   */
+  tool_calls?: { name?: string; count?: number }[];
 }
 
 /** Directory holding one token file per model, inside the session dir. */
@@ -39,9 +44,16 @@ export function tokenFileFor(sessionPath: string, anonId: string): string {
   return join(statsDir(sessionPath), `${anonId}.json`);
 }
 
-/** Read one model's token stats. Returns null when the child hasn't written yet. */
-export function readTokenStats(sessionPath: string, anonId: string): ModelTokenStats | null {
-  const path = tokenFileFor(sessionPath, anonId);
+/**
+ * Read a token file by PATH. Returns null when the child hasn't written yet.
+ *
+ * Path-addressed rather than port-addressed on purpose: `session-stats.ts`
+ * resolves the file from `CLAUDISH_TOKEN_FILE` in the CURRENT process's
+ * environment, which is the wrong file for any parent reading a CHILD's
+ * accounting — team and the channel session manager both hand each child a path
+ * of their own choosing.
+ */
+export function readTokenStatsAt(path: string): ModelTokenStats | null {
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, "utf-8")) as ModelTokenStats;
@@ -50,6 +62,11 @@ export function readTokenStats(sessionPath: string, anonId: string): ModelTokenS
     // token update, so a read can land mid-write. Treat as "not ready yet".
     return null;
   }
+}
+
+/** Read one model's token stats. Returns null when the child hasn't written yet. */
+export function readTokenStats(sessionPath: string, anonId: string): ModelTokenStats | null {
+  return readTokenStatsAt(tokenFileFor(sessionPath, anonId));
 }
 
 /** `12400` → `12.4k`. Keeps the status line narrow. */

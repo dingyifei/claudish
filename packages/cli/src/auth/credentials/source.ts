@@ -47,7 +47,21 @@ import { hasOAuthCredentials } from "../oauth-registry.js";
 import { realValue } from "./api-key-credential.js";
 import { credentials } from "./authority.js";
 
-/** Where a provider's credential resolves from. `null` = nowhere. */
+/**
+ * Where a provider's credential resolves from. `null` = nowhere.
+ *
+ * `"public"` is NO LONGER PRODUCED. It meant "the provider ships a built-in
+ * free key", an affordance removed in 2026-08 because its single user
+ * (OpenCode Zen) answered 401 to the hardcoded token and the mechanism made a
+ * provider report Ready without ever issuing a request. The member is retained
+ * because these strings are a WIRE CONTRACT read by the external
+ * claude-desktop-profiles app via `claudish providers --json`: dropping it from
+ * the union costs a coordinated release for no gain, while leaving it costs an
+ * unreachable branch the consumer may still switch on harmlessly.
+ *
+ * A genuinely keyless provider is `authScheme: "none"`, which reports as normal
+ * readiness rather than a distinct source.
+ */
 export type CredentialSource = "e+c" | "env" | "cfg" | "oauth" | "local" | "public" | null;
 
 /** The subset of a provider definition the classification rules read. */
@@ -55,7 +69,6 @@ export interface SourceClassifiable {
   catalogName: string;
   apiKeyEnvVar: string;
   isLocal?: boolean;
-  publicKeyFallback?: boolean;
   oauthSlug?: string;
 }
 
@@ -88,15 +101,12 @@ export interface SourceConfig {
  *   "e+c"    - both env var AND config-file key present
  *   "env"    - env var only
  *   "cfg"    - config-file key only
- *   "public" - no user credential, but the provider ships a public/free key
- *              (publicKeyFallback) so it's usable as-is (e.g. OpenCode Zen)
  *   null     - no credentials of any kind
  *
- * "public" is checked LAST among the ready sources: a real env/cfg/oauth key
- * always takes precedence in the display, and the public-key affordance only
- * fills in when nothing else is set. Keeping it as a non-null source is what
- * makes the "configured first" sort, the "not configured" divider, the status
- * dot, and Test All all AGREE with providerIsReady.
+ * `"public"` is never returned — see the CredentialSource doc. A provider that
+ * needs no credential now declares `authScheme: "none"`, which the AUTHORITY
+ * reports as available; it has no distinct display source because there is no
+ * credential to describe.
  */
 export function describeSourceSync(p: SourceClassifiable, config: SourceConfig): CredentialSource {
   if (p.isLocal) return isLocalProviderEnabled(p.catalogName, config) ? "local" : null;
@@ -127,8 +137,6 @@ export function describeSourceSync(p: SourceClassifiable, config: SourceConfig):
   if (hasEnv && hasCfg) return "e+c";
   if (hasEnv) return "env";
   if (hasCfg) return "cfg";
-  // Keyless/free providers are usable without any user credential.
-  if (p.publicKeyFallback) return "public";
   return null;
 }
 

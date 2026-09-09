@@ -194,7 +194,7 @@ describe("AntigravityOAuth.logout", () => {
         deleteCallCount += 1;
         store = null;
       },
-      runAgyRefresh: () => {},
+      runAgyRefresh: () => ({ kind: "ran" }) as const,
       now: () => 0,
     };
 

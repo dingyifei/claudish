@@ -21,6 +21,7 @@ import {
   isFailureState,
   isReadyState,
 } from "../providers/probe-live.js";
+import { pinProbeModelSpec } from "../providers/probe-runner.js";
 import { bgHex, cliAnsi } from "../theme/ansi.js";
 import { getThemeMode } from "../theme/theme-mode.js";
 import {
@@ -418,6 +419,8 @@ function shortStatusLabel(
       return `${pc.red}⊗ rate-limited${pc.reset}`;
     case "out-of-credit":
       return `${pc.red}⊗ no credit${pc.reset}`;
+    case "plan-limit":
+      return `${pc.red}⊗ plan limit${pc.reset}`;
     case "server-error":
       return `${pc.red}⊗ server ${probe.httpStatus ?? ""}${pc.reset}`;
     case "timeout":
@@ -662,7 +665,12 @@ function buildDirectRowData(result: ModelResult): RowData[] {
     {
       num: "1",
       provider: result.nativeProvider,
-      spec: `${result.nativeProvider}@${result.model}`,
+      // `result.model` is the RAW user input, so it already carries the prefix
+      // whenever the user typed one — `--probe openrouter@gpt-5.6-sol` rendered
+      // as "openrouter@openrouter@gpt-5.6-sol". pinProbeModelSpec owns the
+      // prefixing rule (it also keeps native-anthropic bare, which a plain
+      // template would break); reuse it rather than repeat a second guard here.
+      spec: pinProbeModelSpec({ provider: result.nativeProvider, modelSpec: result.model }),
       status,
       errorDetail,
       barsTiming,

@@ -55,7 +55,8 @@ Options (run / run-and-judge):
   --path <dir>        Session directory (default: .)
   --models <a,b,...>  Comma-separated model IDs to run
   --input <text>      Task prompt (or create input.md in --path beforehand)
-  --timeout <secs>    Timeout per model in seconds (default: 300)
+  --timeout <secs>    Grid modes only: magmux's own per-pane timeout (default: 300).
+                      json mode has no deadline — nothing kills a working model.
   --grid              Show all models in a magmux grid with live output + status bar
 
 Options (judge / run-and-judge):
@@ -144,7 +145,6 @@ export async function teamCommand(args: string[]): Promise<void> {
       if (effectiveMode === "json") {
         setupSession(sessionPath, models, input);
         const runStatus = await runModels(sessionPath, {
-          timeout,
           onStatusChange: (id, s) => {
             process.stderr.write(`[team] ${id}: ${s.state}\n`);
           },
@@ -174,7 +174,6 @@ export async function teamCommand(args: string[]): Promise<void> {
       }
       setupSession(sessionPath, models, input);
       const status = await runModels(sessionPath, {
-        timeout,
         onStatusChange: (id, s) => {
           process.stderr.write(`[team] ${id}: ${s.state}\n`);
         },

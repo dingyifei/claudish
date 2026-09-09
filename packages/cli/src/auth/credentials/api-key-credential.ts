@@ -5,17 +5,28 @@
  *   1. process.env[envVar]
  *   2. process.env[alias] for each alias
  *   3. getApiKey(envVar) — config.json apiKeys map
- *   4. 1Password (op:// — lazy SDK, only when 1-3 missed AND an op source exists)
+ *   4. macOS Keychain (lazy `security`, only when 1-3 missed AND the backend is on)
+ *   5. 1Password (op:// — lazy SDK, only when 1-4 missed AND an op source exists)
  *
- * When step 4 resolves a key, the value is written THROUGH into process.env so
- * spawned child processes (MCP team/channel) inherit it and never touch the SDK.
- * The authority is the ONLY code that pushes op:// keys into process.env.
+ * Keychain precedes 1Password because it is local, prompt-free once its ACL is
+ * established, and ~17ms — where a 1Password resolve is a desktop-app handshake
+ * that can be denied, and whose denials trip a 15-second machine-wide
+ * suppression. Both remain BELOW env and config: a user who exports a key, or
+ * types one into the config, means it.
  *
- * `isAvailable()` additionally honors two affordances the legacy oracle granted:
- *   - `publicKeyFallback`: the provider ships a free/public key VALUE → always
- *     available, and `getRequestAuth()` emits that value when no real key resolves.
+ * When step 4 or 5 resolves a key, the value is written THROUGH into process.env
+ * so spawned child processes (MCP team/channel) inherit it and never touch the
+ * SDK or the keychain. The authority is the ONLY code that pushes keys from
+ * either vault into process.env.
+ *
+ * `isAvailable()` additionally honors one affordance the legacy oracle granted:
  *   - `oauthFallback`: a `<file>` under ~/.claudish/ — if that OAuth credential
  *     file exists, the provider is available even without an env/config/op key.
+ *
+ * There used to be a second, `publicKeyFallback`, which made a provider report
+ * available on the strength of a hardcoded literal token. It is gone: a keyless
+ * provider declares `authScheme: "none"` instead, which is handled below and
+ * says no credential is expected rather than inventing one.
  *
  * Resolution is memoized: the first await pays the env/config/op cost; later
  * reads return the cached result. `invalidate()` clears it (TUI hydrate-on-add).
@@ -27,6 +38,11 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { realValue } from "../../env-placeholder.js";
+import {
+  hasKeychainSource,
+  recordKeychainHydratedVar,
+  resolveKeychainKeyForEnvVars,
+} from "./keychain-source.js";
 import { resolveLocalApiKey } from "./local-api-key.js";
 import { hasOpSources, resolveOpKeyForEnvVars } from "./op-source.js";
 import type { CredentialProvider, RequestAuth, RequestAuthContext } from "./types.js";
@@ -42,12 +58,6 @@ export interface ApiKeyDescriptor {
    */
   authScheme?: "bearer" | "x-api-key" | "none";
   staticHeaders?: Record<string, string>;
-  /**
-   * Public/free API key VALUE (e.g. "public") sent when no real key resolves —
-   * the provider is always available and getRequestAuth emits this fallback as
-   * the key. Mirrors ProviderDefinition.publicKeyFallback (same string).
-   */
-  publicKeyFallback?: string;
   /**
    * OAuth credential filename under ~/.claudish/ (e.g. "codex-oauth.json"). If
    * the file exists, the provider counts as available even with no API key.
@@ -98,7 +108,6 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
    */
   private readonly authScheme: "bearer" | "x-api-key" | "none";
   private readonly staticHeaders: Record<string, string>;
-  private readonly publicKeyFallback?: string;
   private readonly oauthFallback?: string;
   private readonly declaredKey?: () => string | undefined;
 
@@ -113,7 +122,6 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
     this.aliases = descriptor.aliases ?? [];
     this.authScheme = descriptor.authScheme ?? "bearer";
     this.staticHeaders = descriptor.staticHeaders ?? {};
-    this.publicKeyFallback = descriptor.publicKeyFallback;
     this.oauthFallback = descriptor.oauthFallback;
     this.declaredKey = descriptor.declaredKey;
   }
@@ -157,9 +165,9 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
   }
 
   /**
-   * ASYNC resolved key: env → aliases → config → op:// (lazy). Memoized; the
-   * op pull happens at most once. Writes a resolved op key THROUGH to
-   * process.env so spawned children inherit it.
+   * ASYNC resolved key: env → aliases → config → keychain → op:// (both lazy).
+   * Memoized; each vault is consulted at most once. Writes a resolved key
+   * THROUGH to process.env so spawned children inherit it.
    */
   private async resolveKey(opts?: { allowOpPrompt?: boolean }): Promise<string> {
     if (this.cachedKey !== undefined) return this.cachedKey;
@@ -172,7 +180,26 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
         this.cachedKey = local;
         return local;
       }
-      // Step 4: 1Password, only if a source exists (the sync sniff gates the SDK).
+      // Step 4: macOS Keychain, only if the backend is on (the sync sniff gates
+      // the `security` spawn). Local and quiet, so it is tried before 1Password.
+      let keychainFailed = false;
+      if (hasKeychainSource()) {
+        const kc = resolveKeychainKeyForEnvVars([this.envVar, ...this.aliases]);
+        if (kc.value) {
+          // Write-through mirror: child processes inherit this and re-resolve
+          // nothing — the same contract the op step below honours.
+          process.env[this.envVar] = kc.value;
+          recordKeychainHydratedVar(this.envVar);
+          this.cachedKey = kc.value;
+          return kc.value;
+        }
+        // A keychain MISS is stable (the item is genuinely absent) and may be
+        // cached below. A keychain FAILURE — locked, or a declined ACL — is
+        // transient and must not be, or one early stumble would mark this
+        // provider unavailable for the rest of the process.
+        keychainFailed = kc.failed;
+      }
+      // Step 5: 1Password, only if a source exists (the sync sniff gates the SDK).
       if (hasOpSources()) {
         const wanted = new Set<string>([this.envVar, ...this.aliases]);
         const resolved = await resolveOpKeyForEnvVars(wanted, {
@@ -194,8 +221,11 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
         // retries (e.g. once the 1Password desktop handshake completes).
         return "";
       }
-      // No op source at all → the empty result is stable; safe to cache.
-      this.cachedKey = "";
+      // No op source at all → the empty result is stable and safe to cache,
+      // UNLESS the keychain step above failed rather than simply missing: that
+      // failure is transient, so leave the result uncached and let the next
+      // call retry once the keychain is unlocked.
+      if (!keychainFailed) this.cachedKey = "";
       return "";
     })();
 
@@ -212,7 +242,6 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
     // env/config/oauth/1Password chain for it would be pure cost, and on the
     // 1Password step a real prompt for a key that does not exist.
     if (this.authScheme === "none") return true;
-    if (this.publicKeyFallback) return true;
     // Cheap checks first — avoid the op pull when an oauth file already qualifies.
     if (this.resolveFromEnvConfig()) return true;
     if (this.hasOauthFallbackFile()) return true;
@@ -235,14 +264,18 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
     // than no header, since a gateway that ignores unknown auth may still reject
     // a malformed one.
     if (this.authScheme === "none") {
+      // Deliberately UNMARKED (no `arm`). No credential arm answered here — the
+      // provider declares it needs none — and "unknown" is the honest value. A
+      // consumer that maps arms to money reads unknown as the paid answer, which
+      // is the safe direction.
       return { headers: { ...this.staticHeaders } };
     }
-    // A real user key always wins; the catalog's public/free fallback key only
-    // fills in when nothing resolved. Without this, a keyless publicKeyFallback
-    // provider (e.g. OpenCode Zen) returned EMPTY headers and proxy-server
-    // rejected the route as "no credential" before the handler was built.
-    const key =
-      (await this.resolveKey({ allowOpPrompt: ctx.allowOpPrompt })) || this.publicKeyFallback || "";
+    // No invented fallback: a provider that resolves nothing signs with nothing,
+    // and the routing pre-flight is right to reject that as "no credential"
+    // rather than send a guessed token and collect a 401 downstream. A provider
+    // that genuinely needs no credential says so with `authScheme: "none"`,
+    // which returned above.
+    const key = await this.resolveKey({ allowOpPrompt: ctx.allowOpPrompt });
     let headers: Record<string, string>;
     if (this.authScheme === "x-api-key") {
       headers = { "x-api-key": key, ...this.staticHeaders };
@@ -251,6 +284,12 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
     } else {
       headers = { ...this.staticHeaders };
     }
-    return { headers };
+    // Stamped on EVERY return of this branch, including the keyless one above
+    // (`headers = {...staticHeaders}` — an artifact with no Authorization at all).
+    // That is the point: this method never returns null and never throws, so
+    // "something came back" says nothing about which arm won. Only this marker
+    // does. See CompositeCredentialProvider.getRequestAuth and
+    // OpenAICodexTransport.refreshAuth.
+    return { arm: "api-key", headers };
   }
 }

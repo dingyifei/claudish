@@ -19,6 +19,8 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { config } from "dotenv";
+import { searchCatalogModels } from "./adapters/model-catalog.js";
+import { assertAgentAvailable } from "./agent-availability.js";
 import { prehydrateCredentialsForSpawn } from "./auth/credentials/prehydrate.js";
 import { installWireTap, watchNotificationResult, wrapStateChange } from "./channel/diagnostics.js";
 import { SessionManager } from "./channel/index.js";
@@ -44,6 +46,7 @@ import { findAvailablePort } from "./port-manager.js";
 import { ensureEndpointsRegistered } from "./providers/endpoint-registration.js";
 import { compareByReleaseDateDesc } from "./providers/model-ordering.js";
 import { isLocalProviderName } from "./providers/model-parser.js";
+import { nativeRouteFor } from "./providers/native-route.js";
 import { renderOpFailureBlock } from "./providers/onepassword.js";
 import { isReadyState, probeLink } from "./providers/probe-live.js";
 import { BUILTIN_PROVIDERS } from "./providers/provider-definitions.js";
@@ -51,10 +54,16 @@ import { route } from "./providers/routing-rules.js";
 import { createProxyServer } from "./proxy-server.js";
 import { sanitizeForReport } from "./redact.js";
 import {
+  cancelTeamRun,
   getStatus,
   judgeResponses,
+  readTeamInputFile,
   runModels,
   setupSession,
+  shutdownAllTeamRuns,
+  startModels,
+  teamSlotActivity,
+  teamSlotIdleSeconds,
   validateSessionPath,
 } from "./team-orchestrator.js";
 import type { ProxyServer } from "./types.js";
@@ -93,7 +102,8 @@ When channel mode is active, you receive <channel source="claudish" ...> notific
 - tool_executing: The model is using a tool (Read, Write, Bash, etc.). May include tool_count for batched events.
 - input_required: The model is asking a question and waiting for input. Call send_input with the session_id and your answer.
 - completed: The session finished successfully. Call get_output to retrieve the full output.
-- failed: The session exited with an error. Check the content for details.
+- failed: The session exited with an error. Call get_diagnostics for the cause.
+- timeout: The session hit its timeout_seconds and was killed. Call get_diagnostics to see how far it got.
 - cancelled: The session was cancelled via cancel_session.
 
 ### Workflow
@@ -102,8 +112,12 @@ When channel mode is active, you receive <channel source="claudish" ...> notific
 2. Watch for <channel> notifications — they arrive automatically.
 3. On input_required: call send_input with the answer.
 4. On completed: call get_output to get the full response.
-5. Use list_sessions to see all active/completed sessions.
-6. Use cancel_session to stop a running session.
+5. On failed or timeout — or on a completed session whose output is empty or
+   surprising — call get_diagnostics. It returns the child's stderr, the upstream
+   error bodies, the recent event frames, the resolved model chain and the paths
+   to the full records. It needs no re-run and no debug flag.
+6. Use list_sessions to see all active/completed sessions.
+7. Use cancel_session to stop a running session.
 
 The session_id in the channel tag's meta attributes is the key for all tool calls.`;
 
@@ -357,7 +371,9 @@ function orderingKey(model: any): { releaseDate?: string; id?: string } {
  */
 const NEXT_STEP: Record<string, string> = {
   nonzero_exit: "read the evidence log, then retry or drop the model",
-  timeout: "raise `timeout`, or pick a faster model",
+  cancelled:
+    "you stopped this slot; nothing is wrong with it. Re-run it if you still want its vote",
+  timeout: "grid mode only — magmux ended the pane. The orchestrator has no deadline",
   api_error: "retry once, or route via a different provider (or@<model>)",
   background_task_ceiling:
     "set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 for children, or forbid background work in the prompt",
@@ -395,6 +411,50 @@ function fmtSize(n: number): string {
  * Self-delimiting because MCP `resource_link` blocks arrive flattened into the
  * text stream with no separator — a consumer must be able to see where this ends.
  */
+/**
+ * Build the flag list handed to every child Claude Code process.
+ *
+ * Two inputs, deliberately: `agent` is first-class because selecting a
+ * subagent is the common case and a caller should not have to know the flag
+ * spelling, and `claude_flags` stays open because claudish forwards ANY
+ * unrecognised flag to Claude Code (cli.ts catch-all) — so `--effort`,
+ * `--permission-mode`, `--allowedTools` and anything added later work without
+ * a claudish release.
+ *
+ * The dedicated parameter WINS: if `claude_flags` also carries an `--agent`,
+ * that pair is dropped rather than emitted twice, so the effective agent is
+ * always the one the caller named explicitly.
+ */
+export function buildChildClaudeFlags(agent: unknown, claudeFlags: unknown): string[] | undefined {
+  const extra = typeof claudeFlags === "string" ? claudeFlags.split(/\s+/).filter(Boolean) : [];
+  const named = typeof agent === "string" ? agent.trim() : "";
+
+  if (named.startsWith("-")) {
+    throw new Error(
+      `Invalid 'agent': ${named}. Expected a subagent name (e.g. "dev:reviewer"), not a flag.`
+    );
+  }
+
+  const cleaned: string[] = [];
+  for (let i = 0; i < extra.length; i++) {
+    const tok = extra[i];
+    // ONLY `--agent`. NOT `--agents`, which is an unrelated Claude Code flag
+    // ("--agents <json>: JSON object defining custom agents") — stripping it
+    // would silently discard the caller's custom agent DEFINITIONS while they
+    // believe they were passed.
+    if (named && (tok === "--agent" || tok.startsWith("--agent="))) {
+      // Skip the flag and, for the space-separated form, its value. A dangling
+      // `--agent` with no value drops just the flag.
+      if (tok === "--agent" && extra[i + 1] && !extra[i + 1].startsWith("-")) i++;
+      continue;
+    }
+    cleaned.push(tok);
+  }
+
+  const flags = [...(named ? ["--agent", named] : []), ...cleaned];
+  return flags.length > 0 ? flags : undefined;
+}
+
 export function formatTeamResult(
   status: import("./team-orchestrator.js").TeamStatus,
   sessionPath: string
@@ -677,7 +737,12 @@ function defineTools(
 
   tools.push({
     name: "search_models",
-    description: "Search all OpenRouter models by name, provider, or capability",
+    description:
+      "Search OpenRouter's listing by name, provider, or capability, and cross-reference " +
+      "claudish's own catalog. SCOPE: the listing covers OpenRouter only, so a name's " +
+      "absence from it is NOT evidence the name is unroutable — subscription wire ids " +
+      "(`k3`) and catalog aliases live outside that namespace and are reported separately " +
+      "here.",
     inputSchema: {
       type: "object",
       properties: {
@@ -722,12 +787,39 @@ function defineTools(
           return compareByReleaseDateDesc(orderingKey(a.model), orderingKey(b.model));
         })
         .slice(0, maxResults);
+      // The listing above is ONE namespace. Subscription wire ids (`k3`) and
+      // catalog identities live outside it, so a miss here is not evidence a
+      // name is unroutable — and that inference is exactly what sends callers
+      // to a metered route. Always report what the catalog knows alongside it.
+      const catalogMatches = searchCatalogModels(query, Math.max(maxResults, 5));
+      const renderCatalogSection = (): string => {
+        if (catalogMatches.length === 0) return "";
+        let s = "\n## Catalog names (what claudish routes)\n\n";
+        s += "| Bare name | Matched alias | Subscription plan |\n";
+        s += "|-----------|---------------|-------------------|\n";
+        for (const m of catalogMatches) {
+          const plans = m.subscriptionPlans.length > 0 ? m.subscriptionPlans.join(", ") : "-";
+          s += `| ${m.modelId} | ${m.matchedAlias ?? "-"} | ${plans} |\n`;
+        }
+        s +=
+          "\nPass the **bare name**. Routing puts a subscription ahead of the metered API and " +
+          "rewrites the model to that plan's wire id for you. An aggregator-qualified id " +
+          "(`moonshotai/...`, `accounts/fireworks/...`) pins that aggregator and bills per token.\n";
+        return s;
+      };
+
       if (results.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: `No models found matching "${query}"` }],
-        };
+        const catalog = renderCatalogSection();
+        const text = catalog
+          ? `No OpenRouter listing matches "${query}", but claudish's catalog knows these:\n${catalog}`
+          : `No models found matching "${query}".\n\n` +
+            "This searched OpenRouter's listing only. Subscription wire ids and catalog " +
+            "aliases are not in it, so this is not proof the name is unroutable. Call " +
+            "`list_models` for the recommended set.";
+        return { content: [{ type: "text" as const, text }] };
       }
       let output = `# Search Results for "${query}"\n\n`;
+      output += "## OpenRouter listing\n\n";
       output += "| Model | Provider | Pricing | Context |\n";
       output += "|-------|----------|---------|----------|\n";
       for (const { model } of results) {
@@ -742,7 +834,13 @@ function defineTools(
           : "N/A";
         output += `| ${model.id} | ${provider} | ${pricing} | ${context} |\n`;
       }
-      output += `\nUse with: run_prompt(model="${results[0].model.id}", prompt="your prompt")`;
+      output += renderCatalogSection();
+      // Suggest the BARE catalog name, never the top aggregator id. The old
+      // footer recommended whatever the listing ranked first — for "kimi" that
+      // was `accounts/fireworks/routers/kimi-k3-fast`, a metered address, so
+      // the tool's own advice routed users off their subscription.
+      const suggested = catalogMatches[0]?.modelId ?? results[0].model.id;
+      output += `\nUse with: run_prompt(model="${suggested}", prompt="your prompt")`;
       return { content: [{ type: "text" as const, text: output }] };
     },
   });
@@ -832,11 +930,11 @@ function defineTools(
   tools.push({
     name: "preflight",
     description:
-      "Check a roster of models BEFORE spending a run on it. For each model: which provider " +
-      "will actually serve it, whether that hop is covered by a SUBSCRIPTION or billed per " +
-      "token, and whether it is reachable right now. Call this before `team` or a batch of " +
-      "`create_session` calls — a dead or unexpectedly-metered model is then caught while " +
-      "the roster can still be adjusted, instead of costing a slot minutes into the run.",
+      "DIAGNOSTIC. For a roster of models, report which provider would serve each, " +
+      "whether that hop is subscription or metered, and whether it is reachable right " +
+      "now. This is for a human investigating a roster. It is NOT a step before " +
+      "`team`, `create_session` or `run_prompt` — those resolve their own routing, and " +
+      "a caller that hands them a bare model name never needs to know the route.",
     inputSchema: {
       type: "object",
       properties: {
@@ -878,7 +976,11 @@ function defineTools(
 
       const doProbe = args.probe !== false;
       const timeoutMs = typeof args.timeout_ms === "number" ? args.timeout_ms : 20_000;
-      const proxy = doProbe ? await getProxy() : null;
+      // Start the proxy only if something will actually be probed. Native names
+      // never are (see the loop), so an all-native roster must neither wait on
+      // proxy startup nor throw from it.
+      const needsProxy = doProbe && models.some((m) => nativeRouteFor(m) === null);
+      const proxy = needsProxy ? await getProxy() : null;
 
       // Register runtime providers before ANY `route()` call below.
       //
@@ -896,11 +998,35 @@ function defineTools(
       const rows: string[] = [];
       const readyModels: string[] = [];
       const failedModels: string[] = [];
+      const nativeModels: string[] = [];
       let subCount = 0;
       let meteredCount = 0;
 
       for (const model of models) {
         ctx.reportProgress(`preflight: ${model}`);
+
+        // A bare Claude name never reaches route(): the proxy serves it on the
+        // harness's own auth and checks for that BEFORE routing. route() cannot
+        // see that path — `native-anthropic` has no credential store, so its
+        // filter drops it and the chain degrades to OpenRouter — and preflight
+        // was reporting subscription models as "no route" / "metered".
+        const native = nativeRouteFor(model);
+        if (native) {
+          // Deliberately NOT probed. The native handler authenticates by forwarding
+          // the INBOUND request's Claude Code header (native-handler.ts) and only
+          // falls back to ANTHROPIC_API_KEY. A synthetic probe from this process
+          // carries neither, so it fails "x-api-key header is required" for a
+          // healthy model and a typo alike — measured on the built bundle. That
+          // result is noise, and reporting it drove the very "drop your own
+          // model" advice this guard exists to stop. Counted in its own bucket,
+          // neither ready nor failed: the proxy will serve it on the session's
+          // auth, and that is all this process can say.
+          nativeModels.push(model);
+          rows.push(
+            `| \`${model}\` | ${native.displayName} | native | ${"not probed — served on Claude Code's own auth, which this process cannot forward"} | \`${native.modelSpec}\` |`
+          );
+          continue;
+        }
 
         let plan: Awaited<ReturnType<typeof route>>;
         try {
@@ -972,6 +1098,7 @@ function defineTools(
         `# Preflight — ${models.length} model${models.length === 1 ? "" : "s"}`,
         "",
         `**Ready: ${readyModels.length}** · **Failed: ${failedModels.length}** · ` +
+          (nativeModels.length > 0 ? `native (not probed): ${nativeModels.length} · ` : "") +
           `subscription: ${subCount} · metered: ${meteredCount}`,
         "",
         "| Model | Provider | Billing | Status | Wire id |",
@@ -1007,14 +1134,32 @@ function defineTools(
   tools.push({
     name: "team",
     description:
-      "Run AI models on a task with anonymized outputs and optional blind judging. Modes: 'run' (execute models), 'judge' (blind-vote on existing outputs), 'run-and-judge' (full pipeline), 'status' (check progress).",
+      "Run AI models on a task with anonymized outputs and optional blind judging. " +
+      "Modes: 'run' (START the models and return a slot map immediately — it does NOT " +
+      "wait), 'status' (per-slot state, plus how long each slot has been silent), " +
+      "'cancel' (stop one slot or the whole run), 'judge' (blind-vote on existing " +
+      "outputs), 'run-and-judge' (the blocking pipeline). " +
+      "NO SLOT IS EVER KILLED ON A TIMER. A team slot is a full Claude Code session and " +
+      "may work for a long time; a slot inside a build or test suite emits nothing for " +
+      "minutes and is working, not stuck. Poll 'status', judge the silence against the " +
+      "task you set, and use 'cancel' if you decide a slot is wedged.",
     inputSchema: {
       type: "object",
       properties: {
         mode: {
           type: "string",
-          enum: ["run", "judge", "run-and-judge", "status"],
-          description: "Operation mode",
+          enum: ["run", "judge", "run-and-judge", "status", "cancel"],
+          description:
+            "Operation mode. 'run' STARTS the models and returns immediately with a " +
+            "slot map — it does not wait. Poll 'status' for progress, then 'judge' once " +
+            "the slots have finished. 'run-and-judge' is the blocking pipeline and holds " +
+            "the call open for the whole run. 'cancel' stops one slot or the whole run.",
+        },
+        slot: {
+          type: "string",
+          description:
+            "For 'cancel': the anonymised slot id to stop (e.g. '02'), from the slot map " +
+            "'run' returned. Omit to cancel every slot in the run.",
         },
         path: {
           type: "string",
@@ -1024,21 +1169,37 @@ function defineTools(
           type: "array",
           items: { type: "string" },
           description:
-            "External model IDs to run (required for 'run' and 'run-and-judge' modes). " +
-            "Do NOT pass 'internal', 'default', 'opus', 'sonnet', 'haiku', or 'claude-*' model IDs — " +
-            "those are Claude Code agent selectors and must be handled via Task agents instead.",
+            "Model IDs to run (required for 'run' and 'run-and-judge' modes). " +
+            "Native Claude names ARE runnable slots and belong in this array alongside " +
+            "external models: 'internal'/'default' select the default tier, and " +
+            "'opus'/'sonnet'/'haiku'/'claude-*' select a specific one. They run on the " +
+            "user's Claude subscription through the native passthrough (no API key, no " +
+            "translation), and — unlike a Task agent — they are covered by require_pattern, " +
+            "so a native reviewer that never produced the required shape is reported FAILED " +
+            "instead of silently succeeding.",
         },
         judges: {
           type: "array",
           items: { type: "string" },
           description: "Model IDs to use as judges (default: same as runners)",
         },
+        input_file: {
+          type: "string",
+          description:
+            "PREFERRED. Path to a file holding the task prompt, relative to the working " +
+            "directory. Use this rather than `input` for anything longer than a sentence: " +
+            "a prompt passed inline is echoed verbatim in the caller's terminal, where a " +
+            "200-line review brief buries every other argument and makes the call " +
+            "unreadable. Write the brief to the session directory first (input.md is the " +
+            "conventional name) and point here.",
+        },
         input: {
           type: "string",
           description:
-            "Task prompt text (or place input.md in the session directory before calling)",
+            "Task prompt as inline text. Prefer `input_file` — inline text is rendered in " +
+            "full in the caller's terminal. Passing both is an error. If neither is given, " +
+            "an input.md already present in the session directory is used.",
         },
-        timeout: { type: "number", description: "Per-model timeout in seconds (default: 300)" },
         require_pattern: {
           type: "string",
           description:
@@ -1057,14 +1218,43 @@ function defineTools(
             "off). A blunter instrument than require_pattern — short answers can be " +
             "legitimate — so prefer require_pattern when you know the expected shape.",
         },
+        agent: {
+          type: "string",
+          description:
+            "Claude Code subagent every child runs as, e.g. 'dev:reviewer', 'dev:architect'. " +
+            "Each child is a full Claude Code session, so this loads that agent's system " +
+            "prompt and tool allowlist — the same specialisation a Task agent gets, but " +
+            "inside the team run, where require_pattern still applies. Applies to EVERY " +
+            "model in the run (native and external alike); there is no per-model form.",
+        },
+        claude_flags: {
+          type: "string",
+          description:
+            "Any other Claude Code flags, space-separated (e.g. '--effort high " +
+            "--permission-mode plan'). Unrecognised flags pass straight through to the " +
+            "child Claude Code, so anything Claude Code accepts works here. Prefer the " +
+            "dedicated 'agent' parameter for the subagent; an --agent given here is " +
+            "ignored when 'agent' is also set. NOTE: split on whitespace, so a flag " +
+            'VALUE containing spaces (e.g. --append-system-prompt "two words") cannot ' +
+            "be expressed here.",
+        },
       },
       required: ["mode", "path"],
     },
     group: "agentic",
-    // The tool the whole keepalive exists for: a real `run` was aborted at exactly
+    // The tool the whole keepalive exists for: a real run was aborted at exactly
     // 1800s of channel-frame-only silence. NOT gated on `channelEnabled` — that
     // failure happened in a session with channels unregistered, so gating the
     // keepalive behind the channel group would reproduce the bug exactly.
+    //
+    // Still needed even though `run` no longer blocks: `run-and-judge` is the
+    // pipeline mode and holds the call open for the whole run, which is exactly
+    // the shape that hit the ceiling. `run` returning early does not remove the
+    // exposure, it just stops the common path from carrying it.
+    //
+    // The background run keeps calling `ctx.reportProgress` after `run` has
+    // returned. That is safe by contract — see ToolCallContext: a no-op once the
+    // heartbeat is stopped, and it never throws.
     heartbeat: true,
     handler: async (args, ctx) => {
       try {
@@ -1072,10 +1262,26 @@ function defineTools(
         const path = args.path as string;
         const models = args.models as string[] | undefined;
         const judges = args.judges as string[] | undefined;
-        const input = args.input as string | undefined;
-        const timeout = args.timeout as number | undefined;
+        // `input_file` is the preferred form: a team prompt is usually a long
+        // brief, and inline text is echoed in full in the caller's terminal.
+        // Accepting both would silently pick one and discard the other, which is
+        // the kind of thing a caller only discovers from the models' answers.
+        const inlineInput = args.input as string | undefined;
+        const inputFile = args.input_file as string | undefined;
+        if (inlineInput !== undefined && inputFile !== undefined) {
+          throw new Error(
+            "Pass `input_file` or `input`, not both. Prefer `input_file` — inline text is " +
+              "rendered verbatim in the caller's terminal."
+          );
+        }
+        const input = inputFile !== undefined ? readTeamInputFile(inputFile) : inlineInput;
         const requirePattern = args.require_pattern as string | undefined;
         const minOutputBytes = args.min_output_bytes as number | undefined;
+        const childFlags = buildChildClaudeFlags(args.agent, args.claude_flags);
+        // Reject an unknown agent BEFORE spawning N children. `team` spawns with
+        // --stdin so Claude Code would catch it, but centrally is where the two
+        // spawn sites stay consistent — see agent-availability.ts.
+        await assertAgentAvailable(args.agent as string | undefined, process.cwd());
 
         const resolved = validateSessionPath(path);
 
@@ -1084,9 +1290,9 @@ function defineTools(
         const teamSessionId = resolved.split("/").filter(Boolean).pop() ?? "team";
         const teamCreatedAt = new Date().toISOString();
         const runOpts = {
-          timeout,
           requirePattern,
           minOutputBytes,
+          claudeFlags: childFlags,
           onProgress: (u: {
             rendered: string;
             phase: "running" | "settled";
@@ -1116,25 +1322,121 @@ function defineTools(
           case "run": {
             if (!models?.length) throw new Error("'models' is required for 'run' mode");
             setupSession(resolved, models, input);
-            const status = await runModels(resolved, runOpts);
+            // Returns once the children EXIST, not once they finish. A team slot
+            // is a full Claude Code session and can legitimately work for a long
+            // time; holding the tool call open for that made the run's duration
+            // the client's problem, and the deadline that existed to bound it
+            // killed working slots. Poll `mode: "status"` instead.
+            const handle = await startModels(resolved, runOpts);
             return {
-              content: [{ type: "text" as const, text: formatTeamResult(status, resolved) }],
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      started: true,
+                      team_session_id: handle.teamSessionId,
+                      session_path: handle.sessionPath,
+                      slots: handle.slots,
+                      next: {
+                        status: `team(mode:"status", path:"${handle.sessionPath}")`,
+                        cancel: `team(mode:"cancel", path:"${handle.sessionPath}", slot:"<id>")`,
+                        judge: `team(mode:"judge", path:"${handle.sessionPath}") once every slot has finished`,
+                      },
+                      note:
+                        "Nothing terminates a slot on a timer. `status` reports how many " +
+                        "seconds each slot has been silent; a slot inside a long build is " +
+                        "quiet and working. You decide whether to cancel.",
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          case "cancel": {
+            const slot = args.slot as string | undefined;
+            const teamSessionId = resolved.split("/").filter(Boolean).pop() ?? "team";
+            const result = await cancelTeamRun(teamSessionId, slot);
+            if (!result.found) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify({
+                      cancelled: [],
+                      note:
+                        "No live run for that path. It already settled (read `status`), or " +
+                        "it was started by a different process — this server can only stop " +
+                        "children it spawned.",
+                    }),
+                  },
+                ],
+              };
+            }
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify({ cancelled: result.cancelled }, null, 2),
+                },
+              ],
             };
           }
           case "judge": {
-            const verdict = await judgeResponses(resolved, { judges });
+            const verdict = await judgeResponses(resolved, { judges, claudeFlags: childFlags });
             return { content: [{ type: "text" as const, text: JSON.stringify(verdict, null, 2) }] };
           }
           case "run-and-judge": {
             if (!models?.length) throw new Error("'models' is required for 'run-and-judge' mode");
             setupSession(resolved, models, input);
             await runModels(resolved, runOpts);
-            const verdict = await judgeResponses(resolved, { judges });
+            const verdict = await judgeResponses(resolved, { judges, claudeFlags: childFlags });
             return { content: [{ type: "text" as const, text: JSON.stringify(verdict, null, 2) }] };
           }
           case "status": {
             const status = getStatus(resolved);
-            return { content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }] };
+            const teamSessionId = resolved.split("/").filter(Boolean).pop() ?? "team";
+            // Seconds of silence per slot, for RUNNING slots of a live run.
+            // Null once the run has settled — the states in `status` are final
+            // then, and there is no child left to be quiet.
+            const idle = teamSlotIdleSeconds(teamSessionId);
+            const settled = !Object.values(status.models).some((m) => m.state === "RUNNING");
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      ...status,
+                      idle_seconds_by_slot: idle,
+                      // What each slot is DOING, which is what makes the idle
+                      // number readable. Silence in `tool_executing` is a build;
+                      // the same silence in `running` is a stalled answer.
+                      activity_by_slot: teamSlotActivity(teamSessionId),
+                      ...(idle
+                        ? {
+                            note:
+                              "idle_seconds_by_slot is how long each slot has been silent; " +
+                              "read it against activity_by_slot. Silence in tool_executing " +
+                              "is a build or test suite running, and is not a failure " +
+                              'signal. Nothing cancels on your behalf — use mode:"cancel" ' +
+                              "if you decide to.",
+                          }
+                        : {}),
+                      // The rendered result card, once there is a result to
+                      // render. This is the summary `run` used to return before
+                      // it stopped waiting; a settled `status` is now where it
+                      // belongs, since that is the call that knows the outcome.
+                      ...(settled ? { summary: formatTeamResult(status, resolved) } : {}),
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
           }
           default:
             throw new Error(`Unknown mode: ${mode}`);
@@ -1325,9 +1627,18 @@ function defineTools(
           type: "number",
           description: "Session timeout in seconds (default: 600, max: 3600)",
         },
+        agent: {
+          type: "string",
+          description:
+            "Claude Code subagent the session runs as, e.g. 'dev:reviewer'. Equivalent to " +
+            "putting '--agent <name>' in claude_flags, and wins over one given there.",
+        },
         claude_flags: {
           type: "string",
-          description: "Extra flags to pass to claudish (space-separated)",
+          description:
+            "Any other Claude Code / claudish flags, space-separated. Unrecognised flags " +
+            "pass through to the child Claude Code. NOTE: split on whitespace, so a flag " +
+            "VALUE containing spaces cannot be expressed here.",
         },
         work_dir: {
           type: "string",
@@ -1339,9 +1650,7 @@ function defineTools(
     group: "channel",
     handler: async (args) => {
       try {
-        const claudishFlags = args.claude_flags
-          ? (args.claude_flags as string).split(/\s+/).filter(Boolean)
-          : undefined;
+        const claudishFlags = buildChildClaudeFlags(args.agent, args.claude_flags);
 
         // Resolve the model's credential AND its route in THIS process before
         // spawning the child. Several create_session calls in flight at once
@@ -1358,6 +1667,10 @@ function defineTools(
         // an option — it is process-global and races concurrent calls.
         const requestedModel = args.model as string;
         const workDir = args.work_dir as string | undefined;
+        // The roster is cwd-dependent, so validate against the directory this
+        // session will actually run in, not the parent's.
+        await assertAgentAvailable(args.agent as string | undefined, workDir ?? process.cwd());
+
         const plan = await prehydrateCredentialsForSpawn([requestedModel], {
           pin: workDir === undefined || resolve(workDir) === process.cwd(),
         });
@@ -1479,7 +1792,12 @@ function defineTools(
 
   tools.push({
     name: "list_sessions",
-    description: "List all active channel sessions. Optionally include completed sessions.",
+    description:
+      "List all active channel sessions. Optionally include completed sessions. " +
+      "Each session reports `idleSeconds`: how long since the child last emitted " +
+      "anything. Nothing kills a session for being idle — a child inside a long " +
+      "Bash call is silent and working — so this is yours to judge against the " +
+      "task you set, and `cancel_session` is yours to call if the answer is no.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1495,6 +1813,65 @@ function defineTools(
       return {
         content: [{ type: "text" as const, text: JSON.stringify({ sessions }) }],
       };
+    },
+  });
+
+  // Diagnostics as API.
+  //
+  // Two channel sessions once ran 900 seconds of genuine billed work — 241
+  // assistant messages, ~94k output tokens, 150 tool calls — and reported
+  // success with an empty output log. The cause was one line, written to
+  // `~/.claudish/sessions/<id>/stderr.log` and left there:
+  //   [claude-code:unrecognized_model] {"model":"cx@gpt-5.6-sol"}
+  // No MCP tool returned it. Diagnosis meant reading the filesystem by hand,
+  // which an agent consuming this interface has no reason to know about — and a
+  // failure that has already happened cannot be reproduced with `--debug`.
+  //
+  // Everything this returns is captured unconditionally while the session runs.
+  tools.push({
+    name: "get_diagnostics",
+    description:
+      "Explain what a channel session actually did — stderr, upstream error bodies, the " +
+      "recent event frames, the resolved model chain, accounting, and the paths to the " +
+      "full records. Call this FIRST whenever a session fails, times out, or completes " +
+      "with empty or surprising output; it needs no re-run and no debug flag. " +
+      "`idleSeconds` reports how long since the child last emitted a frame, and is " +
+      "null once the session is no longer live. It is information, never a verdict: " +
+      "claudish does not terminate a session for silence.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID from create_session" },
+        event_limit: {
+          type: "number",
+          description:
+            "How many of the most recent semantic frames to include (default: 40, max: 200). " +
+            "0 omits them; `event_log_path` always has the full record.",
+        },
+      },
+      required: ["session_id"],
+    },
+    group: "channel",
+    handler: async (args) => {
+      try {
+        const diagnostics = sessionManager.getDiagnostics(
+          args.session_id as string,
+          args.event_limit as number | undefined
+        );
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(diagnostics) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     },
   });
 
@@ -1530,9 +1907,24 @@ const EVENT_TO_TASK_STATUS = new Map<string, TaskStatus>([
   ["completed", "completed"],
   ["failed", "failed"],
   ["cancelled", "cancelled"],
+  // The key whose ABSENCE forced the channel wire to lie. `mapEventToTaskStatus`
+  // falls through to `?? "working"`, so a session killed by its own timeout was
+  // reported to a SEP-1686 consumer as still working — which is why the timeout
+  // path emitted `"failed"` on the wire while `SessionInfo.status` said
+  // `"timeout"`. With this key present `ChannelEventType` is the full
+  // `SessionStatus` and the timeout emits its own event; SEP-1686 has no
+  // `timeout` member, and `failed` is the only honest projection of it.
+  ["timeout", "failed"],
 ]);
 
-function mapEventToTaskStatus(event: string): TaskStatus {
+// Exported ONLY so the regression guard can call it instead of grepping this
+// file's source text. The behaviour worth guarding is the fall-through below: a
+// key missing from EVENT_TO_TASK_STATUS does not throw, it silently yields
+// "working", so a dead session (e.g. one killed by its own timeout) reports to a
+// SEP-1686 consumer as still alive. Only a real call can catch that; a source
+// regex stays green if the entry moves to a dead map, is shadowed, or ends up in
+// a comment.
+export function mapEventToTaskStatus(event: string): TaskStatus {
   return EVENT_TO_TASK_STATUS.get(event) ?? "working";
 }
 
@@ -1568,9 +1960,14 @@ async function main() {
   // See: ai-docs/sessions/.../sep-1686-migration-schema.md
   const sessionManager = new SessionManager({
     onStateChange: wrapStateChange((sessionId, event) => {
+      // `timeout` is here because it used to arrive AS `failed` — the wire had
+      // no timeout event until EVENT_TO_TASK_STATUS learned to project one — and
+      // dropping the hint when the event split in two would have been a silent
+      // regression. Both are terminal failures worth reporting, and both are now
+      // explainable without a re-run via get_diagnostics.
       const notificationContent =
-        event.type === "failed"
-          ? `${event.content}\n\nTo report this error, use the report_error tool with error_type: "provider_failure" and model: "${event.model}".`
+        event.type === "failed" || event.type === "timeout"
+          ? `${event.content}\n\nCall get_diagnostics with session_id: "${sessionId}" for the stderr, the upstream error bodies and the transcript path. To report it, use the report_error tool with error_type: "provider_failure" and model: "${event.model}".`
           : event.content;
       const result = server.notification({
         method: "notifications/claude/channel",
@@ -1712,9 +2109,13 @@ async function main() {
   installWireTap();
   await server.connect(transport);
 
-  // Cleanup on shutdown
+  // Cleanup on shutdown. Both subsystems spawn children that outlive the call
+  // that started them — channel sessions always did, and team runs do now that
+  // `run` returns before its models finish — so both must be reached here or
+  // their process trees survive this one and keep billing.
   process.on("SIGTERM", () => {
     sessionManager.shutdownAll().catch(() => {});
+    shutdownAllTeamRuns().catch(() => {});
   });
 }
 

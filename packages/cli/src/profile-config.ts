@@ -157,6 +157,21 @@ export interface ClaudishProfileConfig {
    */
   onepasswordEnvironments?: string[];
   /**
+   * macOS Keychain backend state.
+   *
+   * `enabled` is a LAZINESS GATE, not a record of what is stored. It says only
+   * "this machine uses the keychain backend", which lets `hasKeychainSource()`
+   * answer synchronously without spawning `security` for a user who has never
+   * opted in. The stored variable NAMES are deliberately not mirrored here: the
+   * keychain enumerates its own contents in one ~28ms call, and a second copy
+   * of a list is a second thing that can be wrong.
+   *
+   * Set automatically on the first successful keychain write.
+   */
+  keychain?: {
+    enabled?: boolean;
+  };
+  /**
    * Opt IN to using a real ANTHROPIC_API_KEY for native Claude models, accepting
    * metered API billing. Default (absent/false) hides the key so Claude Code
    * uses the claude.ai subscription — a key bundled into a shared .env /
@@ -229,6 +244,16 @@ export interface ClaudishProfileConfig {
    * `loadConfig` runs on lightweight startup paths and stays Zod-free.
    */
   behavior?: Record<string, unknown>;
+
+  /**
+   * Apply a model's catalog provider-preset (e.g. `reasoning.mode=pro`) while
+   * the Claude Code session is in ultracode. Opt-in and default OFF — a pro
+   * preset burns quota faster, so it must never turn itself on.
+   * Precedence: --pro-on-ultracode flag > CLAUDISH_PRO_ON_ULTRACODE env >
+   * project `.claudish.json` > this field > false. The scoped read is
+   * `readProOnUltracode()`, NOT this allowlist — see its doc comment.
+   */
+  proOnUltracode?: boolean;
 }
 
 /**
@@ -310,6 +335,12 @@ export function loadConfig(): ClaudishProfileConfig {
     if (config.onepasswordEnvironments !== undefined) {
       merged.onepasswordEnvironments = config.onepasswordEnvironments;
     }
+    // Same trap as onepasswordEnvironments below: omitted from this allowlist,
+    // the block survives on disk until the first global save and is then
+    // silently dropped — which would quietly disable the keychain backend.
+    if (config.keychain !== undefined) {
+      merged.keychain = config.keychain;
+    }
     if (config.anthropicApiBilling !== undefined) {
       merged.anthropicApiBilling = config.anthropicApiBilling;
     }
@@ -341,6 +372,12 @@ export function loadConfig(): ClaudishProfileConfig {
     }
     if (config.behavior !== undefined) {
       merged.behavior = config.behavior;
+    }
+    // Same trap as keychain/onepasswordEnvironments above: omitted from this
+    // allowlist, the field survives on disk until the first global save and is
+    // then silently dropped — quietly turning the feature off with no error.
+    if (config.proOnUltracode !== undefined) {
+      merged.proOnUltracode = config.proOnUltracode;
     }
     return merged;
   } catch (error) {
@@ -417,6 +454,52 @@ export function getLocalConfigPath(): string {
  */
 export function localConfigExists(): boolean {
   return existsSync(getLocalConfigPath());
+}
+
+/**
+ * The two config scopes `readProOnUltracode` consults, as thunks.
+ *
+ * A seam rather than direct calls because `homedir()` cannot be re-pointed at
+ * runtime in Bun — the same approach as onepassword-config.test.ts.
+ */
+export interface ScopedConfigPaths {
+  global: () => string;
+  project: () => string;
+}
+
+const defaultScopedConfigPaths: ScopedConfigPaths = {
+  // activeConfigFile(), NOT the raw CONFIG_FILE constant: `--config <file>` /
+  // CLAUDISH_CONFIG must redirect this read like every other config reader,
+  // and `bun run test:safe` relies on that to stay off the real machine file.
+  global: () => activeConfigFile(),
+  project: () => getLocalConfigPath(),
+};
+
+/**
+ * Read `proOnUltracode` from the project file, else the global file.
+ *
+ * Deliberately a RAW per-file read rather than `loadConfig()`. `loadConfig`
+ * merges only the global scope through its allowlist, so a project
+ * `.claudish.json` that sets ONLY this key would be invisible to it. That is
+ * the whole point of this function, not an oversight.
+ *
+ * Returns undefined when neither scope states a boolean — the caller then
+ * applies its own default (false).
+ */
+export function readProOnUltracode(
+  paths: ScopedConfigPaths = defaultScopedConfigPaths
+): boolean | undefined {
+  for (const pathFn of [paths.project, paths.global]) {
+    try {
+      const path = pathFn();
+      if (!existsSync(path)) continue;
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+      if (typeof parsed?.proOnUltracode === "boolean") return parsed.proOnUltracode;
+    } catch {
+      // Garbled/unreadable file → skip this scope rather than fail the run.
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -792,6 +875,38 @@ export function removeApiKey(envVar: string): void {
     delete config.apiKeys[envVar];
     saveConfig(config);
   }
+}
+
+// ─── Keychain Helpers ─────────────────────────────────────
+
+/**
+ * Is the macOS Keychain backend in use on this machine?
+ *
+ * A cheap SYNC sniff, and the only thing standing between a user who has never
+ * touched the keychain and a `security` spawn they do not need. Reads config
+ * only — it never asks the keychain anything, which is the point.
+ */
+export function isKeychainEnabled(): boolean {
+  try {
+    return loadConfig().keychain?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Turn the keychain backend on or off in `~/.claudish/config.json`.
+ *
+ * Enabling does NOT move any secret; it only tells claudish the store is worth
+ * consulting. Disabling likewise leaves stored items untouched — they simply
+ * stop being read. Removing the secrets themselves is `claudish keychain rm`,
+ * which is a separate and deliberately explicit act.
+ */
+export function setKeychainEnabled(enabled: boolean): void {
+  const config = loadConfig();
+  if (!config.keychain) config.keychain = {};
+  config.keychain.enabled = enabled;
+  saveConfig(config);
 }
 
 // ─── Endpoint Helpers ─────────────────────────────────────

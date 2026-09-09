@@ -2,7 +2,7 @@
 
 Planned-but-unimplemented work for Claudish. Items here are deliberately scoped, with explicit **trigger conditions** — what needs to be true upstream or in our codebase before each item moves to active development. If a trigger condition isn't met, leave the item parked.
 
-For shipped features and current architecture, see `CLAUDE.md`. For ad-hoc research and validation sessions, see `ai-docs/sessions/`.
+For shipped features see `CLAUDE.md`; for the engineering rationale behind them see `ai-docs/architecture/`. For ad-hoc research and validation sessions, see `ai-docs/sessions/`.
 
 ---
 
@@ -259,3 +259,121 @@ Each item should follow the structure above:
 - **Effort estimate** (optional): rough sizing if the item moves toward action.
 
 If a trigger condition has been met, move the item to *In Progress* and create the implementation tasks. If a trigger condition becomes irrelevant or wrong, delete the item rather than leave it stale.
+
+---
+
+## Consolidate the two channel test-helper stand-ins
+
+`packages/cli/src/channel/test-helpers/` now holds **two** helpers that can echo argv:
+
+- `fake-claudish.ts` — the original; consumed by BOTH `channel/session-manager.test.ts` and
+  `team-orchestrator.test.ts`, the latter via `--print-argv` to assert the exact spawn
+  contract *including flag order*
+- `fake-channel-stream-json.ts` — added 2026-08-22 during the stream-json transport rewrite,
+  with its own `--print-argv`
+
+**Why this is parked rather than ignored.** The duplication already caused one outage of the
+guard it exists to protect. Migrating the channel tests to the new helper made `--print-argv`
+look dead in the old one; removing it turned the two `runModels — pinned spawn identity`
+tests red — and they failed EMPTY rather than asserting, so the assertions pinning the
+`--verbose`-before-`--quiet` invariant silently stopped RUNNING at exactly the moment the
+argv change made that invariant most likely to break. A guard that cannot execute reads as
+coverage. Restored the same day; a header comment on `fake-claudish.ts` now names both
+consumers, which stops the specific recurrence but not the class.
+
+**Proposed shape** (assessed 2026-08-22, not executed): keep `fake-channel-stream-json.ts`,
+give it an explicit raw/immediate argv mode distinct from its framed mode, move the two
+orchestrator tests onto it, then delete `fake-claudish.ts` after a repository-wide reference
+check.
+
+**Trigger conditions — all must hold:**
+
+1. No session is concurrently editing `team-orchestrator.test.ts` (it moved twice on
+   2026-08-22 alone; this work rewrites two of its tests).
+2. A repository-wide reference check finds no consumer of `fake-claudish.ts` beyond the two
+   known test files — a third consumer changes the answer from "consolidate" to "document".
+3. The seven channel regression guards (G1–G7) are green BEFORE starting, so any red during
+   the move is attributable to the move.
+
+**Do not start if** the only motivation is tidiness. The comment already prevents the known
+failure; this is worth doing when someone is in these files anyway, not as its own errand.
+
+---
+
+## Ultracode pro-preset: broaden past the OpenRouter-only roster
+
+Status: shipped, deliberately narrow.
+
+`--pro-on-ultracode` applies a model's catalog provider-preset while a Claude Code
+session is in ultracode. It reads BOTH halves of the fact from the slim catalog's
+`routeVariant` — `baseModelId` says which model the preset applies to, `preset`
+(`reasoning.mode=pro`) says what to send — via `lookupVariantPresets()` in
+`adapters/model-catalog.ts`. There is no model name regex and no hardcoded payload;
+the `--model-params` parser doubles as the preset parser.
+
+The gate is PROVIDER-SCOPED, and today that means OpenRouter only. Measured against
+the live catalog on 2026-08-27 (`queryModels?catalog=slim`), exactly 3 of 753 entries
+carry a `routeVariant`, all three of them `gpt-5.6-*-pro`, all recorded on
+`provider: "openrouter"`. The base models are served much more widely —
+`gpt-5.6-sol` lists openai, openrouter, opencode-zen and openai-codex — but each
+`-pro` SKU exists on OpenRouter's roster alone.
+
+**Why scoped rather than applied everywhere — now measured, not assumed.** Sending
+`reasoning.mode=pro` to `gpt-5.6-sol` on each vendor (2026-08-27, real requests):
+
+| Vendor | Result |
+|---|---|
+| `openrouter` | accepted (200) |
+| `openai` (`api.openai.com/v1/responses`) | accepted (200) |
+| `openai-codex` (ChatGPT OAuth backend) | **400** — `` `reasoning.mode` is not supported with this model `` |
+
+So the parameter is neither OpenRouter-only nor universal. Applying it unscoped would
+hard-400 every ultracode turn on `cx@`, which is the single most likely route for this
+model family. The provider gate is what prevents that.
+
+`oai@` accepting it means the CATALOG under-reports reality — the fix belongs in
+models-index, not in a client-side exception list.
+
+**Trigger conditions** (either is sufficient):
+
+1. models-index records a `routeVariant` preset (or an equivalent per-vendor preset
+   field) on a non-OpenRouter vendor row for the same base model. The client change is
+   then zero — `lookupVariantPresets(model, provider)` already returns it.
+2. A live run proves the parameter is accepted on another host, at which point the
+   fact belongs in the catalog first (see `TASK_pro_preset_vendor_coverage.md` in the
+   models-index repo), NOT in a claudish-side exception list.
+
+**Do not** work around this by dropping the provider argument or adding a per-provider
+allowlist in the CLI. That reintroduces exactly the hardcoded roster this design
+removed, and `feedback_backend_repo_boundary` puts the data gap in the backend's repo.
+
+**Effort**: none in claudish if trigger 1 lands. The gate already reads whatever the
+catalog says.
+
+Reference: `TASK_pro_preset_vendor_coverage.md` (models-index repo).
+
+---
+
+## `--effort-override` accepts only the seven canonical levels
+
+Status: shipped, deliberately narrow.
+
+`--effort-override <level>` pins reasoning effort verbatim and skips
+`clampToAdvertisedEffort()`. It is NOT `--effort` — that name belongs to Claude Code
+and claudish forwards it untouched in `claudeArgs` (pinned by
+`cli-passthrough.test.ts`). The two compose: `--effort` says what to ask for,
+`--effort-override` says do not clamp what I asked for.
+
+It accepts only `none|minimal|low|medium|high|xhigh|max`, because the value flows
+through the `EffortLevel`-typed pipeline in `base-api-format.ts`. A provider-specific
+value outside that set has an existing escape hatch that needs no new flag:
+`--model-params reasoning_effort=<value>`, which lands on the payload after every
+adapter has finished.
+
+**Trigger condition**: a provider ships a native effort vocabulary that is neither one
+of the seven nor reachable by a single `--model-params` key — e.g. an effort knob whose
+parameter NAME differs per dialect AND whose values are provider-specific. Only then
+does a dialect-aware native-value path earn its complexity.
+
+**Do not** widen `EffortLevel` itself to accommodate one provider. It is the canonical
+vocabulary Claude Code emits, and the clamp table is what maps it onto each provider.

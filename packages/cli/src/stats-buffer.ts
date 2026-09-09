@@ -221,22 +221,33 @@ function syncFlushOnExit(): void {
 // Synchronous flush on normal exit
 process.on("exit", syncFlushOnExit);
 
-// Flush then exit on SIGTERM (sent by process managers, container runtimes, etc.)
-process.on("SIGTERM", () => {
-  try {
-    syncFlushOnExit();
-  } catch {
-    // Silently ignore
-  }
-  process.exit(0);
-});
+/**
+ * `128 + signum`, the shell convention for "died from signal N".
+ *
+ * These two handlers are registered at MODULE LOAD, i.e. before
+ * `claude-runner.ts`'s `setupSignalHandlers` ever runs, and they call
+ * `process.exit` unconditionally — so they, not that one, are what a SIGTERM
+ * actually reaches first. While they exited 0, a claudish process that a
+ * supervisor had KILLED reported a clean success to everything above it:
+ * measured 2026-08-22, a group SIGTERM against a running channel session still
+ * produced `code=0, signal=null` with `claude-runner.ts` already fixed.
+ *
+ * That mattered most in the channel session manager, where an exit-0 was
+ * allowed to upgrade a state the timeout handler had already recorded as
+ * failed, and `meta.json` was written saying `"completed"` for a session that
+ * had been killed 15 minutes into real, billed work.
+ *
+ * Telemetry flushing must not editorialise about how the process died.
+ */
+const SIGNAL_EXIT_CODE: Record<"SIGTERM" | "SIGINT", number> = { SIGTERM: 143, SIGINT: 130 };
 
-// Flush then exit on SIGINT (Ctrl+C or pipe close)
-process.on("SIGINT", () => {
-  try {
-    syncFlushOnExit();
-  } catch {
-    // Silently ignore
-  }
-  process.exit(0);
-});
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    try {
+      syncFlushOnExit();
+    } catch {
+      // Silently ignore
+    }
+    process.exit(SIGNAL_EXIT_CODE[signal]);
+  });
+}

@@ -1,6 +1,6 @@
 /**
- * AntigravityProviderTransport — Antigravity (cloudcode-pa backend) via the
- * SHARED Antigravity OAuth token.
+ * AntigravityProviderTransport — Antigravity's own backend via the SHARED
+ * Antigravity OAuth token.
  *
  * Adapted from the since-removed providers/transport/gemini-codeassist.ts. It keeps ALL of that
  * transport's hardening — the 429 classification (RATE_LIMIT_EXCEEDED retry /
@@ -19,7 +19,8 @@
  * Transport concerns:
  * - OAuth access token via getValidAntigravityAccessToken()
  * - Project ID + tier via setupAntigravityUser()
- * - Fixed endpoint: cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse
+ * - Endpoint: `antigravityHost()`/v1internal:streamGenerateContent?alt=sse —
+ *   Antigravity's host, NOT Code Assist's `cloudcode-pa` (see antigravity-user.ts)
  * - Wraps payload in the CodeAssist envelope: {model, project, user_prompt_id, request}
  * - GeminiRequestQueue for rate limiting
  * - gemini-sse stream format (with response wrapper)
@@ -32,6 +33,7 @@ import {
   getValidAntigravityAccessToken,
 } from "../../auth/antigravity-token.js";
 import {
+  antigravityHost,
   buildAntigravityUserAgent,
   getAntigravityTierDisplayName,
   getServedAntigravityModels,
@@ -45,16 +47,32 @@ import { GeminiRequestQueue } from "../../handlers/shared/gemini-queue.js";
 import { log, logStderr } from "../../logger.js";
 import type { ProviderTransport, StreamFormat } from "./types.js";
 
-// The backend host. Still the cloudcode-pa endpoint the retired Code Assist
-// path used — the split was never about the URL, it was about which OAuth
-// client minted the token.
-const ANTIGRAVITY_BASE = "https://cloudcode-pa.googleapis.com";
-const ANTIGRAVITY_ENDPOINT = `${ANTIGRAVITY_BASE}/v1internal:streamGenerateContent?alt=sse`;
+// The backend host comes from `antigravityHost()` — ONE source, shared with the
+// auth/discovery calls, resolved at call time so `AICODE_ENDPOINT_URL` works and
+// so this can never drift from the host those calls use. See the long note on
+// `ANTIGRAVITY_DEFAULT_HOST` in `auth/antigravity-user.ts` for why it is NOT
+// `cloudcode-pa` (that is Code Assist's backend, and it answers accordingly).
+function antigravityEndpoint(): string {
+  return `${antigravityHost()}/v1internal:streamGenerateContent?alt=sse`;
+}
 
 /** Max retry attempts for retryable 429s (RATE_LIMIT_EXCEEDED) */
 const MAX_RETRY_ATTEMPTS = 3;
-/** Default retry delay when server doesn't specify one */
+/** Default retry delay for a 429 the server ATTRIBUTED but gave no RetryInfo for. */
 const DEFAULT_RATE_LIMIT_DELAY_MS = 10_000;
+/**
+ * Retry delay for a 429 that named neither a reason nor a delay.
+ *
+ * 10s is the right wait for a per-minute throttle, which is what
+ * `RATE_LIMIT_EXCEEDED` means. It is the WRONG wait for a body carrying no
+ * `details` at all, because nothing in that response says a wait helps. Three
+ * such refusals measured 2026-08-22 came back in 343ms, 456ms and 722ms — the
+ * server was not busy, it was declining — so the 20s of backoff claudish spent
+ * between them was invented, and it blew the config TUI's 15s probe ceiling
+ * from the inside. One second still absorbs a genuine blip; it just stops
+ * claudish betting twenty seconds of the user's time on no evidence.
+ */
+const UNATTRIBUTED_RETRY_DELAY_MS = 1_000;
 /**
  * Budget for the quota reading that fact-checks an "out of quota" verdict.
  * `retrieveUserQuota` carries no timeout of its own, and this call sits on a
@@ -177,6 +195,20 @@ interface QuotaClassification {
   retryDelayMs?: number;
   /** The specific reason from ErrorInfo */
   reason?: string;
+  /**
+   * The server named NEITHER a reason nor a retry delay — the whole body was
+   *
+   *     {"error":{"code":429,"message":"Resource has been exhausted (e.g. check
+   *      quota).","status":"RESOURCE_EXHAUSTED"}}
+   *
+   * with no `details` array at all. Retrying such a response is a guess, and
+   * the 10s per-minute-throttle delay is a guess on top of a guess: measured
+   * 2026-08-22, three of these came back in 343-722ms each, so the ~20s claudish
+   * then spent asleep was pure invention. `UNATTRIBUTED_RETRY_DELAY_MS` keeps
+   * the retry — a real transient blip deserves one — at a cost proportional to
+   * the evidence, which is none.
+   */
+  unattributed?: boolean;
 }
 
 /**
@@ -235,7 +267,15 @@ function classify429(responseBody: string): QuotaClassification | null {
       }
     }
 
-    return { terminal: false, retryDelayMs, reason };
+    // Nothing in the body attributed this 429 to anything. Say so, rather than
+    // letting the caller's `?? DEFAULT_RATE_LIMIT_DELAY_MS` silently dress a
+    // contentless refusal up as a known per-minute throttle.
+    return {
+      terminal: false,
+      retryDelayMs,
+      reason,
+      unattributed: reason === undefined && retryDelayMs === undefined,
+    };
   } catch {
     return null;
   }
@@ -312,7 +352,7 @@ export class AntigravityProviderTransport implements ProviderTransport {
   }
 
   getEndpoint(): string {
-    return ANTIGRAVITY_ENDPOINT;
+    return antigravityEndpoint();
   }
 
   async getHeaders(): Promise<Record<string, string>> {
@@ -516,9 +556,11 @@ export class AntigravityProviderTransport implements ProviderTransport {
       }
 
       if (attempt < MAX_RETRY_ATTEMPTS) {
-        const delay = classification.retryDelayMs ?? DEFAULT_RATE_LIMIT_DELAY_MS;
+        const delay =
+          classification.retryDelayMs ??
+          (classification.unattributed ? UNATTRIBUTED_RETRY_DELAY_MS : DEFAULT_RATE_LIMIT_DELAY_MS);
         logStderr(
-          `[Antigravity] Rate limited (${classification.reason || "unknown"}), retrying in ${(delay / 1000).toFixed(1)}s (attempt ${attempt}/${MAX_RETRY_ATTEMPTS})`
+          `[Antigravity] Rate limited (${classification.reason || "unattributed — server gave no reason or retry delay"}), retrying in ${(delay / 1000).toFixed(1)}s (attempt ${attempt}/${MAX_RETRY_ATTEMPTS})`
         );
         if (attempt === 1) {
           await this.logQuotaInfo();

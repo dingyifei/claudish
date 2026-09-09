@@ -100,7 +100,7 @@ describe("Bug #1: TIMEOUT despite successful completion", () => {
       process.env.PATH = `${fakeClaudishDir}:${originalPath}`;
 
       try {
-        const status = await runModels(tempDir, { timeout: 5, minOutputBytes: 0 });
+        const status = await runModels(tempDir, { minOutputBytes: 0 });
 
         // Both models should be COMPLETED since they finish well before the 5s timeout
         for (const [modelId, model] of Object.entries(status.models)) {
@@ -140,7 +140,7 @@ describe("Bug #1: TIMEOUT despite successful completion", () => {
       process.env.PATH = `${fakeClaudishDir}:${originalPath}`;
 
       try {
-        const status = await runModels(tempDir, { timeout: 1, minOutputBytes: 0 });
+        const status = await runModels(tempDir, { minOutputBytes: 0 });
 
         const model = Object.values(status.models)[0];
         expectModelState("model-a", model, "COMPLETED");
@@ -155,121 +155,6 @@ describe("Bug #1: TIMEOUT despite successful completion", () => {
       }
     },
     { retry: 2 }
-  );
-
-  it(
-    "REPRO: actual timeout should still produce TIMEOUT state",
-    async () => {
-      // Create a slow fake claudish that takes 5 seconds
-      if (fakeClaudishDir) {
-        rmSync(fakeClaudishDir, { recursive: true, force: true });
-      }
-      fakeClaudishDir = makeFakeClaudish(5000); // 5 second delay
-
-      setupSession(tempDir, ["slow-model"], "Say hello");
-
-      const originalPath = process.env.PATH;
-      const originalClaudishBin = process.env.CLAUDISH_BIN;
-      // CLAUDISH_BIN outranks PATH in resolveClaudishSpawn, so leaving it set would defeat the fake shim.
-      delete process.env.CLAUDISH_BIN;
-      process.env.PATH = `${fakeClaudishDir}:${originalPath}`;
-
-      try {
-        const status = await runModels(tempDir, { timeout: 1 });
-
-        const model = Object.values(status.models)[0];
-        expectModelState("slow-model", model, "TIMEOUT");
-      } finally {
-        process.env.PATH = originalPath;
-        if (originalClaudishBin === undefined) {
-          delete process.env.CLAUDISH_BIN;
-        } else {
-          process.env.CLAUDISH_BIN = originalClaudishBin;
-        }
-      }
-    },
-    { retry: 2 }
-  );
-
-  it(
-    "REPRO: mixed fast/slow models — fast ones COMPLETED, slow one TIMEOUT",
-    async () => {
-      // Two fast models and one slow model
-      // The fast ones should be COMPLETED, the slow one TIMEOUT
-      if (fakeClaudishDir) {
-        rmSync(fakeClaudishDir, { recursive: true, force: true });
-      }
-
-      // Create a "claudish" that takes different times based on model name
-      const dir = mkdtempSync(join(tmpdir(), "fake-claudish-mixed-"));
-      const script = join(dir, "claudish");
-      writeFileSync(
-        script,
-        `#!/bin/bash
-# Read stdin
-cat > /dev/null
-# Parse the model name from args
-MODEL=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --model) MODEL="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-# Slow model takes 50 seconds, fast models take 50ms
-if [[ "$MODEL" == "slow-model" ]]; then
-  sleep 50
-else
-  sleep 0.05
-fi
-echo "Response from $MODEL — complete analysis."
-exit 0
-`,
-        "utf-8"
-      );
-      chmodSync(script, 0o755);
-      fakeClaudishDir = dir;
-
-      setupSession(tempDir, ["fast-a", "fast-b", "slow-model"], "Analyze code");
-
-      const originalPath = process.env.PATH;
-      const originalClaudishBin = process.env.CLAUDISH_BIN;
-      // CLAUDISH_BIN outranks PATH in resolveClaudishSpawn, so leaving it set would defeat the fake shim.
-      delete process.env.CLAUDISH_BIN;
-      process.env.PATH = `${fakeClaudishDir}:${originalPath}`;
-
-      try {
-        // Keep the slow/timeout ratio at 5:1 while giving bash + child-process
-        // startup enough headroom under full-suite resource pressure.
-        const status = await runModels(tempDir, { timeout: 10, minOutputBytes: 0 });
-
-        // Read manifest to find which anon ID maps to which model
-        const manifest = JSON.parse(readFileSync(join(tempDir, "manifest.json"), "utf-8"));
-
-        for (const [anonId, entry] of Object.entries(manifest.models) as [
-          string,
-          { model: string },
-        ][]) {
-          const modelStatus = status.models[anonId];
-          if (entry.model === "slow-model") {
-            expectModelState(entry.model, modelStatus, "TIMEOUT");
-          } else {
-            // THIS IS THE BUG: fast models that completed should be COMPLETED
-            // but the current code may mark them as TIMEOUT because proc.killed === false
-            expectModelState(entry.model, modelStatus, "COMPLETED");
-            expect(modelStatus.exitCode).toBe(0);
-          }
-        }
-      } finally {
-        process.env.PATH = originalPath;
-        if (originalClaudishBin === undefined) {
-          delete process.env.CLAUDISH_BIN;
-        } else {
-          process.env.CLAUDISH_BIN = originalClaudishBin;
-        }
-      }
-    },
-    { timeout: 20_000, retry: 2 }
   );
 
   it(
@@ -307,7 +192,7 @@ exit 0
       process.env.PATH = `${largeFakeDir}:${originalPath}`;
 
       try {
-        const status = await runModels(tempDir, { timeout: 10 });
+        const status = await runModels(tempDir, {});
 
         const model = Object.values(status.models)[0];
         expectModelState("model-a", model, "COMPLETED");

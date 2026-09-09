@@ -88,6 +88,7 @@ describe("Group 1: MCP Protocol — channel capability", () => {
       "cancel_session",
       "compare_models",
       "create_session",
+      "get_diagnostics",
       "get_output",
       "list_models",
       "list_sessions",
@@ -256,12 +257,13 @@ describe("Group 1b: MCP Protocol — channel-only tools", () => {
     } catch {}
   });
 
-  test("lists only the 5 channel tools when CLAUDISH_MCP_TOOLS=channel", async () => {
+  test("lists only the 6 channel tools when CLAUDISH_MCP_TOOLS=channel", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
     expect(names).toEqual([
       "cancel_session",
       "create_session",
+      "get_diagnostics",
       "get_output",
       "list_sessions",
       "send_input",

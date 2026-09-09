@@ -1,0 +1,6 @@
+{"label":"collapse-to-string","collection":"orders","clauseCount":2,"clauses":[{"clause":["cost",">",500],"runtimeTypes":["string","string","number"]},{"clause":["status","==","shipped"],"runtimeTypes":["string","string","string"]}]}
+{"label":"collapse-to-string","collection":"orders","clauseCount":2,"clauses":[{"clause":["cost",">",500],"runtimeTypes":["string","string","number"]},{"clause":["status","==","shipped"],"runtimeTypes":["string","string","string"]}]}
+{"label":"collapse-to-string","collection":"orders","clauseCount":2,"clauses":[{"clause":["cost",">",500],"runtimeTypes":["string","string","number"]},{"clause":["status","=","shipped"],"runtimeTypes":["string","string","string"]}]}
+{"label":"union","collection":"orders","clauseCount":2,"clauses":[{"clause":["cost","gt",500],"runtimeTypes":["string","string","number"]},{"clause":["status","eq","shipped"],"runtimeTypes":["string","string","string"]}]}
+{"label":"union","collection":"orders","clauseCount":2,"clauses":[{"clause":["cost","gt",500],"runtimeTypes":["string","string","number"]},{"clause":["status","eq","shipped"],"runtimeTypes":["string","string","string"]}]}
+{"label":"union","collection":"orders","clauseCount":2,"clauses":[{"clause":["cost","gt",500],"runtimeTypes":["string","string","number"]},{"clause":["status","eq","shipped"],"runtimeTypes":["string","string","string"]}]}

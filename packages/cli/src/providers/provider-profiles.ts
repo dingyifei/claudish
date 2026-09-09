@@ -24,6 +24,7 @@ import { CodexAPIFormat } from "../adapters/codex-api-format.js";
 import { DevinAPIFormat } from "../adapters/devin-api-format.js";
 import { GeminiAPIFormat } from "../adapters/gemini-api-format.js";
 import { LiteLLMAPIFormat } from "../adapters/litellm-api-format.js";
+import { lookupModelEndpoint } from "../adapters/model-catalog.js";
 import { OllamaAPIFormat } from "../adapters/ollama-api-format.js";
 import { OpenAIAPIFormat } from "../adapters/openai-api-format.js";
 import { getVertexConfig, validateVertexOAuthConfig } from "../auth/vertex-auth.js";
@@ -64,8 +65,29 @@ export interface ProfileContext {
   targetModel: string;
   /** The listening port of the proxy server */
   port: number;
-  /** Shared ComposedHandler options from the outer scope */
-  sharedOpts: Pick<ComposedHandlerOptions, "isInteractive" | "invocationMode">;
+  /**
+   * Catalog cache path override — a TEST SEAM, unset in production.
+   *
+   * `requiresResponsesApi` reads the model catalog, which made the composition
+   * table in `provider-profiles.test.ts` depend on whichever
+   * `~/.claudish/all-models.json` the machine happened to have. That is the
+   * v7.43.0 trap: green on every dev box, and a different answer on a cold CI
+   * runner. Passing a fixture path here keeps that table hermetic.
+   */
+  catalogCachePath?: string;
+  /**
+   * Shared ComposedHandler options from the outer scope.
+   *
+   * Every profile spreads this verbatim, so widening this Pick is how a new
+   * handler option reaches all ~25 profile and custom-endpoint construction
+   * sites at once. An option added to ComposedHandlerOptions but NOT listed
+   * here is dropped by the spread with no error — the feature then works on
+   * the direct proxy-server routes and silently not on any profile.
+   */
+  sharedOpts: Pick<
+    ComposedHandlerOptions,
+    "isInteractive" | "invocationMode" | "effortOverride" | "modelParams" | "proOnUltracode"
+  >;
 }
 
 /**
@@ -173,8 +195,20 @@ export const devinProfile: ProviderProfile = {
  * transport will keep routing ids this function no longer claims. The two tests
  * must stay identical; a test pins their agreement.
  *
- * Only OpenAI-served ids reach this gate — it lives inside `openaiProfile`, so
- * `cx@` (Responses-only by construction) and every other provider are untouched.
+ * THE GATE IS HOST-BLIND, and the comment here used to say otherwise ("only
+ * OpenAI-served ids reach this gate"). `openaiProfile` is many-to-one — it also
+ * serves x-ai, qwen, deepseek and mistralai (`provider-definitions.ts:228`) — so
+ * every one of those hosts reaches this function. `endpoints.openai` is keyed by
+ * TRANSPORT FAMILY, not by host, so the catalog cannot say "responses on OpenAI,
+ * chat completions on x-ai" about one model id.
+ *
+ * Measured 2026-09-09 against the live catalog, nothing is mis-served by that:
+ * all 8 Responses-only ids are `gpt-*`, which no other host under this profile
+ * carries. The exposure is a future id served by two hosts on different APIs.
+ *
+ * `cx@` really is untouched, for a different reason than the old comment gave:
+ * `openaiCodexProfile` builds `CodexAPIFormat` unconditionally and never calls
+ * this function at all.
  *
  * Pick the verification model carefully. /v1/models is a CATALOGUE, not a served
  * set: of those six ids, only `gpt-5.3-codex` actually answers 200 on
@@ -184,11 +218,35 @@ export const devinProfile: ProviderProfile = {
  * routing fix did not work" when the model is simply not being served. Same
  * catalogue-vs-served-set trap the Antigravity and Devin providers document.
  *
- * Still a PER-MODEL constraint and still a TEMPORARY name gate — replaced by
- * the catalog capability record (endpoints.openai.toolsWithReasoning ===
- * "requires-responses") once route-time capability fetch lands.
+ * THE CATALOG MAY ONLY WIDEN THIS GATE, NEVER NARROW IT. The name rule stays an
+ * unconditional `||` below for the reason above: the transport routes every
+ * `*codex*` id to /v1/responses on its own, so a catalog record that said "chat
+ * completions" for one would restore the split in the other direction —
+ * OpenAIAPIFormat's body on a Responses endpoint.
+ *
+ * The name rule alone could not stay correct, which is what this comment
+ * predicted and what then happened. `gpt-6-astra` shipped 2026-09-03, matches
+ * neither pattern, and is Responses-only. Its Chat Completions body carried the
+ * catalog's own `tokenParam` and was rejected:
+ *
+ *   400 unknown_parameter — "Unknown parameter: 'max_output_tokens'."
+ *
+ * `max_output_tokens` is the Responses spelling. claudish was already reading
+ * half of the catalog's endpoint contract — `tokenParam`, via
+ * `OpenAIAPIFormat.tokenParamName` — while ignoring the sibling field that says
+ * which wire API that spelling belongs to. Reading both is the fix. The name
+ * rule survives only as the cold-cache fallback, where the catalog has no
+ * opinion to read.
+ *
+ * @param cachePath Test seam. Points the catalog lookup at a fixture, so a test
+ *   never depends on a warm `~/.claudish/all-models.json`.
  */
-function requiresResponsesApi(modelName: string): boolean {
+export function requiresResponsesApi(modelName: string, cachePath?: string): boolean {
+  const endpoint = lookupModelEndpoint(modelName, "openai", cachePath);
+  if (endpoint?.api === "responses" || endpoint?.toolsWithReasoning === "requires-responses") {
+    return true;
+  }
+
   const name = modelName.toLowerCase();
   return /^gpt-5\.6/.test(name) || name.includes("codex");
 }
@@ -223,7 +281,7 @@ export const openaiProfile: ProviderProfile = {
     // Claude Code always sends tools, so requires-responses models must get the
     // whole Responses-API slice (endpoint + CodexAPIFormat payload + responses
     // SSE) swapped together — same composition the Zen profile uses for gpt-*.
-    if (requiresResponsesApi(ctx.modelName)) {
+    if (requiresResponsesApi(ctx.modelName, ctx.catalogCachePath)) {
       const responsesProvider = { ...ctx.provider, apiPath: "/v1/responses" };
       const transport = new OpenAIProviderTransport(responsesProvider, ctx.modelName, ctx.apiKey);
       const adapter = new CodexAPIFormat(ctx.modelName);
@@ -296,13 +354,16 @@ export const glmProfile: ProviderProfile = {
 
 /**
  * OpenCode Zen / Zen Go — two tiers:
- *   zen/  (opencode-zen):    free anonymous models + full paid access (OPENCODE_API_KEY)
+ *   zen/  (opencode-zen):    OPENCODE_API_KEY
  *   zgo/  (opencode-zen-go): go-plan models (glm-5, minimax-m2.5, kimi-k2.5) via zen/go/v1/
  *
- * Free anonymous models work without a key: the catalog's publicKeyFallback
- * ("public") is emitted by the credential authority (ApiKeyCredentialProvider)
- * when no real key resolves, so ctx.apiKey is always populated here — keeps
- * rate-limit bucketing consistent without a second inline fallback.
+ * ZEN REQUIRES A REAL KEY (changed 2026-08-22). The catalog used to declare
+ * `publicKeyFallback: "public"`, so the credential authority emitted the literal
+ * string "public" whenever no real key resolved and `ctx.apiKey` was always
+ * populated here. Measured: the endpoint answers `401 — Missing API key` to
+ * that token, so the "free anonymous" tier it modelled does not exist (or no
+ * longer does). The affordance is removed entirely; `ctx.apiKey` can now be
+ * empty here, exactly as for any other keyed provider without a key.
  *
  * Model routing inside the profile:
  *   - GPT-* models    → OpenAIProviderTransport (/v1/responses) + CodexAPIFormat (Responses API)

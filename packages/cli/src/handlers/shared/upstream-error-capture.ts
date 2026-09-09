@@ -24,6 +24,7 @@
  */
 
 import { appendFileSync } from "node:fs";
+import { redactSecrets } from "../../redact.js";
 
 /** Env var naming the capture file. Unset = feature off. */
 export const UPSTREAM_ERROR_LOG_ENV = "CLAUDISH_UPSTREAM_ERROR_LOG";
@@ -64,7 +65,18 @@ export function captureUpstreamError(record: UpstreamErrorRecord): boolean {
   if (!path) return false;
 
   try {
-    const raw = record.body ?? "";
+    // Redacted BEFORE truncation, and before the bytes hit disk.
+    //
+    // A 401/403 body routinely echoes the credential that failed, and this file
+    // is no longer only a path a user opted into: channel sessions now point
+    // every child at `<sessionDir>/upstream-errors.jsonl` and `get_diagnostics`
+    // hands its contents to an agent. Redacting at write time is the only point
+    // that covers every reader — the same rule and the same reason as team's
+    // error log (team-orchestrator.ts:1070) and the channel's `events.jsonl`.
+    //
+    // Before truncation specifically, so the cut cannot fall inside a key and
+    // leave a usable prefix of it in the file.
+    const raw = redactSecrets(record.body ?? "");
     const truncated = raw.length > MAX_CAPTURED_BODY_BYTES;
     const line = JSON.stringify({
       at: record.at ?? new Date().toISOString(),

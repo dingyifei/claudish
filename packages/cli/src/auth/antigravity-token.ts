@@ -47,8 +47,24 @@ const KC_ACCOUNT = "antigravity";
 const PREFIX = "go-keyring-base64:";
 /** Refresh when the access token is within this window of its expiry (~2 min). */
 const EXPIRY_SKEW_MS = 120_000;
-/** Max time to wait for `agy models` to refresh the shared token. */
-const AGY_REFRESH_TIMEOUT_MS = 40_000;
+/**
+ * Max time to wait for `agy models` to refresh the shared token.
+ *
+ * MUST STAY BELOW THE SHORTEST CALLER DEADLINE. This was 40s while the config
+ * TUI's provider probe aborts its whole request at 15s
+ * (`tui/hooks/useRouteProbe.ts`) — so the refresh was granted 2.7× longer than
+ * the operation containing it, and a slow refresh was killed from outside
+ * before it could report anything. The user saw `timeout · 15004ms` on the
+ * provider row, with no indication that a refresh had been in flight, and the
+ * next attempt reported the still-expired token as an unrecoverable session.
+ *
+ * At 12s the refresh now fails INSIDE its own timeout, so it can say what
+ * happened and recommend waiting rather than a pointless re-login. A healthy
+ * refresh is a single network round-trip (~1-3s); the only thing 12s cannot
+ * absorb is agy self-updating, which no caller-side ceiling could absorb either
+ * and which is precisely the case the "timeout" message now names.
+ */
+const AGY_REFRESH_TIMEOUT_MS = 12_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,6 +91,19 @@ interface SharedStoreRecord {
  * Injectable side-effect seams. Tests supply fakes so no real keychain, agy
  * process, or clock is ever touched.
  */
+/**
+ * What happened when we asked the Antigravity CLI to refresh.
+ *
+ * `detail` carries agy's own stderr, truncated. agy explains its failures
+ * perfectly well; claudish was throwing that explanation away and substituting a
+ * guess.
+ */
+export type AgyRefreshOutcome =
+  | { kind: "ran" }
+  | { kind: "not-installed" }
+  | { kind: "timeout" }
+  | { kind: "failed"; detail: string };
+
 export interface AntigravityTokenDeps {
   /** Read the raw keychain value (with the `go-keyring-base64:` prefix), or null. */
   readStore: () => string | null;
@@ -85,11 +114,19 @@ export interface AntigravityTokenDeps {
   /**
    * Ask the Antigravity CLI to refresh the shared token — the real implementation
    * runs `agy models` (a lightweight authed command), which makes agy mint a fresh
-   * token with its OWN current secret and write it back to the shared store. A
-   * no-op when agy isn't installed (the caller then re-reads, finds it still
-   * stale, and throws). claudish never touches the client secret itself.
+   * token with its OWN current secret and write it back to the shared store.
+   * claudish never touches the client secret itself.
+   *
+   * Returns WHY it did not work, rather than nothing. The previous signature was
+   * `() => void` with the failure swallowed by a bare `catch {}` and agy's output
+   * sent to `stdio: "ignore"` — so three genuinely different situations (agy not
+   * installed / agy failed or timed out / agy succeeded but the session is
+   * revoked) all surfaced as one message telling the user to re-login. Only the
+   * third is actually fixed by re-logging in; for the second the fix is usually
+   * to wait, because agy AUTO-UPDATES and a 177MB self-update makes `agy models`
+   * take minutes.
    */
-  runAgyRefresh: () => void;
+  runAgyRefresh: () => AgyRefreshOutcome;
   /** Current time in ms since epoch (defaults to Date.now). */
   now: () => number;
 }
@@ -205,16 +242,25 @@ function defaultDeleteStore(): void {
  * caller re-reads, sees the token is still stale, and throws an actionable error.
  * claudish never handles the client secret in any form.
  */
-function defaultRunAgyRefresh(): void {
+function defaultRunAgyRefresh(): AgyRefreshOutcome {
   const agy = locateAgyBinary();
-  if (!agy) return;
+  if (!agy) return { kind: "not-installed" };
   try {
+    // stderr is CAPTURED, not discarded. It is the only account of why a refresh
+    // failed, and sending it to /dev/null is what forced the caller to guess.
     execFileSync(agy, ["models"], {
-      stdio: ["ignore", "ignore", "ignore"],
+      stdio: ["ignore", "ignore", "pipe"],
+      encoding: "utf8",
       timeout: AGY_REFRESH_TIMEOUT_MS,
     });
-  } catch {
-    // Non-zero exit / timeout — the caller re-reads the store and decides.
+    return { kind: "ran" };
+  } catch (err) {
+    const e = err as { code?: string; signal?: string; stderr?: string };
+    // A killed child reports no exit code. `agy` self-updates (a ~177MB
+    // download), and during that window `agy models` can far exceed any sane
+    // ceiling — a timeout here means "busy", not "signed out".
+    if (e.code === "ETIMEDOUT" || e.signal === "SIGTERM") return { kind: "timeout" };
+    return { kind: "failed", detail: (e.stderr ?? "").trim().slice(0, 300) };
   } finally {
     // agy writes the refreshed token into the SAME keychain item from ANOTHER
     // process, and `resolveValidToken` re-reads immediately after this returns.
@@ -371,7 +417,7 @@ async function resolveValidToken(deps: AntigravityTokenDeps): Promise<string> {
   // Expired/near-expiry → ask agy to refresh (it owns the secret). Running `agy
   // models` mints a fresh token into the shared store; we then RE-READ it.
   log("[Antigravity] Access token expired/near-expiry — asking the Antigravity CLI to refresh.");
-  deps.runAgyRefresh();
+  const outcome = deps.runAgyRefresh();
 
   const refreshedRec = parseRecord(deps.readStore());
   if (refreshedRec && !needsRefresh(refreshedRec.token, deps.now())) {
@@ -379,11 +425,43 @@ async function resolveValidToken(deps: AntigravityTokenDeps): Promise<string> {
     return refreshedRec.token.access_token;
   }
 
-  // agy wasn't installed, or ran but the token is still stale (revoked session).
-  throw new Error(
-    "[Antigravity] Antigravity session expired and couldn't be refreshed. " +
-      "Run `claudish login antigravity` (installs/authenticates the Antigravity CLI)."
-  );
+  // Still stale. WHY decides what the user should actually do — and only one of
+  // these four is fixed by signing in again. Reporting them all as "session
+  // expired, re-login" sent users through an OAuth flow that could not help,
+  // most often while agy was simply mid-self-update.
+  throw new Error(`[Antigravity] ${describeRefreshFailure(outcome)}`);
+}
+
+/** Turn a refresh outcome into the remediation that actually applies to it. */
+function describeRefreshFailure(outcome: AgyRefreshOutcome): string {
+  switch (outcome.kind) {
+    case "not-installed":
+      return (
+        "The Antigravity CLI (`agy`) is not installed, so the expired session could not be " +
+        "refreshed. Run `claudish login antigravity` — it installs and authenticates it."
+      );
+    case "timeout":
+      return (
+        `The Antigravity CLI did not finish within ${Math.round(AGY_REFRESH_TIMEOUT_MS / 1000)}s, ` +
+        "so the session could not be refreshed. `agy` auto-updates itself (a large download) " +
+        "and is unusably slow while it does — this usually clears on its own. Try again in a " +
+        "minute; run `agy models` to see what it is doing. You are most likely still signed in."
+      );
+    case "failed":
+      return (
+        "The Antigravity CLI could not refresh the session" +
+        (outcome.detail ? `: ${outcome.detail}` : ".") +
+        " If it reports being signed out, run `claudish login antigravity`."
+      );
+    default:
+      // agy ran cleanly and the token is STILL stale — the session really is
+      // revoked, which is the one case a fresh sign-in fixes.
+      return (
+        "The Antigravity session is expired and the Antigravity CLI refreshed it without " +
+        "producing a valid token — the session has most likely been revoked. " +
+        "Run `claudish login antigravity`."
+      );
+  }
 }
 
 /**

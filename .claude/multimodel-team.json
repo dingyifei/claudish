@@ -1,13 +1,14 @@
 {
   "schemaVersion": "2.1.0",
-  "lastUpdated": "2026-08-08T14:11:27Z",
+  "lastUpdated": "2026-09-02T10:19:57Z",
   "defaultModels": [
     "internal",
     "gpt-5.6-sol",
-    "gemini-3.6-flash",
-    "grok-4.5",
+    "gemini-3.7-flash",
+    "grok-4.6",
     "kimi-k3",
-    "glm-5.2"
+    "glm-5.3",
+    "qwen3.8-max"
   ],
   "defaultThreshold": "majority",
   "contextPreferences": {

@@ -1,8 +1,17 @@
 import { useCallback, useState } from "react";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
+import { nativeRouteFor } from "../../providers/native-route.js";
+
+/**
+ * Why a native row is never probed here: the native handler authenticates with
+ * the inbound Claude Code header, which this probe cannot supply, so a request
+ * would fail for a healthy model and a typo alike (see providers/native-route.ts).
+ */
+const REASON_NATIVE =
+  "Native Claude Code auth — not probed — served on Claude Code's own auth, which this process cannot forward";
 import { describeProbeState } from "../../providers/probe-live.js";
-import { probeProviderRoute } from "../../providers/probe-runner.js";
-import { route } from "../../providers/routing-rules.js";
+import { INTERACTIVE_PROBE_TIMEOUT_MS, probeProviderRoute } from "../../providers/probe-runner.js";
+import { type Route, route } from "../../providers/routing-rules.js";
 import { ensureProbeProxy } from "../probe-proxy.js";
 import { getProviderDefs, providerIsReady } from "../providers.js";
 import type { ProbeEntry, ProbeMode } from "../types.js";
@@ -96,20 +105,31 @@ export function useRouteProbe(config: ClaudishProfileConfig): UseRouteProbeRetur
     // route() is async (credential resolution may pull from 1Password); the rest
     // of submit is already async, so the whole flow runs in one IIFE.
     (async () => {
-      const plan = await route(model);
-      if (plan.kind !== "ok") {
-        setProbeResults([
-          {
-            provider: "none",
-            displayName: "No routes found",
-            status: "failed",
-            error: plan.hint ?? plan.reason,
-          },
-        ]);
-        setProbeMode("done");
-        return;
+      // Same guard the proxy applies before routing: a bare Claude name is native
+      // passthrough, and route() would misreport it (see providers/native-route.ts).
+      // The native link joins the chain so the panel shows it, but it is skipped
+      // in the loop below: this probe cannot supply the Claude Code auth the
+      // native handler forwards, so any request would fail regardless of model.
+      const native = nativeRouteFor(model);
+      let chain: Route[];
+      if (native) {
+        chain = [native];
+      } else {
+        const plan = await route(model);
+        if (plan.kind !== "ok") {
+          setProbeResults([
+            {
+              provider: "none",
+              displayName: "No routes found",
+              status: "failed",
+              error: plan.hint ?? plan.reason,
+            },
+          ]);
+          setProbeMode("done");
+          return;
+        }
+        chain = [plan.primary, ...plan.fallbacks];
       }
-      const chain = [plan.primary, ...plan.fallbacks];
       // Check which routing rule matched. Case-INSENSITIVE — must mirror the
       // matching logic in matchRoutingRule (routing-rules.ts) so the probe panel
       // doesn't lie about which rule the engine actually picked.
@@ -130,7 +150,11 @@ export function useRouteProbe(config: ClaudishProfileConfig): UseRouteProbeRetur
           displayName: r.displayName,
           status: "pending",
           hasKey: true,
-          reason: matchedRule ? `Custom rule: ${matchedRule[0]}` : "Default fallback chain",
+          reason: native
+            ? "Native Claude Code auth — served by the proxy, never routed"
+            : matchedRule
+              ? `Custom rule: ${matchedRule[0]}`
+              : "Default fallback chain",
         };
       });
       setProbeResults(initial);
@@ -146,6 +170,16 @@ export function useRouteProbe(config: ClaudishProfileConfig): UseRouteProbeRetur
       // OAuth providers (e.g. antigravity after `claudish login antigravity`)
       // are tested for real instead of being misreported as missing.
       (async () => {
+        // A native chain has nothing to probe — settle it BEFORE the proxy is
+        // touched. Proxy startup failure below repaints every row `failed`,
+        // which would turn the native row back into a red "no route".
+        if (native) {
+          setProbeResults((prev) =>
+            prev.map((e) => ({ ...e, status: "unverified" as const, reason: REASON_NATIVE }))
+          );
+          setProbeMode("done");
+          return;
+        }
         // Best-effort proxy startup. If it fails we mark everything as failed
         // with a clear error.
         let proxyUrl: string;
@@ -186,7 +220,7 @@ export function useRouteProbe(config: ClaudishProfileConfig): UseRouteProbeRetur
               // ready-check above just gates the noisy "no key" rows.
               hasCredentials: true,
             },
-            15000
+            INTERACTIVE_PROBE_TIMEOUT_MS
           ).catch((e) => ({
             state: "error" as const,
             latencyMs: Date.now() - startMs,

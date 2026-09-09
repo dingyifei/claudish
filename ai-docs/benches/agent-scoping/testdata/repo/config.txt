@@ -1,0 +1,5 @@
+# Deployment configuration
+region = ap-southeast-2
+replicas = 3
+MARKER = QUOKKA-7741
+timeout_seconds = 45

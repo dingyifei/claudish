@@ -1640,13 +1640,41 @@ export async function runClaudeWithProxy(
   // Handle process termination signals (includes cleanup)
   setupSignalHandlers(proc, tempSettingsPath, config.quiet, onCleanup);
 
-  // Wait for claude to exit
-  const exitCode = await new Promise<number>((resolve) => {
-    proc.on("exit", (code) => {
+  // Wait for claude to exit.
+  //
+  // Bind `signal`, not `code` alone. A child killed by a signal reports
+  // `code === null`, so `code ?? 1` filed every Ctrl-C as exit code 1 — the same
+  // value a genuine crash returns — and the caller then told a user who chose to
+  // quit that their session "ended with errors".
+  //
+  // `128 + signum` is the convention `setupSignalHandlers` below already applies
+  // to claudish's OWN exit, and `bin/claudish.cjs` to ITS child. This handler was
+  // the last place that flattened the two causes into one number.
+  const { exitCode, exitSignal } = await new Promise<{
+    exitCode: number;
+    exitSignal: NodeJS.Signals | null;
+  }>((resolve) => {
+    proc.on("exit", (code, signal) => {
       setClaudeCodeRunning(false);
-      resolve(code ?? 1);
+      resolve({
+        exitCode: signal ? 128 + (SIGNAL_EXIT_NUMBERS[signal] ?? 0) : (code ?? 1),
+        exitSignal: signal,
+      });
     });
   });
+
+  // The only durable record of WHY the run ended. The always-on session log
+  // carries proxy traffic, so a session that died before its first request left
+  // nothing but "[Proxy] Server started" behind, and the caller's error notice
+  // pointed at a file that could not name the cause.
+  //
+  // `debugLog` writes to buffers only (no console without forceConsole), so this
+  // is safe while the terminal firewall is still up.
+  debugLog(
+    exitSignal
+      ? `[Claude Code] Exited from ${exitSignal} (exit code ${exitCode})`
+      : `[Claude Code] Exited with code ${exitCode}`
+  );
 
   // The child has released the terminal — claudish may speak again. Restore
   // BEFORE any shutdown message, or the caller's "Shutting down proxy…" line
@@ -1662,6 +1690,20 @@ export async function runClaudeWithProxy(
 
   return exitCode;
 }
+
+/**
+ * Signal numbers, for the `128 + signum` exit convention.
+ *
+ * Hardcoded because Node exposes `os.constants.signals` but not a portable
+ * reverse map, and these four are POSIX-fixed. `packages/cli/bin/claudish.cjs`
+ * carries the same table for the case where the CHILD dies from a signal.
+ */
+const SIGNAL_EXIT_NUMBERS: Partial<Record<NodeJS.Signals, number>> = {
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGQUIT: 3,
+  SIGTERM: 15,
+};
 
 /**
  * Setup signal handlers to gracefully shutdown
@@ -1703,7 +1745,18 @@ function setupSignalHandlers(
       } catch {
         // Ignore cleanup errors
       }
-      process.exit(0);
+      // `128 + signum`, the shell convention for "died from signal N" — NOT 0.
+      //
+      // This one line manufactured the 900-second silent success. A supervisor
+      // (the channel session manager's timeout, `team`'s deadline, a CI runner)
+      // would SIGTERM the process group, this handler would run its cleanup and
+      // exit 0, and every layer above read that 0 as "the run succeeded". The
+      // channel manager then let the exit UPGRADE a state its timeout handler
+      // had already recorded as failed, and wrote `status: "completed"` to
+      // meta.json for a session that had been killed. A graceful shutdown is
+      // still a shutdown: the process did not finish its work, and its exit
+      // code is the only place that can say so.
+      process.exit(128 + (SIGNAL_EXIT_NUMBERS[signal] ?? 0));
     });
   }
 }

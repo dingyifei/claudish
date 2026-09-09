@@ -86,7 +86,24 @@ if (before.existed) {
   }
 }
 
-const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit", env: process.env });
+// The developer's real CREDENTIAL STORES are guarded the same way as their
+// config file, and for the same reason: a test that reaches one is not
+// hermetic, and the damage lands on the machine rather than on the test.
+//
+// `CLAUDISH_DISABLE_KEYCHAIN=1` makes `hasKeychainSource()` return false, so no
+// suite can spawn `security` against the login keychain. This is not
+// hypothetical: `keychain.enabled` in a real config was enough to make an
+// unrelated test run enumerate it. The keychain is worse than the config file
+// in one respect — a mutation there cannot be snapshotted and restored the way
+// the bytes of a JSON file can — so it is prevented rather than repaired.
+//
+// `CLAUDISH_DISABLE_OP=1` is set for the same reason: 1Password arbitrates its
+// handshake machine-wide, and a burst of denials from a test run suppresses
+// authorization for every process on the machine for 15 seconds.
+const child = spawn(cmd[0], cmd.slice(1), {
+  stdio: "inherit",
+  env: { ...process.env, CLAUDISH_DISABLE_KEYCHAIN: "1", CLAUDISH_DISABLE_OP: "1" },
+});
 
 /** Report the mutation, put the original bytes back, and explain the fix. */
 function reportAndRestore(after: Snapshot): void {

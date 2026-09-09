@@ -51,6 +51,23 @@ interface ToolCallResult {
   isError?: unknown;
 }
 
+interface TeamStartPayload {
+  started?: unknown;
+  team_session_id?: unknown;
+  session_path?: unknown;
+  slots?: Record<string, unknown>;
+}
+
+interface TeamStatusPayload {
+  models?: Record<
+    string,
+    {
+      state?: unknown;
+      error?: { reason?: unknown };
+    }
+  >;
+}
+
 const delay = (ms: number) => new Promise<void>((resolveDelay) => setTimeout(resolveDelay, ms));
 
 function isRunning(process: ChildProcessWithoutNullStreams): boolean {
@@ -81,6 +98,16 @@ function extractToolText(result: unknown): string {
     )
     .filter(Boolean)
     .join("\n");
+}
+
+function parseToolJson<T>(result: ToolCallResult, context: string): T {
+  const text = extractToolText(result);
+  if (!text) throw new Error(`${context} returned no text content`);
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    throw new Error(`${context} returned invalid JSON: ${text}`, { cause: error });
+  }
 }
 
 describe("MCP team shape contract", () => {
@@ -232,6 +259,43 @@ describe("MCP team shape contract", () => {
         expect(teamTool).toBeDefined();
         expect(teamTool?.inputSchema?.properties).toHaveProperty("require_pattern");
         expect(teamTool?.inputSchema?.properties).toHaveProperty("min_output_bytes");
+        expect(teamTool?.inputSchema?.properties).not.toHaveProperty("timeout");
+
+        const pollSettledStatus = async (
+          sessionPath: string,
+          label: string
+        ): Promise<TeamStatusPayload> => {
+          const settleLimitMs = 15_000;
+          const deadline = Date.now() + settleLimitMs;
+          let lastStatus: TeamStatusPayload | undefined;
+
+          while (Date.now() < deadline) {
+            const statusResult = (await request("tools/call", {
+              name: "team",
+              arguments: { mode: "status", path: sessionPath },
+            })) as ToolCallResult;
+            if (statusResult.isError === true) {
+              throw new Error(`${label} status call returned isError=true`);
+            }
+
+            lastStatus = parseToolJson<TeamStatusPayload>(statusResult, `${label} status`);
+            const models = lastStatus.models;
+            if (!models || typeof models !== "object") {
+              throw new Error(`${label} status has no models object`);
+            }
+            if (Object.values(models).every((model) => model.state !== "RUNNING")) {
+              return lastStatus;
+            }
+
+            await delay(25);
+          }
+
+          throw new Error(
+            `${label} did not settle within ${settleLimitMs}ms; last status: ${JSON.stringify(
+              lastStatus
+            )}`
+          );
+        };
 
         const mismatchResult = (await request("tools/call", {
           name: "team",
@@ -239,15 +303,23 @@ describe("MCP team shape contract", () => {
             mode: "run",
             path: requiredShapeSession,
             models: ["fake-dropout"],
-            timeout: 60,
             require_pattern: "```vote",
           },
         })) as ToolCallResult;
         expect(mismatchResult.isError).not.toBe(true);
-        const mismatchText = extractToolText(mismatchResult);
-        expect(mismatchText).toContain("0/1 succeeded");
-        expect(mismatchText).toContain("reason=shape_mismatch");
-        expect(mismatchText).not.toContain("1/1 succeeded");
+        const mismatchStart = parseToolJson<TeamStartPayload>(mismatchResult, "shape-required run");
+        expect(mismatchStart.started).toBe(true);
+        expect(mismatchStart.team_session_id).toBe("required-shape");
+        expect(mismatchStart.session_path).toBe(requiredShapeSession);
+        expect(mismatchStart.slots).toHaveProperty("fake-dropout");
+        const mismatchSlot = mismatchStart.slots?.["fake-dropout"];
+        expect(typeof mismatchSlot).toBe("string");
+
+        const mismatchStatus = await pollSettledStatus(requiredShapeSession, "shape-required run");
+        const mismatchedModel = mismatchStatus.models?.[String(mismatchSlot)];
+        expect(mismatchedModel).toBeDefined();
+        expect(mismatchedModel?.state).toBe("EMPTY");
+        expect(mismatchedModel?.error?.reason).toBe("shape_mismatch");
 
         // This control is load-bearing: the same exit-0 child must succeed when
         // no shape is required, proving the first failure was not a broken fake.
@@ -257,13 +329,20 @@ describe("MCP team shape contract", () => {
             mode: "run",
             path: controlSession,
             models: ["fake-dropout"],
-            timeout: 60,
           },
         })) as ToolCallResult;
         expect(controlResult.isError).not.toBe(true);
-        const controlText = extractToolText(controlResult);
-        expect(controlText).toContain("1/1 succeeded");
-        expect(controlText).not.toContain("reason=shape_mismatch");
+        const controlStart = parseToolJson<TeamStartPayload>(controlResult, "control run");
+        expect(controlStart.started).toBe(true);
+        expect(controlStart.slots).toHaveProperty("fake-dropout");
+        const controlSlot = controlStart.slots?.["fake-dropout"];
+        expect(typeof controlSlot).toBe("string");
+
+        const controlStatus = await pollSettledStatus(controlSession, "control run");
+        const controlModel = controlStatus.models?.[String(controlSlot)];
+        expect(controlModel).toBeDefined();
+        expect(controlModel?.state).toBe("COMPLETED");
+        expect(controlModel?.error).toBeUndefined();
       } finally {
         if (server && serverClosed) await terminateServer(server, serverClosed);
         rmSync(tempRoot, { recursive: true, force: true });

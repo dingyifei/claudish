@@ -360,7 +360,8 @@ Claudish automatically loads `.env` from the current directory at startup. For t
 | `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` |
 | `QWEN_CLOUD_PLAN_API_KEY` | Qwen Plan (`qc@`) — Alibaba Cloud Model Studio | _(none — billing mode is fixed when the key is minted)_ |
 | `OLLAMA_API_KEY` | OllamaCloud (`oc@`) | |
-| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) — optional for free models | |
+| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) | |
+| `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`) | _(none — the Zen key is a different plan and is not accepted)_ |
 | `LITELLM_API_KEY` | LiteLLM (`ll@`) — requires `LITELLM_BASE_URL` | |
 | `POE_API_KEY` | Poe (`poe@`) | |
 | `VERTEX_API_KEY` | Vertex AI Express (`v@`) | |
@@ -635,8 +636,8 @@ claudish --model ollama@llama3.2:3 "code review"  # 3 concurrent requests
 | `qc@` | Qwen Plan | `QWEN_CLOUD_PLAN_API_KEY` | `qc@qwen3.7-plus` |
 | `llama@`, `lc@`, `meta@` | OllamaCloud | `OLLAMA_API_KEY` | `llama@llama-3.1-70b` |
 | `oc@` | OllamaCloud | `OLLAMA_API_KEY` | `oc@llama-3.1-70b` |
-| `zen@` | OpenCode Zen (free/paid) | `OPENCODE_API_KEY` _(optional)_ | `zen@gpt-5-nano` |
-| `zgo@`, `zengo@` | OpenCode Zen Go plan | `OPENCODE_API_KEY` | `zgo@glm-5` |
+| `zen@` | OpenCode Zen | `OPENCODE_API_KEY` | `zen@gpt-5-nano` |
+| `zgo@`, `zengo@` | OpenCode Zen Go plan | `OPENCODE_GO_API_KEY` | `zgo@glm-5` |
 | `v@`, `vertex@` | Vertex AI | `VERTEX_API_KEY` | `v@gemini-2.5-flash` |
 | `ag@`, `antigravity@` | Antigravity (Gemini subscription) | _(OAuth via `claudish login antigravity`)_ | `ag@gemini-3.6-flash` |
 | `go@` | _deprecated alias → `ag@`_ | _(OAuth)_ | `go@gemini-2.5-flash` |

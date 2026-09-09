@@ -1,0 +1,95 @@
+description: "Does --agent reach the child and shape the session it runs?"
+harness: claude-code
+
+harness_config:
+  model: claude-haiku-4-5-20251001
+  # `Explore` is a BUILT-IN agent. Plugin agents (dev:reviewer, dev:architect)
+  # are deliberately NOT used here: sandbox levels above `workspace` replace HOME,
+  # so ~/.claude/plugins is not visible and `--agent dev:reviewer` would fail with
+  # "not found" — a harness error, not a graded result.
+  #
+  # bypassPermissions because Explore reaches for Grep/Read/Bash; in --print mode
+  # an un-approved tool call silently no-ops, which would turn a real failure into
+  # a quiet pass.
+  args: ["--agent", "Explore", "--permission-mode", "bypassPermissions"]
+
+defaults:
+  # `workspace`, NOT `home`: home replaces HOME and hides the claude.ai login in
+  # ~/.claude, so preflight blocks on "neither CLAUDE_CODE_OAUTH_TOKEN nor
+  # ANTHROPIC_API_KEY found". `workspace` still isolates the working tree, so the
+  # agent cannot touch the real repo.
+  sandbox: workspace
+  timeout: 180s
+  capture: log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What this measures, and what it deliberately does NOT
+#
+# MEASURES: that `--agent <name>` is carried through to the child and the
+# resulting Session reflects it — the agent reads real files with real tools and
+# answers from their contents.
+#
+# Why it matters here: claudish's `team` and `create_session` gained a
+# first-class `agent` parameter (471bbf7). Claude Code applies a VALID agent
+# correctly under `-p --input-format stream-json` (measured: --agent dev:reviewer
+# yields tools ["Read","Bash"]) but SILENTLY IGNORES an unknown one — exit 0, no
+# stderr, default agent, full toolset. `agent-availability.ts` guards that at the
+# MCP boundary; this bench guards the other half, that a good name still works.
+#
+# DOES NOT MEASURE: claudish-internal behaviour — native slots resolving
+# internal->opus, require_pattern catching a slot that never voted, or
+# rate_limit_event frames being kept out of the captured answer. Those are not
+# things an AGENT does, so madbench cannot grade them honestly: a check that
+# passes under the mock harness is grading nothing, which `madbench check`
+# enforces. They are covered by 48 unit tests plus measured e2e runs, recorded in
+# ai-docs/reports/native-team-slots.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+scenarios:
+  - name: explore-agent-reads-config
+    description: "Explore finds a marker that exists in exactly one seeded file"
+    testdata: ./testdata/repo
+    prompt: |
+      Somewhere in the files in the current working directory there is a line
+      of the form `MARKER = <value>`.
+
+      Find it and report the value, exactly as written, in your final message.
+    checks:
+      # Deterministic core: the value only exists inside a seeded file, so this
+      # cannot be answered without actually reading it. A no-op agent fails.
+      - type: contains
+        value: "QUOKKA-7741"
+
+      # The session shows a real read. Under the mock harness no tool is used at
+      # all, which is what keeps the negative control honest.
+      - type: any-of
+        checks:
+          - { type: session:tool-used, value: "Grep" }
+          - { type: session:tool-used, value: "Read" }
+          - { type: session:tool-used, value: "Glob" }
+          - { type: session:tool-used, value: "Bash" }
+
+      # NO session:file-read check here, deliberately. It counts only dedicated
+      # reading tools (Read/NotebookRead/View/read_file), and a first real run
+      # showed the agent solving this with `Bash: grep -r "MARKER = "` — a
+      # perfectly good way to find the value that scores 0 file reads:
+      #   session:file-read  no read of glob:**/config.txt among 0 file(s) read
+      # That was the check over-specifying HOW rather than WHAT. The anti-cheat
+      # it was reaching for is already covered: QUOKKA-7741 appears in exactly
+      # one seeded file and nowhere in the prompt, so `contains` cannot pass
+      # without the agent having obtained that file's contents somehow.
+
+      # Tuned from 3 real passes (2026-08-22, claude-haiku-4-5), not guessed:
+      #   cost      $0.0142  spread $0.0135-$0.0168  1.2x  sigma $0.0014
+      #   duration  10.83s   spread 8.95s-10.83s     1.2x  sigma 805ms
+      # Set at ~2x the observed MAX. If a healthy run crosses one of these,
+      # raise the bound — do not re-roll the run.
+      #
+      # These two cannot be negative-controlled: both ERROR when the harness
+      # reports no metrics, so `madbench check` lists them under "could not
+      # grade". That is expected and documented. The control still proves what
+      # matters — the 2 grading cells both fail against a do-nothing harness.
+      - type: cost
+        threshold: 0.04
+      - type: latency
+        threshold: 25000

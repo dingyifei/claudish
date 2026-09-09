@@ -72,6 +72,7 @@
  * never lock a user out of `claudish config`.
  */
 
+import { keychainHasAnyOf } from "../auth/credentials/keychain-source.js";
 import { hasLocalApiKey } from "../auth/credentials/local-api-key.js";
 import {
   type CustomEndpointComplex,
@@ -415,7 +416,17 @@ export function loadPredefinedEndpoints(
     // ── permissions ─────────────────────────────────────────────────────────
 
     const { envVar, aliases } = credentialEnvVars(entry);
-    const permitted = optOut.enable.has(name) || hasLocalApiKey({ envVar, aliases });
+    // The keychain is OR-ed in as a PRESENCE check only. Registration cannot
+    // await, and a per-variable keychain value read costs ~17ms — but
+    // `keychainHasAnyOf` answers for every vendor from ONE enumerate call, so
+    // the gate stays affordable. Deliberately not folded into
+    // `hasLocalApiKey`: that function IS the authority's value-resolution step
+    // (see local-api-key.ts), and widening it would change what every provider
+    // in claudish signs requests with, which is not an endpoints decision.
+    const permitted =
+      optOut.enable.has(name) ||
+      hasLocalApiKey({ envVar, aliases }) ||
+      keychainHasAnyOf([envVar, ...(aliases ?? [])]);
     if (!permitted) {
       skipStale("no local credential");
       continue;

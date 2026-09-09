@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isNativeClaudeModelId } from "./classifier-passthrough.js";
+import { EFFORT_LEVELS, isEffortLevel } from "./adapters/base-api-format.js";
 import { ENV } from "./config.js";
 import { buildLegacyHint, resolveDefaultProvider } from "./default-provider.js";
 import {
@@ -30,6 +31,7 @@ import {
   normalizePricingDisplay,
   searchModels,
 } from "./model-loader.js";
+import { parseModelParams } from "./model-params.js";
 import { compareByReleaseDateDesc } from "./model-selector.js";
 import {
   type ModelResult as PrintableModelResult,
@@ -47,12 +49,13 @@ import {
   isLocalProviderEnabled,
   loadConfig,
   loadLocalConfig,
+  readProOnUltracode,
 } from "./profile-config.js";
 import { API_KEY_MAP } from "./providers/api-key-map.js";
 import { type KeyProvenance, resolveApiKeyProvenance } from "./providers/api-key-provenance.js";
 import type { FallbackRoute } from "./providers/auto-route.js";
 import { latestAnthropicTierModelId } from "./providers/catalog-client.js";
-import { claudeCodeTierAlias } from "./providers/claude-code-aliases.js";
+import { claudeCodeTierAlias, normalizeNativeModelSpec } from "./providers/claude-code-aliases.js";
 import { ensureEndpointsRegistered } from "./providers/endpoint-registration.js";
 import { parseModelChain, parseModelSpec } from "./providers/model-parser.js";
 import { fetchOllamaModels } from "./providers/ollama-discovery.js";
@@ -277,7 +280,10 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       // Code — then behaves exactly as it does for an ordinary `--model`, and
       // only the proxy needs to know a chain exists. A plain value yields a
       // one-element chain, so this costs nothing in the common case.
-      const chain = parseModelChain(modelArg);
+      // Native SELECTORS (`internal`, `default`) are normalized to the tier they
+      // select before anything downstream sees them — Claude Code exits 1 on the
+      // selector and 0 on the tier. See normalizeNativeModelSpec.
+      const chain = parseModelChain(modelArg).map(normalizeNativeModelSpec);
       config.model = chain[0]; // Accept any model ID
       if (chain.length > 1) config.modelChain = chain;
     } else if (arg === "--model-opus") {
@@ -454,6 +460,49 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       // Explicit off switch: enablement ORs several sources, so without this a
       // CLAUDISH_CLASSIFIER_MODEL in a shell profile is unswitchable-off.
       config.classifierPassthrough = false;
+    } else if (arg === "--model-params") {
+      // Extra request params deep-merged into the outbound payload AFTER the
+      // adapter has shaped it, so these win over every adapter default.
+      // Repeatable: later occurrences merge over earlier ones.
+      const mpArg = args[++i];
+      if (!mpArg) {
+        console.error("--model-params requires k=v[,k=v...] (e.g. reasoning.mode=pro)");
+        process.exit(1);
+      }
+      try {
+        config.modelParams = parseModelParams(mpArg, config.modelParams ?? {});
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+    } else if (arg === "--effort-override") {
+      // NOT `--effort`. That name belongs to Claude Code and claudish forwards
+      // it verbatim in claudeArgs (pinned by cli-passthrough.test.ts); claiming
+      // it here would silently stop the child ever seeing it.
+      //
+      // The two are complementary. `--effort` tells Claude Code what to ASK
+      // for, which arrives as output_config.effort and is then clamped to the
+      // levels the model advertises. This pins the level VERBATIM and skips
+      // that clamp. An escape hatch: the clamp is what keeps an unadvertised
+      // level off the wire, so pinning past it can be rejected upstream.
+      const effArg = args[++i];
+      if (!effArg) {
+        console.error(`--effort-override requires a level (${EFFORT_LEVELS.join(", ")})`);
+        process.exit(1);
+      }
+      if (!isEffortLevel(effArg)) {
+        console.error(
+          `--effort-override "${effArg}" is not a canonical level (${EFFORT_LEVELS.join(", ")}). ` +
+            "For a provider-specific value, use --model-params (e.g. --model-params reasoning_effort=<value>)."
+        );
+        process.exit(1);
+      }
+      config.effortOverride = effArg;
+    } else if (arg === "--pro-on-ultracode") {
+      config.proOnUltracode = true;
+    } else if (arg === "--no-pro-on-ultracode") {
+      // Escape hatch when it is enabled via config/env: off for this run.
+      config.proOnUltracode = false;
     } else if (arg === "--op-env" || arg.startsWith("--op-env=")) {
       // The actual 1Password Environment read happens early in index.ts
       // (highest priority). Here we only consume the flag + its value so it
@@ -830,6 +879,17 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       config.proxyIdleTimeoutMs = fc.proxyIdleTimeoutMs;
     }
   } catch {}
+  // proOnUltracode precedence: CLI flag > CLAUDISH_PRO_ON_ULTRACODE env >
+  // project ./.claudish.json > global config.json > false. Opt-in, default OFF
+  // — a pro preset burns quota faster, so it must never turn itself on.
+  if (config.proOnUltracode === undefined) {
+    const envVal = process.env.CLAUDISH_PRO_ON_ULTRACODE;
+    if (envVal !== undefined) {
+      config.proOnUltracode = envVal === "1" || envVal.toLowerCase() === "true";
+    } else {
+      config.proOnUltracode = readProOnUltracode() === true;
+    }
+  }
 
   return config as ClaudishConfig;
 }
@@ -2172,6 +2232,10 @@ ${h("OPTIONS")}
   ${green("--free")}                   Show only FREE models in the interactive selector
   ${green("--monitor")}                Monitor mode - proxy to REAL Anthropic API and log traffic
   ${green("--advisor")} ${yellow('"m1,m2[:collector]"')}  Multi-model advisor replacement (implies --monitor)
+  ${green("--model-params")} ${yellow('"k=v,..."')}  Extra request params merged into the payload (e.g. reasoning.mode=pro)
+  ${green("--effort-override")} ${yellow("<level>")}  Pin reasoning effort verbatim, skipping the per-model clamp
+  ${green("--pro-on-ultracode")}       Apply the model's catalog preset while in ultracode (opt-in)
+  ${green("--no-pro-on-ultracode")}    Force that off for this run (when enabled in config/env)
   ${green("-y, --auto-approve")}       Skip permission prompts (--dangerously-skip-permissions)
   ${green("--no-auto-approve")}        Explicitly enable permission prompts (default)
   ${green("--dangerous")}              Pass --dangerouslyDisableSandbox to Claude Code
@@ -2244,6 +2308,17 @@ ${h("1PASSWORD")} ${dim("(SDK-based — no op CLI needed for secrets)")}
   ${green("--op-env")} ${yellow("<id>")}             Load a 1Password Environment (highest-priority source)
   ${dim("Persistent setup (single refs, sets, environments, account): claudish config -> 1Password tab")}
 
+${h("MACOS KEYCHAIN")} ${dim("(local, encrypted at rest, no desktop-app handshake)")}
+  ${green("claudish keychain status")}          Backend state and how many keys are stored
+  ${green("claudish keychain list")}            Stored variables, with ${dim("••••1234")} identification tails
+  ${green("claudish keychain import")}          Copy keys from env vars / 1Password into the keychain
+                           ${dim("--from env|1password|all   --only VAR,VAR   --dry-run   --yes")}
+  ${green("claudish keychain set")} ${yellow("<ENV_VAR>")}    Store one key (prompted, or piped on stdin — never in argv)
+  ${green("claudish keychain rm")} ${yellow("<ENV_VAR>")}     Remove one key
+  ${green("claudish keychain enable")}${dim("|")}${green("disable")}  Turn the backend on/off (moves no secrets)
+  ${dim("Resolution order: env var -> alias -> config.json -> macOS Keychain -> 1Password")}
+  ${dim("The config TUI's Providers tab writes to the keychain by default on macOS.")}
+
 ${h("CLAUDE CODE FLAG PASSTHROUGH")}
   ${dim("Any unrecognized flag is forwarded to Claude Code. Claudish flags can appear in any order.")}
     ${green("claudish")} --model grok ${yellow("--agent test")} ${yellow('"task"')}        ${dim("# --agent passes through")}
@@ -2292,7 +2367,8 @@ ${h("ENVIRONMENT VARIABLES")}
   ${blue("SAKANA_API_KEY")}                  Sakana Fugu ${dim("(sakana@, fugu@)")}
   ${blue("SAKANA_SUBSCRIPTION_API_KEY")}     Sakana Fugu Subscription ${dim("(sc@; separate subscription key)")}
   ${blue("OLLAMA_API_KEY")}                  OllamaCloud ${dim("(oc@, llama@)")}
-  ${blue("OPENCODE_API_KEY")}                OpenCode Zen ${dim("(zen@; optional - free models work without it)")}
+  ${blue("OPENCODE_API_KEY")}                OpenCode Zen ${dim("(zen@)")}
+  ${blue("OPENCODE_GO_API_KEY")}             OpenCode Zen Go plan ${dim("(zgo@, zengo@; separate plan key)")}
   ${blue("POE_API_KEY")}                     Poe ${dim("(poe@)")}
   ${blue("LITELLM_API_KEY")}                 LiteLLM ${dim("(litellm@, ll@; needs LITELLM_BASE_URL)")}
   ${blue("VERTEX_API_KEY")}                  Vertex AI Express ${dim("(v@)")}

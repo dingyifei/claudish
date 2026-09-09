@@ -1,85 +1,59 @@
 /**
- * Unit tests for SessionManager.
+ * Unit and process-level regression tests for the bidirectional stream-json
+ * channel transport.
  *
- * SessionManager normally spawns `claudish`, but here we intercept by
- * prepending a temp directory to PATH that contains a `claudish` shim.
- * The shim (`fake-claudish.ts`) is a tiny Bun script whose behaviour is
- * controlled by extra flags we pass via SessionCreateOptions.claudishFlags.
- *
- * Flag conventions (understood by the fake, silently ignored by the real CLI):
- *   --sleep <s>    sleep for <s> seconds then exit 0
- *   --fail         exit immediately with code 1
- *   --lines <n>    write "line 1" … "line N" to stdout then exit 0
- *   --print-argv   write the received argv as JSON then exit 0
- *
- * The real claudish spawn args (--model, -y, --stdin, --quiet) come first;
- * the test-only flags are appended via claudishFlags so they land after all
- * the real flags. The fake script simply ignores unknown flags it doesn't
- * recognise.
+ * SessionManager spawns the stream-json-speaking fake through the CLAUDISH_BIN
+ * seam. Every manager gets an explicit temporary sessionsDir, so this file
+ * never resolves either the installed claudish binary or ~/.claudish/sessions.
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SessionManager } from "./session-manager.js";
-import type { ChannelEvent, SessionManagerOptions } from "./types.js";
-
-// ─── Setup: PATH shim ────────────────────────────────────────────────────────
+import { mapEventToTaskStatus } from "../mcp-server.js";
+import {
+  SessionManager,
+  assertNoReservedFlags,
+  buildChannelSpawnArgs,
+  userFrame,
+} from "./session-manager.js";
+import {
+  CAPTURED_ASSISTANT_PROSE,
+  CAPTURED_DELTA_LINE,
+  capturedAssistantFrame,
+} from "./test-helpers/captured-stream-json.js";
+import type { ChannelEvent, SessionManagerOptions, SessionStatus } from "./types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const FAKE_CLAUDISH_TS = join(__dirname, "test-helpers", "fake-channel-stream-json.ts");
+const SIGNAL_CHILD_TS = join(__dirname, "test-helpers", "stats-buffer-signal-child.ts");
+const TERMINAL_STATUSES: readonly SessionStatus[] = ["completed", "failed", "cancelled", "timeout"];
+// Must match KILL_GRACE_MS in session-manager.ts:210; post-SIGTERM waits must exceed it.
+const KILL_GRACE_MS = 5000;
+const POST_SIGTERM_WAIT_MS = KILL_GRACE_MS + 2000;
+const TIMEOUT_REGRESSION_TEST_MS = POST_SIGTERM_WAIT_MS * 2 + 1000;
 
-/** Absolute path to the fake-claudish TypeScript entry point. */
-const FAKE_CLAUDISH_TS = join(__dirname, "test-helpers", "fake-claudish.ts");
-
-/** Temp directory where we place a `claudish` wrapper script. */
-let shimDir: string;
-/** Temp artifact root so tests never write under the real ~/.claudish. */
-let sessionsDir: string;
-/** Original PATH value so we can restore it after tests. */
-const ORIGINAL_PATH = process.env.PATH ?? "";
-/** Original CLAUDISH_BIN value so we can restore it after tests. */
 const ORIGINAL_CLAUDISH_BIN = process.env.CLAUDISH_BIN;
+let sessionsDir: string;
+let managers: SessionManager[] = [];
 
 beforeAll(() => {
-  // Create a temp directory for the shim
-  shimDir = mkdtempSync(join(tmpdir(), "claudish-shim-"));
-  sessionsDir = mkdtempSync(join(tmpdir(), "claudish-sessions-"));
-
-  // Write a `claudish` wrapper that calls the fake via bun
-  const shimPath = join(shimDir, "claudish");
-  writeFileSync(shimPath, `#!/bin/sh\nexec bun run "${FAKE_CLAUDISH_TS}" "$@"\n`, { mode: 0o755 });
-
-  // Prepend shim directory to PATH so our fake is found first
-  // CLAUDISH_BIN outranks PATH in resolveClaudishSpawn, so leaving it set would defeat the fake shim.
-  delete process.env.CLAUDISH_BIN;
-  process.env.PATH = `${shimDir}:${ORIGINAL_PATH}`;
+  sessionsDir = mkdtempSync(join(tmpdir(), "claudish-channel-sessions-"));
+  process.env.CLAUDISH_BIN = FAKE_CLAUDISH_TS;
 });
 
 afterAll(() => {
-  // Restore original PATH
-  process.env.PATH = ORIGINAL_PATH;
-  if (ORIGINAL_CLAUDISH_BIN === undefined) {
-    delete process.env.CLAUDISH_BIN;
-  } else {
-    process.env.CLAUDISH_BIN = ORIGINAL_CLAUDISH_BIN;
-  }
-
-  // Clean up shim directory
-  try {
-    rmSync(shimDir, { recursive: true, force: true });
-    rmSync(sessionsDir, { recursive: true, force: true });
-  } catch {}
+  if (ORIGINAL_CLAUDISH_BIN === undefined) delete process.env.CLAUDISH_BIN;
+  else process.env.CLAUDISH_BIN = ORIGINAL_CLAUDISH_BIN;
+  rmSync(sessionsDir, { recursive: true, force: true });
 });
 
-// ─── Helper utilities ────────────────────────────────────────────────────────
-
-/** Wait until a predicate returns true, checking every `intervalMs` ms.
- *  Rejects if the predicate hasn't returned true within `timeoutMs`. */
-function waitUntil(predicate: () => boolean, timeoutMs = 5000, intervalMs = 50): Promise<void> {
+function waitUntil(predicate: () => boolean, timeoutMs = 5000, intervalMs = 25): Promise<void> {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     const check = () => {
@@ -91,16 +65,17 @@ function waitUntil(predicate: () => boolean, timeoutMs = 5000, intervalMs = 50):
   });
 }
 
-/** Create a SessionManager with sensible test defaults. */
 function makeManager(opts?: SessionManagerOptions): SessionManager {
-  return new SessionManager({ maxSessions: 20, sessionsDir, ...opts });
+  const manager = new SessionManager({
+    maxSessions: 20,
+    sessionsDir,
+    stallSeconds: 0,
+    ...opts,
+  });
+  managers.push(manager);
+  return manager;
 }
 
-/**
- * Create a session whose spawned process exits quickly.
- * By default the fake echoes an empty stdin and exits.
- * Extra fake flags can be passed via extraFlags.
- */
 function quickSession(
   manager: SessionManager,
   extraFlags: string[] = [],
@@ -113,7 +88,39 @@ function quickSession(
   });
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+async function waitForStatus(
+  manager: SessionManager,
+  sessionId: string,
+  statuses: readonly SessionStatus[],
+  timeoutMs = 5000
+): Promise<void> {
+  await waitUntil(() => statuses.includes(manager.getSession(sessionId).status), timeoutMs);
+}
+
+async function waitForCompleted(manager: SessionManager, sessionId: string): Promise<void> {
+  await waitForStatus(manager, sessionId, ["completed"]);
+}
+
+async function waitForMeta(sessionId: string, timeoutMs = 5000): Promise<string> {
+  const metaPath = join(sessionsDir, sessionId, "meta.json");
+  await waitUntil(() => existsSync(metaPath), timeoutMs);
+  return metaPath;
+}
+
+beforeEach(() => {
+  managers = [];
+});
+
+afterEach(async () => {
+  // Cancel only live sessions. Calling shutdownAll on a process that already
+  // exited waits for an exit event that has already happened.
+  for (const manager of managers) {
+    for (const session of manager.listSessions(false)) {
+      manager.cancelSession(session.sessionId);
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 75));
+});
 
 describe("SessionManager", () => {
   let manager: SessionManager;
@@ -122,35 +129,20 @@ describe("SessionManager", () => {
     manager = makeManager();
   });
 
-  afterEach(() => {
-    // Shut down all sessions. We don't await because the KILL_GRACE_MS (5s)
-    // wait could exceed the hook timeout. Each test uses a fresh manager
-    // instance so not awaiting here is safe — orphaned processes will exit
-    // via SIGTERM and the SIGKILL fallback will clean them up asynchronously.
-    manager.shutdownAll().catch(() => {});
-  });
-
-  // ── 1. createSession returns unique session IDs ──────────────────────────
-
   test("createSession returns unique session IDs", () => {
-    const id1 = quickSession(manager);
-    const id2 = quickSession(manager);
+    const id1 = manager.createSession({ model: "test-model", claudishFlags: ["--sleep", "3"] });
+    const id2 = manager.createSession({ model: "test-model", claudishFlags: ["--sleep", "3"] });
     expect(id1).not.toBe(id2);
-    expect(typeof id1).toBe("string");
     expect(id1.length).toBeGreaterThan(0);
-    expect(typeof id2).toBe("string");
     expect(id2.length).toBeGreaterThan(0);
   });
 
-  // ── 2. getSession returns correct info ───────────────────────────────────
-
   test("getSession returns correct model/status/sessionId fields", () => {
-    const id = quickSession(manager);
+    const id = manager.createSession({ model: "test-model", claudishFlags: ["--sleep", "3"] });
     const info = manager.getSession(id);
     expect(info.sessionId).toBe(id);
     expect(info.model).toBe("test-model");
-    // Status is "starting" immediately after spawn
-    expect(["starting", "running", "completed"]).toContain(info.status);
+    expect(["starting", "running"]).toContain(info.status);
     expect(info.pid).not.toBeNull();
     expect(typeof info.startedAt).toBe("string");
     expect(info.completedAt).toBeNull();
@@ -161,28 +153,32 @@ describe("SessionManager", () => {
     const id = manager.createSession({
       model: "glm-5",
       spawnModel: "gc@glm-5",
+      prompt: "report argv",
       claudishFlags: ["--print-argv"],
     });
 
-    await waitUntil(() => ["completed", "failed"].includes(manager.getSession(id).status));
+    await waitForCompleted(manager, id);
 
     const argv = JSON.parse(manager.getOutput(id).output.trim()) as string[];
     const modelFlag = argv.indexOf("--model");
     expect(argv[modelFlag + 1]).toBe("gc@glm-5");
+    expect(argv).not.toContain("--stdin");
     expect(manager.getSession(id).model).toBe("glm-5");
   });
 
   test("spawn argv falls back to the requested model when spawnModel is absent", async () => {
     const id = manager.createSession({
       model: "glm-5",
+      prompt: "report argv",
       claudishFlags: ["--print-argv"],
     });
 
-    await waitUntil(() => ["completed", "failed"].includes(manager.getSession(id).status));
+    await waitForCompleted(manager, id);
 
     const argv = JSON.parse(manager.getOutput(id).output.trim()) as string[];
     const modelFlag = argv.indexOf("--model");
     expect(argv[modelFlag + 1]).toBe("glm-5");
+    expect(argv).toContain("stream-json");
     expect(manager.getSession(id).model).toBe("glm-5");
   });
 
@@ -190,153 +186,86 @@ describe("SessionManager", () => {
     expect(() => manager.getSession("nonexistent")).toThrow("not found");
   });
 
-  // ── 3. listSessions filters completed sessions ───────────────────────────
-
   test("listSessions includes active session", () => {
-    const id = quickSession(manager, ["--sleep", "3"]);
-    const list = manager.listSessions(false);
-    expect(list.some((s) => s.sessionId === id)).toBe(true);
-    // Cancel immediately so afterEach shutdownAll is fast
-    manager.cancelSession(id);
+    const id = manager.createSession({ model: "test-model", claudishFlags: ["--sleep", "3"] });
+    expect(manager.listSessions(false).some((session) => session.sessionId === id)).toBe(true);
   });
 
   test("listSessions excludes completed sessions when includeCompleted=false", async () => {
     const id = quickSession(manager);
-    // Wait until the session completes
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-    const list = manager.listSessions(false);
-    expect(list.some((s) => s.sessionId === id)).toBe(false);
+    await waitForCompleted(manager, id);
+    expect(manager.listSessions(false).some((session) => session.sessionId === id)).toBe(false);
   });
 
   test("listSessions includes completed sessions when includeCompleted=true", async () => {
     const id = quickSession(manager);
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-    const list = manager.listSessions(true);
-    expect(list.some((s) => s.sessionId === id)).toBe(true);
+    await waitForCompleted(manager, id);
+    expect(manager.listSessions(true).some((session) => session.sessionId === id)).toBe(true);
   });
 
-  // ── 4. maxSessions limit ─────────────────────────────────────────────────
-
-  test("maxSessions limit: 3rd session throws when limit is 2", async () => {
+  test("maxSessions limit: 3rd session throws when limit is 2", () => {
     const limited = makeManager({ maxSessions: 2 });
-    const ids: string[] = [];
-    try {
-      ids.push(limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] }));
-      ids.push(limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] }));
-      expect(() => limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] })).toThrow(
-        /Max sessions/
-      );
-    } finally {
-      // Cancel all sessions before shutdown so SIGTERM resolves quickly
-      for (const id of ids) {
-        try {
-          limited.cancelSession(id);
-        } catch {}
-      }
-      await limited.shutdownAll();
-    }
+    limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] });
+    limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] });
+    expect(() => limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] })).toThrow(
+      /Max sessions/
+    );
   });
-
-  // ── 5. cancelSession sends SIGTERM ───────────────────────────────────────
 
   test("cancelSession: status becomes 'cancelled'", async () => {
     const id = manager.createSession({
       model: "test-model",
       claudishFlags: ["--sleep", "60"],
     });
+    await waitUntil(() => manager.getSession(id).pid !== null);
 
-    // Wait until the process is running (has a PID and is not instantly done)
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return info.pid !== null;
-    });
-
-    const result = manager.cancelSession(id);
-    expect(result).toBe(true);
+    expect(manager.cancelSession(id)).toBe(true);
     expect(manager.getSession(id).status).toBe("cancelled");
   });
 
-  // ── 6. cancelSession returns false for already-completed session ─────────
-
   test("cancelSession returns false for completed session", async () => {
     const id = quickSession(manager);
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-    const result = manager.cancelSession(id);
-    expect(result).toBe(false);
+    await waitForCompleted(manager, id);
+    expect(manager.cancelSession(id)).toBe(false);
   });
-
-  // ── 7. sendInput returns false for non-existent session ─────────────────
 
   test("sendInput returns false for non-existent session", () => {
     expect(manager.sendInput("does-not-exist", "hello")).toBe(false);
   });
 
-  // ── 8. sendInput returns false for completed session ────────────────────
-
   test("sendInput returns false for completed session", async () => {
     const id = quickSession(manager);
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
+    await waitForCompleted(manager, id);
     expect(manager.sendInput(id, "some input")).toBe(false);
   });
 
-  // ── 9. getOutput returns scrollback content ──────────────────────────────
-
   test("getOutput returns output from process stdout", async () => {
-    const id = manager.createSession({
-      model: "test-model",
-      prompt: "hello world",
-      // echo stdin to stdout (default fake behaviour)
-    });
+    const id = quickSession(manager, [], "hello world");
+    await waitForCompleted(manager, id);
 
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-
-    const out = manager.getOutput(id);
-    expect(out.sessionId).toBe(id);
-    expect(out.output).toContain("hello world");
+    const output = manager.getOutput(id);
+    expect(output.sessionId).toBe(id);
+    expect(output.status).toBe("completed");
+    expect(output.output).toContain(CAPTURED_ASSISTANT_PROSE);
+    expect(output.output).not.toContain('"type":"assistant"');
   });
 
-  // ── 10. getOutput with tail_lines ────────────────────────────────────────
-
   test("getOutput with tail_lines returns only the last N lines", async () => {
-    const id = manager.createSession({
-      model: "test-model",
-      claudishFlags: ["--lines", "10"],
-    });
+    const id = quickSession(manager, ["--messages", "5"]);
+    await waitForCompleted(manager, id);
 
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-
-    const out = manager.getOutput(id, 2);
-    const lines = out.output.split("\n").filter((l) => l.trim() !== "");
-    expect(lines.length).toBeLessThanOrEqual(2);
-    // Last two of 10 numbered lines should be "line 9" and "line 10"
-    expect(out.output).toContain("line 9");
-    expect(out.output).toContain("line 10");
-    expect(out.output).not.toContain("line 1\n");
+    const full = manager.getOutput(id);
+    const tail = manager.getOutput(id, 2);
+    const fullLines = full.output.split("\n");
+    expect(tail.output).toBe(fullLines.slice(-2).join("\n"));
+    expect(tail.output.split("\n")).toHaveLength(2);
+    expect(tail.totalLines).toBe(full.totalLines);
+    expect(tail.output).not.toBe(full.output);
   });
 
   test("getOutput throws for non-existent session", () => {
     expect(() => manager.getOutput("bad-id")).toThrow("not found");
   });
-
-  // ── 11. timeout kills process ─────────────────────────────────────────────
 
   test("timeout kills long-running process and terminates it", async () => {
     const id = manager.createSession({
@@ -345,101 +274,53 @@ describe("SessionManager", () => {
       claudishFlags: ["--sleep", "60"],
     });
 
-    // After the timeout fires (1s), the watcher forces "failed" state and
-    // completedAt is set. The internal status ends up as "failed" because
-    // watcher.forceState("failed") overwrites the transient "timeout" value.
-    // We verify the session was killed by confirming completedAt is set within
-    // a short window.
-    await waitUntil(
-      () => {
-        const info = manager.getSession(id);
-        // completedAt is set in the timeout handler (line 208 of session-manager.ts)
-        // before forceState is called, so it's a reliable signal that timeout fired.
-        return info.completedAt !== null;
-      },
-      4000,
-      100
-    );
-
+    const metaPath = await waitForMeta(id, 4000);
     const info = manager.getSession(id);
-    // completedAt was set by the timeout handler
+    const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as { status: string };
     expect(info.completedAt).not.toBeNull();
-    // Process was killed: status is "failed" (watcher overrides the transient "timeout")
-    expect(["failed", "timeout"]).toContain(info.status);
-  }, 10000);
-
-  // ── 12. onStateChange callback fires ─────────────────────────────────────
+    expect(info.status).toBe("timeout");
+    expect(meta.status).toBe("timeout");
+  }, 10_000);
 
   test("onStateChange callback fires with session_id and event", async () => {
     const events: Array<{ sessionId: string; event: ChannelEvent }> = [];
-
-    const mgr = makeManager({
-      onStateChange: (sessionId, event) => {
-        events.push({ sessionId, event });
-      },
+    const callbackManager = makeManager({
+      onStateChange: (sessionId, event) => events.push({ sessionId, event }),
     });
+    const id = quickSession(callbackManager, [], "trigger events");
 
-    try {
-      const id = mgr.createSession({
-        model: "test-model",
-        prompt: "trigger events",
-      });
+    await waitForCompleted(callbackManager, id);
 
-      // Wait for the process to reach a terminal state
-      await waitUntil(() => {
-        const info = mgr.getSession(id);
-        return ["completed", "failed"].includes(info.status);
-      }, 8000);
-
-      // Give the SignalWatcher a moment to flush any pending callbacks
-      await new Promise((r) => setTimeout(r, 200));
-
-      expect(events.length).toBeGreaterThan(0);
-      // All events should reference the correct session
-      for (const e of events) {
-        expect(e.sessionId).toBe(id);
-        expect(typeof e.event.type).toBe("string");
-        expect(typeof e.event.model).toBe("string");
-      }
-    } finally {
-      await mgr.shutdownAll();
+    expect(events.map(({ event }) => event.type)).toEqual([
+      "running",
+      "waiting_for_input",
+      "completed",
+    ]);
+    for (const observed of events) {
+      expect(observed.sessionId).toBe(id);
+      expect(observed.event.model).toBe("test-model");
     }
-  }, 15000);
-
-  // ── 13. session artifacts on disk ─────────────────────────────────────────
+  });
 
   test("meta.json is written to the configured sessions directory after completion", async () => {
     const id = quickSession(manager);
+    const metaPath = await waitForMeta(id);
+    const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as Record<string, unknown>;
 
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-
-    // Give the exit handler a moment to finish writing files
-    await new Promise((r) => setTimeout(r, 300));
-
-    const metaPath = join(sessionsDir, id, "meta.json");
-    expect(existsSync(metaPath)).toBe(true);
-
-    const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
     expect(meta.sessionId).toBe(id);
     expect(meta.model).toBe("test-model");
+    expect(meta.status).toBe("completed");
+    expect(meta.turnsCompleted).toBe(1);
     expect(typeof meta.startedAt).toBe("string");
     expect(typeof meta.completedAt).toBe("string");
   });
-
-  // ── Additional edge cases ─────────────────────────────────────────────────
 
   test("createSession stores session in listSessions immediately", () => {
     const id = manager.createSession({
       model: "test-model",
       claudishFlags: ["--sleep", "3"],
     });
-    const all = manager.listSessions(true);
-    expect(all.some((s) => s.sessionId === id)).toBe(true);
-    // Cancel so afterEach is fast
-    manager.cancelSession(id);
+    expect(manager.listSessions(true).some((session) => session.sessionId === id)).toBe(true);
   });
 
   test("cancelled session appears in listSessions with includeCompleted=true", async () => {
@@ -450,28 +331,378 @@ describe("SessionManager", () => {
     await waitUntil(() => manager.getSession(id).pid !== null);
     manager.cancelSession(id);
 
-    const all = manager.listSessions(true);
-    const found = all.find((s) => s.sessionId === id);
-    expect(found).toBeDefined();
+    const found = manager.listSessions(true).find((session) => session.sessionId === id);
     expect(found?.status).toBe("cancelled");
   });
 
   test("getOutput totalLines reflects number of lines produced", async () => {
-    const id = manager.createSession({
-      model: "test-model",
-      claudishFlags: ["--lines", "5"],
-    });
-
-    await waitUntil(() => {
-      const info = manager.getSession(id);
-      return ["completed", "failed"].includes(info.status);
-    });
-
-    const out = manager.getOutput(id);
-    expect(out.totalLines).toBeGreaterThanOrEqual(5);
+    const id = quickSession(manager, ["--messages", "5"]);
+    await waitForCompleted(manager, id);
+    expect(manager.getOutput(id).totalLines).toBeGreaterThanOrEqual(5);
   });
 
   test("cancelSession returns false for non-existent session", () => {
     expect(manager.cancelSession("ghost-session")).toBe(false);
   });
+
+  test(
+    "G1/G2: timeout stays timeout in memory, meta, and on the wire",
+    async () => {
+      const events: ChannelEvent[] = [];
+      const timeoutManager = makeManager({
+        onStateChange: (_sessionId, event) => events.push(event),
+      });
+      const id = timeoutManager.createSession({
+        model: "test-model",
+        timeoutSeconds: 1,
+        claudishFlags: ["--result-then-hang", "--trap-term-exit-zero"],
+      });
+
+      await waitForStatus(timeoutManager, id, ["running"]);
+      expect(timeoutManager.sendInput(id, "interactive turn")).toBe(true);
+      await waitForStatus(timeoutManager, id, ["waiting_for_input"]);
+
+      // If the SIGTERM trap loses its race, SIGKILL follows only after the full
+      // grace, then exit, pipe drain, and writeArtifacts must finish. Keep these
+      // polling budgets above KILL_GRACE_MS or load makes this a fast-path-only test.
+      await waitForStatus(timeoutManager, id, ["timeout"], POST_SIGTERM_WAIT_MS);
+      const metaPath = await waitForMeta(id, POST_SIGTERM_WAIT_MS);
+      const info = timeoutManager.getSession(id);
+      const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as {
+        status: string;
+        exitCode: number | null;
+      };
+      const terminalWireEvents = events
+        .map((event) => event.type)
+        .filter((type) => TERMINAL_STATUSES.includes(type as SessionStatus));
+
+      // Same test, deliberately: memory, persistent data, and the wire must all
+      // report the honest terminal reason. SEP-1686 projects timeout to failed.
+      expect(info.status).toBe("timeout");
+      expect(meta.status).toBe("timeout");
+      expect(info.exitCode).toBe(0);
+      expect(meta.exitCode).toBe(0);
+      expect(terminalWireEvents).toEqual(["timeout"]);
+      expect(events.some((event) => event.type === "timeout")).toBe(true);
+    },
+    TIMEOUT_REGRESSION_TEST_MS
+  );
+
+  test("G7: a promptless session reaches a usable state and accepts later input", async () => {
+    const id = manager.createSession({ model: "test-model", timeoutSeconds: 5 });
+
+    await waitForStatus(manager, id, ["running"], 2000);
+    expect(manager.sendInput(id, "first interactive turn")).toBe(true);
+    await waitUntil(
+      () =>
+        manager.getSession(id).status === "waiting_for_input" &&
+        manager.getOutput(id).output.includes(CAPTURED_ASSISTANT_PROSE),
+      2000
+    );
+
+    expect(existsSync(join(sessionsDir, id, "prompt.md"))).toBe(false);
+    expect(manager.getSession(id).status).toBe("waiting_for_input");
+    expect(manager.cancelSession(id)).toBe(true);
+  });
+
+  test("G6: delta firehose is not stored and cannot evict assistant prose", () => {
+    const boundedManager = makeManager({ scrollbackCapacity: 2000 });
+    const id = boundedManager.createSession({
+      model: "test-model",
+      claudishFlags: ["--sleep", "60"],
+    });
+    const internal = boundedManager as unknown as {
+      sessions: Map<string, { process: ChildProcess }>;
+    };
+    const stdout = internal.sessions.get(id)?.process.stdout;
+    if (!stdout) throw new Error("spawned test child has no stdout pipe");
+
+    for (let i = 0; i < 3; i++) {
+      stdout.emit("data", Buffer.from(`${JSON.stringify(capturedAssistantFrame())}\n`));
+    }
+    stdout.emit("data", Buffer.from(`${CAPTURED_DELTA_LINE}\n`.repeat(3000)));
+
+    const output = boundedManager.getOutput(id);
+    expect(output.output).toContain(CAPTURED_ASSISTANT_PROSE);
+    expect(output.output).not.toContain('"type":"stream_event"');
+    expect(output.totalLines).toBeLessThan(20);
+  });
+
+  test("D1: a new manager recovers a finished session from disk", async () => {
+    const id = quickSession(manager, [], "DELTA");
+    await waitForCompleted(manager, id);
+    await waitForMeta(id);
+
+    const liveInfo = manager.getSession(id);
+    const liveOutput = manager.getOutput(id);
+    const recovered = makeManager();
+
+    const info = recovered.getSession(id);
+    const output = recovered.getOutput(id);
+    const diagnostics = recovered.getDiagnostics(id);
+
+    expect(info).toMatchObject({
+      sessionId: id,
+      model: liveInfo.model,
+      status: "completed",
+      turnsCompleted: liveInfo.turnsCompleted,
+      exitCode: liveInfo.exitCode,
+    });
+    expect(output).toMatchObject({
+      sessionId: id,
+      status: "completed",
+      turnsCompleted: liveOutput.turnsCompleted,
+      tokensUsed: liveOutput.tokensUsed,
+    });
+    // ScrollbackBuffer is chunk-boundary sensitive: live can retain a phantom
+    // trailing line that a one-append disk replay correctly cannot reproduce.
+    expect(output.output.trimEnd()).toBe(liveOutput.output.trimEnd());
+    expect(diagnostics).toMatchObject({
+      sessionId: id,
+      status: "completed",
+      model: liveInfo.model,
+      turnsCompleted: liveInfo.turnsCompleted,
+    });
+    expect(diagnostics.outputBytes).toBeGreaterThan(0);
+    expect(diagnostics.eventsTotal).toBeGreaterThan(0);
+    expect(diagnostics.recentEvents.every((event) => event.at === "")).toBe(true);
+  });
+
+  test("D2: a disk-recovered session is structurally read-only", async () => {
+    const id = quickSession(manager);
+    await waitForCompleted(manager, id);
+    await waitForMeta(id);
+
+    const recovered = makeManager();
+    expect(recovered.getSession(id).pid).toBeNull();
+    expect(recovered.sendInput(id, "hello")).toBe(false);
+    expect(recovered.cancelSession(id)).toBe(false);
+  });
+
+  test("D3: hostile session ids are rejected before disk lookup", () => {
+    const root = join(sessionsDir, "hostile-root");
+    const outside = join(root, "outside");
+    mkdirSync(join(outside, "victim"), { recursive: true });
+    writeFileSync(join(outside, "victim", "meta.json"), JSON.stringify({ model: "LEAKED" }));
+    const hostileManager = makeManager({ sessionsDir: join(root, "sessions") });
+
+    for (const id of [
+      "../outside/victim",
+      "..%2Foutside",
+      "../../etc",
+      "..",
+      ".",
+      "/etc/passwd",
+      "a/b",
+      "a\\b",
+      "with\0null",
+      "",
+      ".hidden",
+      "x".repeat(200),
+    ]) {
+      expect(() => hostileManager.getSession(id), JSON.stringify(id)).toThrow("not found");
+    }
+  });
+
+  test("D4: malformed disk records degrade to diagnostics instead of throwing", () => {
+    const cases: Array<[string, string | null]> = [
+      ["nometa", null],
+      ["halfwritten", '{"sessionId":"halfwr'],
+      ["emptymeta", ""],
+      [
+        "wrongtypes",
+        JSON.stringify({
+          sessionId: 42,
+          model: null,
+          status: "banana",
+          tokensUsed: "lots",
+          pid: 1,
+          startedAt: [],
+          elapsedSeconds: Number.NaN,
+        }),
+      ],
+      ["notjson", "[1,2,3]"],
+    ];
+
+    for (const [id, meta] of cases) {
+      const dir = join(sessionsDir, id);
+      mkdirSync(dir, { recursive: true });
+      if (meta !== null) writeFileSync(join(dir, "meta.json"), meta);
+      if (id === "halfwritten") writeFileSync(join(dir, "output.log"), "partial answer\n");
+
+      const info = manager.getSession(id);
+      const output = manager.getOutput(id);
+      const diagnostics = manager.getDiagnostics(id);
+      expect(info.sessionId).toBe(id);
+      expect(info.pid).toBeNull();
+      expect(typeof info.tokensUsed).toBe("number");
+      expect(Number.isFinite(info.elapsedSeconds)).toBe(true);
+      expect(typeof output.output).toBe("string");
+      expect(typeof diagnostics.stderrTail).toBe("string");
+      if (id !== "wrongtypes") {
+        expect(diagnostics.anomalies.length, id).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("D5: disk diagnostics stay bounded for a 4 MB event log", () => {
+    const id = "bigsession";
+    const dir = join(sessionsDir, id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "meta.json"),
+      JSON.stringify({
+        sessionId: id,
+        model: "m",
+        status: "failed",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    const frames: string[] = [];
+    let eventBytes = 0;
+    for (let i = 0; eventBytes < 4 * 1024 * 1024; i++) {
+      const frame = `${JSON.stringify({
+        type: "assistant",
+        subtype: null,
+        i,
+        pad: "x".repeat(2000),
+      })}\n`;
+      frames.push(frame);
+      eventBytes += Buffer.byteLength(frame);
+    }
+    writeFileSync(join(dir, "events.jsonl"), frames.join(""));
+
+    const diagnostics = manager.getDiagnostics(id, 200);
+    expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThan(512 * 1024);
+    expect(diagnostics.eventsTotal).toBeLessThan(512);
+    expect(diagnostics.recentEvents).toHaveLength(200);
+    expect(diagnostics.recentEvents.every((event) => event.preview.length <= 800)).toBe(true);
+  });
+});
+
+describe("exported channel transport seams", () => {
+  test("timeout projects to SEP-1686 failed instead of falling through to working", () => {
+    expect(mapEventToTaskStatus("timeout")).toBe("failed");
+    expect(mapEventToTaskStatus("timeout")).not.toBe("working");
+    expect(mapEventToTaskStatus("genuinely_unknown_event")).toBe("working");
+
+    for (const [event, status] of [
+      ["completed", "completed"],
+      ["failed", "failed"],
+      ["cancelled", "cancelled"],
+    ] as const) {
+      expect(mapEventToTaskStatus(event)).toBe(status);
+    }
+  });
+
+  test("G4: every transport-owned flag is rejected loudly", () => {
+    for (const flag of [
+      "-p",
+      "--print",
+      "--output-format",
+      "--input-format",
+      "--session-id",
+      "--verbose",
+      "--output-format=json",
+    ]) {
+      expect(() => assertNoReservedFlags([flag])).toThrow(/channel transport/);
+    }
+
+    expect(() =>
+      assertNoReservedFlags(["--effort", "high", "--agent", "dev:reviewer"])
+    ).not.toThrow();
+  });
+
+  test("G5: spawn argv keeps verbose before quiet and leaves -p valueless", () => {
+    const args = buildChannelSpawnArgs({
+      model: "provider@model",
+      claudeSessionId: "captured-session-id",
+      claudishFlags: ["--effort", "high"],
+    });
+    const verboseAt = args.indexOf("--verbose");
+    const quietAt = args.indexOf("--quiet");
+    const printAt = args.indexOf("-p");
+
+    expect(verboseAt).toBeGreaterThan(-1);
+    expect(quietAt).toBeGreaterThan(verboseAt);
+    expect(printAt).toBeGreaterThan(-1);
+    expect(args[printAt + 1]?.startsWith("-")).toBe(true);
+    expect(args).not.toContain("--stdin");
+  });
+
+  test("userFrame encodes one newline-delimited user turn", () => {
+    const encoded = userFrame("hello\nworld");
+    expect(encoded.endsWith("\n")).toBe(true);
+    expect(encoded.split("\n")).toHaveLength(2);
+    expect(JSON.parse(encoded)).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "hello\nworld" }],
+      },
+    });
+  });
+});
+
+interface ExitObservation {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+}
+
+async function runSignalChild(signal: "SIGTERM" | "SIGINT"): Promise<ExitObservation> {
+  const child = spawn(process.execPath, ["run", SIGNAL_CHILD_TS], {
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString("utf-8");
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf-8");
+  });
+
+  try {
+    await waitUntil(() => stdout.includes("ready"), 3000);
+    const exit = new Promise<ExitObservation>((resolve) => {
+      child.once("exit", (code, observedSignal) => {
+        resolve({ code, signal: observedSignal as NodeJS.Signals | null, stderr });
+      });
+    });
+    child.kill(signal);
+    return await Promise.race([
+      exit,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`signal child did not exit after ${signal}`)), 3000)
+      ),
+    ]);
+  } finally {
+    stopChild(child);
+  }
+}
+
+function stopChild(child: ChildProcess): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGKILL");
+}
+
+describe("claudish signal exit codes", () => {
+  test("G3: module-load signal handlers preserve SIGTERM=143 and SIGINT=130", async () => {
+    const term = await runSignalChild("SIGTERM");
+    const interrupt = await runSignalChild("SIGINT");
+
+    expect({ code: term.code, signal: term.signal, stderr: term.stderr }).toEqual({
+      code: 143,
+      signal: null,
+      stderr: "",
+    });
+    expect({ code: interrupt.code, signal: interrupt.signal, stderr: interrupt.stderr }).toEqual({
+      code: 130,
+      signal: null,
+      stderr: "",
+    });
+  }, 10_000);
 });

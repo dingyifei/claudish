@@ -1,19 +1,52 @@
 import { DETAIL_H } from "../constants.js";
-import type { ProviderDef } from "../providers.js";
+import type { AuthSource, ProviderDef } from "../providers.js";
 /** @jsxImportSource @opentui/react */
 import { A, C } from "../theme.js";
 import type { Mode, TestResultsMap } from "../types.js";
 
 /**
- * Collapse newlines and clip an error string to a single line that fits
- * inside the detail box without wrapping. Used for `tr.error` which can
- * come back from describeProbeState as a multi-line, 200-char message.
+ * Break an error into at most `maxLines` lines that fit `maxWidth`, on word
+ * boundaries, with an ellipsis if it still does not fit.
+ *
+ * One line was not enough for the thing the user actually needs. A surfaced
+ * error is `"<Provider> error (HTTP <status>): <claudish hint> — <the
+ * provider's own sentence>"` (see `buildSurfacedErrorMessage`), so claudish's
+ * attribution and advice eat the first ~120 characters and the provider's
+ * sentence — the only part naming the plan and the way out — fell off the end.
+ * MiniMax Coding rendered as "… Out of quota - check your plan & bil…" with
+ * "Token Plan usage limit reached: Upgrade your Token Plan…" never shown.
+ *
+ * Bounded on purpose rather than free-wrapping: the detail box is a fixed
+ * DETAIL_H, and a wrap that overflows bleeds into the provider rows above,
+ * which the renderer cannot invalidate.
  */
-function truncateOneLine(text: string, maxWidth: number): string {
+function wrapToLines(text: string, maxWidth: number, maxLines: number): string[] {
   const collapsed = text.replace(/\s+/g, " ").trim();
   const limit = Math.max(20, maxWidth);
-  if (collapsed.length <= limit) return collapsed;
-  return `${collapsed.slice(0, limit - 1)}…`;
+  if (collapsed.length <= limit) return [collapsed];
+
+  const lines: string[] = [];
+  let rest = collapsed;
+  while (rest.length > 0 && lines.length < maxLines) {
+    if (rest.length <= limit) {
+      lines.push(rest);
+      break;
+    }
+    // Break at the last space inside the budget; fall back to a hard cut for a
+    // single token longer than the line (a URL, a base64 blob).
+    const slice = rest.slice(0, limit);
+    const cut = slice.lastIndexOf(" ");
+    const at = cut > limit * 0.5 ? cut : limit;
+    lines.push(rest.slice(0, at));
+    rest = rest.slice(at).trimStart();
+  }
+  // Anything still left is dropped, so say so on the last line rather than
+  // ending mid-sentence as if that were the whole message.
+  if (rest.length > 0 && lines.length === maxLines) {
+    const last = lines[maxLines - 1] ?? "";
+    lines[maxLines - 1] = `${last.slice(0, Math.max(1, limit - 1))}…`;
+  }
+  return lines;
 }
 
 interface ProviderDetailProps {
@@ -25,15 +58,42 @@ interface ProviderDetailProps {
   hasCfgKey: boolean;
   hasEnvKey: boolean;
   hasKey: boolean;
+  /** Unified source used by the provider list and readiness classifier. */
+  authSource: AuthSource;
   /** True when the env-var key was hydrated from 1Password (not a shell env var). */
   isOpKey: boolean;
-  /** True for a keyless/free provider usable via its built-in public key. */
-  isPublicKey: boolean;
+  /** True when the env-var key was hydrated from the macOS Keychain. */
+  isKcKey: boolean;
+  /** True when a keychain item exists for this variable, whether or not it is the value in use. */
+  hasKcKey: boolean;
+  /**
+   * Where a key typed here will be written. Named in the input box title so the
+   * store is never a surprise — this used to be plaintext config.json
+   * unconditionally, and a silent change of destination for secrets is exactly
+   * the kind of thing a user is entitled to see before pressing Enter.
+   */
+  keySaveTarget: string;
   cfgKeyMask: string;
   envKeyMask: string;
   activeEndpoint: string;
   testResults: TestResultsMap;
   isInputMode: boolean;
+}
+
+export function resolveProviderDetailKeyDisplay(input: {
+  isLocal: boolean;
+  isReady: boolean;
+  authSource: AuthSource;
+  hasEnvKey: boolean;
+  hasCfgKey: boolean;
+  envKeyMask: string;
+  cfgKeyMask: string;
+}): string {
+  if (input.isLocal) return input.isReady ? "enabled" : "disabled";
+  if (input.authSource === "oauth") return "oauth";
+  if (input.hasEnvKey) return input.envKeyMask;
+  if (input.hasCfgKey) return input.cfgKeyMask;
+  return "────────";
 }
 
 export function ProviderDetail({
@@ -45,8 +105,11 @@ export function ProviderDetail({
   hasCfgKey,
   hasEnvKey,
   hasKey,
+  authSource,
   isOpKey,
-  isPublicKey,
+  isKcKey,
+  hasKcKey,
+  keySaveTarget,
   cfgKeyMask,
   envKeyMask,
   activeEndpoint,
@@ -55,17 +118,16 @@ export function ProviderDetail({
 }: ProviderDetailProps) {
   // Show the mask of the key that's ACTUALLY being used at runtime.
   // process.env wins over config in the resolver, so env is shown first when both exist.
-  const displayKey = selectedProvider.isLocal
-    ? hasKey
-      ? "enabled"
-      : "disabled"
-    : hasEnvKey
-      ? envKeyMask
-      : hasCfgKey
-        ? cfgKeyMask
-        : isPublicKey
-          ? "free"
-          : "────────";
+  const isOAuth = authSource === "oauth";
+  const displayKey = resolveProviderDetailKeyDisplay({
+    isLocal: !!selectedProvider.isLocal,
+    isReady: hasKey,
+    authSource,
+    hasEnvKey,
+    hasCfgKey,
+    envKeyMask,
+    cfgKeyMask,
+  });
 
   if (isInputMode) {
     return (
@@ -74,7 +136,11 @@ export function ProviderDetail({
         border
         borderStyle="single"
         borderColor={C.focusBorder}
-        title={` Set ${mode === "input_key" ? "API Key" : "Endpoint"} — ${selectedProvider.displayName} `}
+        title={
+          mode === "input_key"
+            ? ` Set API Key — ${selectedProvider.displayName} → ${keySaveTarget} `
+            : ` Set Endpoint — ${selectedProvider.displayName} `
+        }
         backgroundColor={C.bg}
         flexDirection="column"
         paddingX={1}
@@ -115,6 +181,28 @@ export function ProviderDetail({
   }
 
   const tr = testResults[selectedProvider.name];
+
+  // The provider's OWN sentence, given lines of its own below.
+  //
+  // It used to share the "Test:" line, clipped to `width - 16`, which is where
+  // the part that names the cause went missing: MiniMax Coding's `429 "Token
+  // Plan usage limit reached: Upgrade your Token Plan or purchase Credits for
+  // more usage. (2056)"` reached the user as "out of credit · 429 · 2371ms —
+  // MiniMax". The status is a bucket; this sentence is the diagnosis, and it is
+  // the only place the plan and the way out are named.
+  //
+  // `providerMessage` rather than `error` because the row directly above
+  // already prints the `<state> · <status> · <ms>` prefix that `error` repeats.
+  // `error` remains the fallback for states with no upstream message to quote
+  // (a local server that is not running, a proxy that never answered), where
+  // the rendered line IS the explanation.
+  //
+  // `Desc:` and `Get Key:` yield their lines to make room (see below). Nothing
+  // is lost: both appear elsewhere, and this text appears nowhere else.
+  const failureText =
+    tr && (tr.status === "failed" || tr.status === "unavailable")
+      ? (tr.providerMessage ?? tr.error)
+      : undefined;
 
   return (
     <box
@@ -180,26 +268,44 @@ export function ProviderDetail({
             </span>
           </>
         )}
-        {hasKey && !selectedProvider.isLocal && isPublicKey && (
+        {/* OAuth branch FIRST among the non-local sources. Without it an
+            OAuth-only provider reaches the env/cfg block below, where both
+            flags are false and "From: " renders with nothing after it. */}
+        {hasKey && !selectedProvider.isLocal && isOAuth && (
+          <>
+            <span fg={C.dim}>{"   "}</span>
+            <span fg={C.blue} attributes={A.bold}>
+              {"From: "}
+            </span>
+            <span fg={C.cyan} attributes={A.bold}>
+              {"oauth"}
+            </span>
+            <span fg={C.fgMuted}>{" (used)"}</span>
+          </>
+        )}
+        {hasKey && !selectedProvider.isLocal && isOAuth && (
           <>
             <span fg={C.dim}>{"   "}</span>
             <span fg={C.blue} attributes={A.bold}>
               {"From: "}
             </span>
             <span fg={C.green} attributes={A.bold}>
-              {"public key (free)"}
+              {"OAuth"}
             </span>
           </>
         )}
-        {hasKey && !selectedProvider.isLocal && !isPublicKey && (
+        {hasKey && !selectedProvider.isLocal && !isOAuth && (
           <>
             <span fg={C.dim}>{"   "}</span>
             <span fg={C.blue} attributes={A.bold}>
               {"From: "}
             </span>
+            {/* Origin of the runtime value. `isKcKey` is tested BEFORE `isOpKey`
+                because the keychain is resolved first, so when both vaults could
+                supply this variable the keychain is the one that did. */}
             {hasEnvKey && (
               <span fg={C.green} attributes={A.bold}>
-                {isOpKey ? "1Password" : "env"}
+                {isKcKey ? "keychain" : isOpKey ? "1Password" : "env"}
               </span>
             )}
             {hasEnvKey && hasCfgKey && <span fg={C.fgMuted}>{" (used) + "}</span>}
@@ -210,6 +316,17 @@ export function ProviderDetail({
               </span>
             )}
             {hasCfgKey && <span fg={C.fgMuted}>{hasEnvKey ? " (shadowed)" : " (used)"}</span>}
+            {/* A keychain item that exists but is NOT the runtime value — the
+                backend is off, or a higher-priority source shadows it. Worth
+                naming explicitly: otherwise `x` reporting "removed from macOS
+                Keychain" would come as a surprise on a row that never mentioned
+                one. */}
+            {hasKcKey && !isKcKey && (
+              <>
+                <span fg={C.fgMuted}>{" + "}</span>
+                <span fg={C.fgMuted}>{"keychain (shadowed)"}</span>
+              </>
+            )}
           </>
         )}
       </text>
@@ -221,13 +338,20 @@ export function ProviderDetail({
           <span fg={C.cyan}>{activeEndpoint || selectedProvider.defaultEndpoint || "default"}</span>
         </text>
       )}
-      <text>
-        <span fg={C.blue} attributes={A.bold}>
-          Desc:{" "}
-        </span>
-        <span fg={C.strong}>{selectedProvider.description}</span>
-      </text>
-      {selectedProvider.keyUrl && (
+      {!failureText && (
+        <text>
+          <span fg={C.blue} attributes={A.bold}>
+            Desc:{" "}
+          </span>
+          <span fg={C.strong}>{selectedProvider.description}</span>
+        </text>
+      )}
+      {/* `Desc:` and `Get Key:` both yield their line while a failure is on
+          screen, which is what buys the message two lines inside a fixed
+          DETAIL_H. Neither is lost: the description is in the row's
+          DESCRIPTION column, and the key URL is one keypress away once the
+          error has been read. The provider's sentence has nowhere else to go. */}
+      {selectedProvider.keyUrl && !failureText && (
         <text>
           <span fg={C.blue} attributes={A.bold}>
             Get Key:{" "}
@@ -258,37 +382,32 @@ export function ProviderDetail({
               </span>
             </>
           )}
+          {/* The message itself is NOT here any more — it gets its own
+              full-width line below, where the provider's sentence survives
+              instead of being clipped to `width - 16`. */}
           {tr.status === "failed" && (
-            <>
-              <span fg={C.red} attributes={A.bold}>
-                {"✗ failed"}
-              </span>
-              {tr.error && (
-                <span fg={C.red}>
-                  {/* Clip the error to a single line. describeProbeState can
-                      produce 200+ char strings ("HTTP 400. Request format
-                      may be incompatible…") that wrap and overflow the
-                      fixed-height detail box, bleeding into the provider
-                      rows above. */}
-                  {`  ${truncateOneLine(tr.error, width - 16)}`}
-                </span>
-              )}
-            </>
+            <span fg={C.red} attributes={A.bold}>
+              {"✗ failed"}
+            </span>
           )}
           {tr.status === "unavailable" && (
-            <>
-              {/* Not a failure — the server is off or has no chat model to probe.
-                  Neutral yellow, not red. */}
-              <span fg={C.yellow} attributes={A.bold}>
-                {"○ unavailable"}
-              </span>
-              {tr.error && (
-                <span fg={C.yellow}>{`  ${truncateOneLine(tr.error, width - 16)}`}</span>
-              )}
-            </>
+            /* Not a failure — the server is off or has no chat model to probe.
+               Neutral yellow, not red. */
+            <span fg={C.yellow} attributes={A.bold}>
+              {"○ unavailable"}
+            </span>
           )}
         </text>
       )}
+      {failureText &&
+        wrapToLines(failureText, width - 4, 2).map((line, i) => (
+          // Index key: these are positional slices of one string, not a
+          // reorderable list, so the index IS the stable identity.
+          // biome-ignore lint/suspicious/noArrayIndexKey: positional slices of one string
+          <text key={i}>
+            <span fg={tr?.status === "unavailable" ? C.yellow : C.red}>{line}</span>
+          </text>
+        ))}
     </box>
   );
 }

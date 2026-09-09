@@ -124,9 +124,6 @@ export function ProvidersContent({
       keyDisplay = "local";
     } else if (isOauthOnly) {
       keyDisplay = "oauth···";
-    } else if (auth === "public") {
-      // Keyless/free provider (publicKeyFallback) — no user key, but usable.
-      keyDisplay = "free";
     } else if (auth === "cfg") {
       keyDisplay = maskKey(config.apiKeys?.[p.apiKeyEnvVar]);
     } else if (auth === "env" || auth === "e+c") {

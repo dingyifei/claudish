@@ -10,7 +10,10 @@ harness_config:
   args: ["--permission-mode", "bypassPermissions"]
 
 defaults:
-  sandbox: process
+  # `process` was RENAMED to `home` and is now REFUSED, not aliased — this bench
+  # could not start at all until 2026-08-22. `madbench list` still exits 0 on it,
+  # which is why list is not a gate; `preflight` is.
+  sandbox: home
   timeout: 300s
   capture: log
 

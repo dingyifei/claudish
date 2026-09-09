@@ -62,7 +62,37 @@ const DEDUPE_TAIL_LIMIT = 4096;
  * absent or outside this set is not our protocol and is passed through rather
  * than dropped — see the degradation note in the module header.
  */
-const STREAM_JSON_EVENT_TYPES = new Set(["system", "assistant", "user", "result"]);
+export const STREAM_JSON_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "system",
+  "assistant",
+  "user",
+  "result",
+  // Real protocol event, and its ABSENCE here was a bug: an unrecognised type
+  // falls to `passthrough()` (line ~183), so every `rate_limit_event` frame was
+  // emitted into the captured answer as prose. Measured 2026-08-22 — a two-byte
+  // reply ("OK") was recorded as 191 B of "OK\n{\"type\":\"rate_limit_event\"…}",
+  // which corrupts `outputSize` and silently defeats `min_output_bytes`.
+  // Enumerated from real `--output-format stream-json` output; the full observed
+  // vocabulary is system / assistant / rate_limit_event / result (+ user).
+  "rate_limit_event",
+]);
+
+/*
+ * TWO CONSUMERS READ THIS SET WITH DIFFERENT MEANINGS — check both before editing.
+ *
+ *   - HERE (`write()` below): membership means "this is our protocol, handle it
+ *     structurally". A member that is not `assistant` yields no text, i.e. it is
+ *     DROPPED. A non-member is passed through VERBATIM.
+ *   - `channel/stream-json-reducer.ts` `reachesAnswer()`: membership means the
+ *     opposite direction — "safe to HAND to the capture". A non-member is
+ *     withheld from it.
+ *
+ * So adding a type here drops it in the team path and forwards it in the channel
+ * path, and both are only correct because the two work together. `rate_limit_event`
+ * is the worked example: the channel gate already withheld it (its comment records
+ * the same measurement), which is why the channel path was accidentally fine while
+ * the team path stayed broken — a fix in one consumer left the shared source wrong.
+ */
 
 export interface AssistantTextCapture {
   /**

@@ -3,6 +3,21 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // Drops op-source's memoized per-glob resolutions + resolved values after a
 // 1Password add/edit, so an edited item is re-discovered without a restart.
+// The credential authority memoizes each provider's resolved key, so any
+// mutation made from this tab must drop that memo — otherwise a key the user
+// just deleted keeps being served for the rest of the session, and a key they
+// just set is not seen until relaunch.
+import { credentials } from "../auth/credentials/authority.js";
+// macOS Keychain — the default store for keys typed into this tab on macOS.
+// `hydrateKeychainIntoEnv` is what makes a keychain-only key visible to the SYNC
+// readiness classifier: it write-throughs into process.env exactly as the
+// credential authority does, so no new CredentialSource member is needed.
+import {
+  hasKeychainSource,
+  hydrateKeychainIntoEnv,
+  isKeychainHydratedVar,
+  recordKeychainHydratedVar,
+} from "../auth/credentials/keychain-source.js";
 import { invalidateOpResolutionCache } from "../auth/credentials/op-source.js";
 import {
   disableLocalProvider,
@@ -16,9 +31,16 @@ import {
   saveLocalConfig,
   setApiKey,
   setEndpoint,
+  setKeychainEnabled,
 } from "../profile-config.js";
 import { DEFAULT_ROUTING_RULES } from "../providers/default-routing-rules.js";
 import { ensureEndpointsRegistered } from "../providers/endpoint-registration.js";
+import {
+  deleteKeychainSecret,
+  isKeychainSupported,
+  listKeychainVars,
+  writeKeychainSecret,
+} from "../providers/keychain.js";
 import {
   type LocalLiveness,
   localBaseUrl,
@@ -64,6 +86,7 @@ import {
   resolveSecrets,
   withSdkRetry,
 } from "../providers/onepassword.js";
+import type { SdkAuth } from "../providers/onepassword.js";
 import {
   discoverProbeModelFromEndpoint,
   ensureProbeModelsCached,
@@ -71,7 +94,7 @@ import {
   getProbeModel,
 } from "../providers/probe-catalog.js";
 import { describeProbeState } from "../providers/probe-live.js";
-import { probeProviderRoute } from "../providers/probe-runner.js";
+import { INTERACTIVE_PROBE_TIMEOUT_MS, probeProviderRoute } from "../providers/probe-runner.js";
 import { getProviderByName } from "../providers/provider-definitions.js";
 import { invalidateProbeDiscovery } from "../providers/transport/probe-discovery.js";
 import { clearBuffer, getBufferStats } from "../stats-buffer.js";
@@ -106,10 +129,12 @@ import {
   isProbeProxyReady,
 } from "./probe-proxy.js";
 import {
+  type AuthSource,
   type ProviderDef,
   getProviderDefs,
   maskKey,
   providerAuthCapabilities,
+  providerAuthSource,
   providerIsReady,
   providerIsReadyForDisplay,
 } from "./providers.js";
@@ -140,6 +165,95 @@ interface AppProps {
   requestLogin?: (slug: NonNullable<ProviderDef["oauthSlug"]>) => void;
 }
 
+/**
+ * Resolve a batch of 1Password entries into an `{ENV_VAR: secret}` map.
+ *
+ * Module-level rather than a closure inside App: it needs no React state, and
+ * keeping the resolution rules in one named function is what stops the copy
+ * handler from drifting away from `testOpEntry`, which resolves the same three
+ * entry kinds the same three ways.
+ *
+ * Every call goes through `withSdkRetry`, which serializes SDK access — two
+ * concurrent ops on a shared client corrupt the WASM↔desktop-app bridge (the
+ * `-4` IPC failure).
+ */
+async function resolveOpEntrySecrets(
+  entries: OpEntry[],
+  auth: SdkAuth
+): Promise<Record<string, string>> {
+  const secrets: Record<string, string> = {};
+  for (const entry of entries) {
+    if (entry.kind === "environment") {
+      Object.assign(
+        secrets,
+        await withSdkRetry(() => readEnvironment(entry.value, { auth }), "tui:copy-keychain")
+      );
+    } else if (entry.kind === "glob" || isGlobImport(entry.value)) {
+      // resolveGlobImport returns the {envVar: value} map directly.
+      Object.assign(
+        secrets,
+        await withSdkRetry(() => resolveGlobImport(entry.value, { auth }), "tui:copy-keychain")
+      );
+    } else {
+      const r = await withSdkRetry(
+        () => resolveSecrets({ T: entry.value }, { auth }),
+        "tui:copy-keychain"
+      );
+      const name = envNameFromOpRef(entry.value);
+      if (name && r.T) secrets[name] = r.T;
+    }
+  }
+  return secrets;
+}
+
+/** What a keychain copy actually did. Counts and NAMES only — never a value. */
+interface KeychainCopyOutcome {
+  created: number;
+  replaced: number;
+  /** Variables that could not be stored, by name. */
+  skipped: string[];
+}
+
+/**
+ * Write a resolved secret map into the keychain.
+ *
+ * One unstorable value (control characters) or a denied ACL must NOT abort the
+ * batch — a user copying twelve keys should not lose eleven because the third
+ * had a problem. Failures are collected by NAME; the underlying `security`
+ * stderr is deliberately dropped rather than surfaced, because text derived
+ * from a failed secret operation is not something to splice into a status line.
+ */
+function writeSecretsToKeychain(
+  secrets: Record<string, string>,
+  alreadyStored: ReadonlySet<string>
+): KeychainCopyOutcome {
+  const outcome: KeychainCopyOutcome = { created: 0, replaced: 0, skipped: [] };
+  for (const [name, value] of Object.entries(secrets)) {
+    if (!value) continue;
+    try {
+      writeKeychainSecret(name, value);
+      if (alreadyStored.has(name)) outcome.replaced++;
+      else outcome.created++;
+    } catch {
+      outcome.skipped.push(name);
+    }
+  }
+  return outcome;
+}
+
+/** Human-readable summary of a copy. Names variables, never values. */
+function describeCopyOutcome({ created, replaced, skipped }: KeychainCopyOutcome): string {
+  if (created + replaced === 0) {
+    return `Nothing copied to the Keychain${
+      skipped.length > 0 ? ` — ${skipped.length} could not be stored` : ""
+    }.`;
+  }
+  const parts = [`${created} new`];
+  if (replaced > 0) parts.push(`${replaced} replaced`);
+  if (skipped.length > 0) parts.push(`${skipped.length} skipped (${skipped.join(", ")})`);
+  return `Copied to macOS Keychain: ${parts.join(" · ")}.`;
+}
+
 export function App({ requestLogin }: AppProps = {}) {
   const renderer = useRenderer();
   const { width, height } = useTerminalDimensions();
@@ -150,6 +264,34 @@ export function App({ requestLogin }: AppProps = {}) {
   const [activeTab, setActiveTab] = useState<Tab>("providers");
   const [mode, setMode] = useState<Mode>("browse");
   const [inputValue, setInputValue] = useState("");
+  /**
+   * Env vars currently stored in the macOS Keychain.
+   *
+   * Held in STATE rather than read per render: `listKeychainVars()` spawns
+   * `security` (~28ms) behind a 3-second memo, so calling it from a render path
+   * would fork a subprocess every few seconds for the life of the TUI. It is
+   * refreshed exactly where it can change — at mount, and after this tab writes
+   * or deletes a key.
+   */
+  const [keychainVars, setKeychainVars] = useState<Set<string>>(new Set());
+  const keychainSupported = useMemo(() => isKeychainSupported(), []);
+  /**
+   * The provider an OPEN key/endpoint input belongs to, captured the moment the
+   * input opened.
+   *
+   * Selection is otherwise held as a numeric index into `displayProviders`,
+   * and that list RE-SORTS whenever readiness changes — "configured first" is
+   * part of the sort key. The keychain hydration effect finishes a few hundred
+   * milliseconds after mount and can flip several providers to ready at once,
+   * so a user who starts typing immediately can have the rows move underneath
+   * them while the input is open. Reading `selectedProvider` at submit time
+   * would then write the secret they typed for provider A into provider B's
+   * variable — and a later probe would send that credential to B's endpoint.
+   *
+   * Pinning the identity (not the index) makes the destination immune to any
+   * re-sort, which is also what the input box's title already promises.
+   */
+  const inputTargetRef = useRef<ProviderDef | null>(null);
   const [routingPattern, setRoutingPattern] = useState("");
   const [chainSelected, setChainSelected] = useState<Set<string>>(new Set());
   const [chainOrder, setChainOrder] = useState<string[]>([]);
@@ -329,6 +471,69 @@ export function App({ requestLogin }: AppProps = {}) {
     setOpTick((t) => t + 1);
   }, []);
 
+  /**
+   * Re-read which variables the keychain holds. Cheap-ish (one ~28ms spawn),
+   * so it is called only at mount and after a write/delete from this tab.
+   */
+  const refreshKeychainVars = useCallback(() => {
+    // Gated on the BACKEND, not merely on the platform. `listKeychainVars()`
+    // spawns `security`, and gating on `keychainSupported` alone made every
+    // macOS user pay that spawn at TUI mount — including everyone who has never
+    // opted into the keychain at all. `hasKeychainSource()` is the same sync
+    // sniff the credential authority uses, so "never opted in" costs zero
+    // keychain I/O here exactly as it does everywhere else.
+    if (!hasKeychainSource()) {
+      setKeychainVars(new Set());
+      return;
+    }
+    try {
+      setKeychainVars(new Set(listKeychainVars()));
+    } catch {
+      // Enumeration failing (locked keychain) must never break the TUI; an
+      // empty set simply renders as "nothing stored here".
+      setKeychainVars(new Set());
+    }
+    // No deps: `hasKeychainSource()` reads the platform and config at CALL time,
+    // so this callback is stable and never goes stale.
+  }, []);
+
+  /**
+   * Hydrate keychain values into process.env once, at mount.
+   *
+   * WHY IT IS NEEDED: `describeSourceSync` — which decides the readiness dot,
+   * the "configured first" sort and the not-configured divider — cannot await,
+   * so a keychain-only provider would render as unconfigured despite working
+   * perfectly at request time. Hydrating up front is the same mechanism that
+   * makes 1Password keys visible to those same sync rules: once the value is in
+   * process.env, the existing classifier reports "env", which by then it is.
+   *
+   * Reads run in PARALLEL inside `hydrateKeychainIntoEnv`, so ten stored keys
+   * cost roughly one read's wall clock rather than ten. Gap-fill only — a
+   * variable already in the environment is never overwritten, because env
+   * outranks the keychain in the resolution order.
+   */
+  useEffect(() => {
+    if (!keychainSupported) return;
+    let cancelled = false;
+    void (async () => {
+      let hydrated = 0;
+      try {
+        hydrated = await hydrateKeychainIntoEnv();
+      } catch {
+        // Non-fatal by design: a keychain that cannot be read leaves providers
+        // looking unconfigured, which is exactly what they are from here.
+      }
+      if (cancelled) return;
+      refreshKeychainVars();
+      // Only re-derive the whole config when something actually landed in
+      // process.env — an unnecessary refresh re-runs endpoint registration.
+      if (hydrated > 0) refreshConfig();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [keychainSupported, refreshKeychainVars, refreshConfig]);
+
   // Drop the cached test badge for one provider (keyed by TUI name, as
   // runProbeTest stores it). Call on any credential change — save/remove key or
   // URL, OAuth login — so a stale FAIL / "ready Xms" doesn't outlive the
@@ -358,15 +563,49 @@ export function App({ requestLogin }: AppProps = {}) {
 
   const hasCfgKey = !!config.apiKeys?.[selectedProvider.apiKeyEnvVar];
   const hasEnvKey = !!process.env[selectedProvider.apiKeyEnvVar];
-  // Keyless/free provider (publicKeyFallback, e.g. OpenCode Zen): usable with no
-  // user key. Counts as "has key" so the detail pane shows it Ready, consistent
-  // with providerIsReady / the Providers list (no more "ready" under
-  // "not configured").
-  const selectedPublicKey = !!selectedProvider.publicKeyFallback && !hasCfgKey && !hasEnvKey;
-  const hasKey = hasCfgKey || hasEnvKey || selectedLocalEnabled || selectedPublicKey;
+  /**
+   * Does the SELECTED provider have a credential of any kind?
+   *
+   * Delegated to `providerIsReadyForDisplay` — the SAME oracle the list sorts by
+   * — rather than re-derived here. The hand-rolled expression this replaces was
+   * `hasCfgKey || hasEnvKey || selectedLocalEnabled || selectedPublicKey`, which
+   * omitted OAuth entirely: every OAuth provider (Antigravity, Devin, OpenAI
+   * Codex, Grok Build) rendered `Status: not configured` in the detail pane while
+   * the row one line above said `ready` and its own test returned valid.
+   *
+   * That is precisely the duplicate-oracle pattern `auth/credentials/source.ts`
+   * was created to end, reintroduced one surface over. Syncing two expressions
+   * would fix today's symptom and leave the next divergence waiting; deleting one
+   * of them cannot drift. `...ForDisplay` is the variant that also counts a local
+   * server that is RUNNING but not configured, which the list already honours.
+   */
+  /**
+   * Every variable name this provider could have stored in the keychain —
+   * primary AND aliases.
+   *
+   * The authority resolves a provider from any of its accepted spellings, and
+   * `claudish keychain import` stores aliases too, so checking only the primary
+   * name made an alias-stored key invisible here: the row read "not configured"
+   * while requests authenticated fine, and `x` could not delete the item that
+   * was actually in use.
+   */
+  const providerKeychainVars = useMemo(
+    () =>
+      [selectedProvider.apiKeyEnvVar, ...(selectedProvider.aliases ?? [])].filter(
+        (n): n is string => !!n && keychainVars.has(n)
+      ),
+    [selectedProvider, keychainVars]
+  );
+  const hasKcKey = providerKeychainVars.length > 0;
+  const selectedAuthSource: AuthSource = providerAuthSource(selectedProvider, config);
+  const hasKey = providerIsReadyForDisplay(selectedProvider, config, localLiveness);
   // True when the env-var value was hydrated from 1Password at startup (not a
   // genuine shell env var) — so the detail pane shows "From: 1Password", not "env".
   const isOpKey = hasEnvKey && isOpHydratedVar(selectedProvider.apiKeyEnvVar);
+  // Same idea for the keychain. Checked separately (and rendered ahead of the
+  // 1Password tag) because the keychain is resolved FIRST, so when both stores
+  // could supply a variable, the keychain is the one that did.
+  const isKcKey = hasEnvKey && isKeychainHydratedVar(selectedProvider.apiKeyEnvVar);
   const cfgKeyMask = maskKey(config.apiKeys?.[selectedProvider.apiKeyEnvVar]);
   const envKeyMask = maskKey(process.env[selectedProvider.apiKeyEnvVar]);
   const activeEndpointEnvVar = selectedProvider.endpointEnvVar;
@@ -673,6 +912,69 @@ export function App({ requestLogin }: AppProps = {}) {
       }
     },
     [acquireOpAuth]
+  );
+
+  /**
+   * Copy 1Password entries into the macOS Keychain — the TUI counterpart of
+   * `claudish keychain import --from 1password`.
+   *
+   * WHY IT LIVES HERE: this tab is where the user can already SEE what they
+   * have stored, so it is where "put these in the Keychain" belongs. Copying
+   * moves the credential off a desktop-app handshake that can be denied (and
+   * whose denials trip a 15-second machine-wide suppression) onto a local store
+   * that resolves in ~17ms and never prompts once its ACL is established.
+   *
+   * OVERWRITES WITHOUT A CONFIRM DIALOG, deliberately. 1Password still holds
+   * every value, so a replaced Keychain item is a REFRESH rather than a loss —
+   * and this tab's `x` already removes an entry with no confirmation, so gating
+   * a non-destructive refresh would be the inconsistent choice. What the user
+   * gets instead is an exact report of new vs replaced vs skipped.
+   *
+   * Resolution mirrors `testOpEntry`, `withSdkRetry` included — that wrapper
+   * serializes every SDK call (the `-4` IPC fix), so a copy cannot interleave
+   * with a test or an add and corrupt the WASM bridge.
+   */
+  const copyOpToKeychain = useCallback(
+    async (entries: OpEntry[], label: string): Promise<void> => {
+      if (!keychainSupported) {
+        setStatusMsg("macOS Keychain is only available on macOS.");
+        return;
+      }
+      const copyable = entries.filter((e) => e.kind !== "account");
+      if (copyable.length === 0) {
+        setStatusMsg("Nothing to copy — the account entry holds no secret.");
+        return;
+      }
+
+      setOpBusy(true);
+      setStatusMsg(`Resolving ${label} from 1Password…`);
+      try {
+        const auth = await acquireOpAuth();
+        // Resolve EVERYTHING before writing anything. A partial resolve that had
+        // already written half the keys would leave the Keychain in a state
+        // neither the user nor the status line could describe.
+        const secrets = await resolveOpEntrySecrets(copyable, auth);
+        const outcome = writeSecretsToKeychain(secrets, new Set(keychainVars));
+
+        if (outcome.created + outcome.replaced > 0) {
+          setKeychainEnabled(true);
+          refreshKeychainVars();
+          // Every provider whose key just changed has a stale authority memo,
+          // and the endpoint roster may now include vendors that were gated out
+          // for lack of a local credential.
+          credentials.invalidate();
+          invalidateProbeProxyHandlers();
+          refreshConfig();
+        }
+
+        setStatusMsg(describeCopyOutcome(outcome));
+      } catch (err: unknown) {
+        setStatusMsg(err instanceof Error ? err.message : String(err));
+      } finally {
+        setOpBusy(false);
+      }
+    },
+    [acquireOpAuth, keychainSupported, keychainVars, refreshKeychainVars, refreshConfig]
   );
 
   /**
@@ -1057,7 +1359,7 @@ export function App({ requestLogin }: AppProps = {}) {
             // cfg, OAuth). The live request is the source of truth.
             hasCredentials: true,
           },
-          15000
+          INTERACTIVE_PROBE_TIMEOUT_MS
         );
         lastResult = result;
 
@@ -1121,7 +1423,12 @@ export function App({ requestLogin }: AppProps = {}) {
         const error = tried.size > 1 ? `${baseError} (tried ${tried.size} models)` : baseError;
         setTestResults((prev) => ({
           ...prev,
-          [provName]: { status: "failed", error, ms },
+          // `errorMessage` is carried alongside the rendered `error` rather than
+          // re-derived from it: the detail panel needs the upstream's own words
+          // without the state/status/latency prefix, and splitting a formatted
+          // string back apart would break on any provider whose message
+          // contains the same separator.
+          [provName]: { status: "failed", error, providerMessage: result.errorMessage, ms },
         }));
       }
     } catch (err: unknown) {
@@ -1185,40 +1492,84 @@ export function App({ requestLogin }: AppProps = {}) {
           setMode("browse");
           return;
         }
+        // The provider this input was opened FOR, not whatever row happens to
+        // be selected now — the list can re-sort under an open input. See
+        // inputTargetRef.
+        const target = inputTargetRef.current ?? selectedProvider;
         if (mode === "input_key") {
-          if (!selectedProvider.apiKeyEnvVar) {
-            setStatusMsg(`${selectedProvider.displayName} has no apiKeyEnvVar — cannot save key.`);
+          if (!target.apiKeyEnvVar) {
+            setStatusMsg(`${target.displayName} has no apiKeyEnvVar — cannot save key.`);
           } else {
-            setApiKey(selectedProvider.apiKeyEnvVar, val);
-            process.env[selectedProvider.apiKeyEnvVar] = val;
-            setStatusMsg(
-              `Key saved for ${selectedProvider.displayName} (${selectedProvider.apiKeyEnvVar}).`
-            );
+            const envVar = target.apiKeyEnvVar;
+            // On macOS the key goes into the KEYCHAIN, not config.json. A key
+            // typed here used to land in plaintext in ~/.claudish/config.json;
+            // the keychain is encrypted at rest and gated by the login session,
+            // and it is the store this tab now advertises. config.json stays the
+            // fallback everywhere the keychain does not exist.
+            let saved = false;
+            if (keychainSupported) {
+              try {
+                writeKeychainSecret(envVar, val);
+                // A successful write is the only thing that turns the backend
+                // on — enabling first would leave it on after a failed write,
+                // pointing at a store with nothing in it.
+                setKeychainEnabled(true);
+                // Make it active for the rest of this session. Overwriting a
+                // shell-exported value here is intended: the user just typed a
+                // replacement, and this only affects THIS process — their shell
+                // is untouched.
+                process.env[envVar] = val;
+                // Record the ORIGIN, or `x` will not know this env value came
+                // from the keychain and will leave the deleted secret live in
+                // process.env — still inherited by children, still
+                // authenticating — until the process exits.
+                recordKeychainHydratedVar(envVar);
+                refreshKeychainVars();
+                setStatusMsg(`Key saved to macOS Keychain for ${target.displayName} (${envVar}).`);
+                saved = true;
+              } catch (err) {
+                // Fall through to config.json rather than losing the key the
+                // user just typed. The reason is surfaced, not swallowed.
+                setStatusMsg(
+                  `Keychain write failed (${err instanceof Error ? err.message : String(err)}) — saved to config.json instead.`
+                );
+              }
+            }
+            if (!saved) {
+              setApiKey(envVar, val);
+              process.env[envVar] = val;
+              // When the keychain write failed, the status line already explains
+              // the fallback and must not be clobbered.
+              if (!keychainSupported) {
+                setStatusMsg(`Key saved for ${target.displayName} (${envVar}).`);
+              }
+            }
+            // Whichever store took it, the authority's memo for this provider is
+            // now stale — drop it so the new key is used without a relaunch.
+            credentials.invalidate(target.catalogName);
+            invalidateProbeProxyHandlers(target.catalogName);
+            clearTestResult(target.name);
           }
         } else {
-          if (!selectedProvider.endpointEnvVar) {
-            setStatusMsg(
-              `${selectedProvider.displayName} has no endpointEnvVar — cannot save URL.`
-            );
+          if (!target.endpointEnvVar) {
+            setStatusMsg(`${target.displayName} has no endpointEnvVar — cannot save URL.`);
           } else {
-            setEndpoint(selectedProvider.endpointEnvVar, val);
-            process.env[selectedProvider.endpointEnvVar] = val;
-            setStatusMsg(
-              `URL saved for ${selectedProvider.displayName} (${selectedProvider.endpointEnvVar}=${val}).`
-            );
+            setEndpoint(target.endpointEnvVar, val);
+            process.env[target.endpointEnvVar] = val;
+            setStatusMsg(`URL saved for ${target.displayName} (${target.endpointEnvVar}=${val}).`);
           }
         }
         // Drop stale caches so the next probe picks up the new URL/key.
         // Without this the probe-proxy keeps using a pre-built transport
         // pointing at the old endpoint, and discovery returns the cached
         // model lookup keyed by the old URL.
-        invalidateProbeProxyHandlers(selectedProvider.catalogName);
-        invalidateProbeDiscovery(selectedProvider.catalogName);
+        invalidateProbeProxyHandlers(target.catalogName);
+        invalidateProbeDiscovery(target.catalogName);
         // Clear the stale test badge: a previous FAIL/valid result reflects the
         // OLD credential, not the one just saved. Leaving it would show a red
         // FAIL even after the user pastes a working key (testResults is separate
         // state that refreshConfig doesn't touch).
-        clearTestResult(selectedProvider.name);
+        clearTestResult(target.name);
         refreshConfig();
         setInputValue("");
         setMode("browse");
@@ -1822,10 +2173,14 @@ export function App({ requestLogin }: AppProps = {}) {
         setStatusMsg(null);
       } else if (key.name === "s") {
         if (selectedProvider.apiKeyEnvVar) {
+          // Pin the destination NOW — see inputTargetRef. A re-sort while the
+          // input is open must not redirect the secret to another provider.
+          inputTargetRef.current = selectedProvider;
           setInputValue("");
           setStatusMsg(null);
           setMode("input_key");
         } else if (selectedProvider.endpointEnvVar) {
+          inputTargetRef.current = selectedProvider;
           setInputValue(activeEndpoint);
           setStatusMsg(null);
           setMode("input_endpoint");
@@ -1843,6 +2198,7 @@ export function App({ requestLogin }: AppProps = {}) {
           }
           refreshConfig();
         } else if (selectedProvider.endpointEnvVar) {
+          inputTargetRef.current = selectedProvider;
           setInputValue(activeEndpoint);
           setStatusMsg(null);
           setMode("input_endpoint");
@@ -1854,6 +2210,7 @@ export function App({ requestLogin }: AppProps = {}) {
         // For local providers `e` is taken by the enable/disable toggle, so
         // `u` is the consistent way to edit the URL across all provider types.
         if (selectedProvider.endpointEnvVar) {
+          inputTargetRef.current = selectedProvider;
           setInputValue(activeEndpoint);
           setStatusMsg(null);
           setMode("input_endpoint");
@@ -1862,9 +2219,50 @@ export function App({ requestLogin }: AppProps = {}) {
         }
       } else if (key.name === "x") {
         let changed = false;
+        const removedFrom: string[] = [];
+        // A FAILED delete must survive to the end of this handler. The final
+        // branch below used to overwrite it with "No stored config to remove."
+        // — reporting a denied ACL as "there was nothing there", while the item
+        // and its live credential both remained.
+        let failureMsg: string | null = null;
         if (hasCfgKey) {
           removeApiKey(selectedProvider.apiKeyEnvVar);
+          removedFrom.push("config.json");
           changed = true;
+        }
+        // Delete from the KEYCHAIN too. `x` reads as "remove this provider's
+        // stored credential", and clearing only config.json would leave the
+        // keychain copy resolving happily at request time — the provider would
+        // stay green after the user asked for it to be gone, which is the worst
+        // possible outcome for a delete key.
+        //
+        // ALIASES included: the authority resolves a provider from its aliases
+        // as well as its primary variable, and `claudish keychain import` stores
+        // them. Deleting only the primary name would leave an alias item that
+        // keeps the provider authenticated — a delete that visibly does nothing.
+        if (keychainSupported) {
+          for (const name of providerKeychainVars) {
+            try {
+              if (deleteKeychainSecret(name)) {
+                removedFrom.push(`macOS Keychain (${name})`);
+                changed = true;
+              }
+            } catch (err) {
+              failureMsg = `Keychain delete failed for ${name}: ${
+                err instanceof Error ? err.message : String(err)
+              }`;
+            }
+          }
+          if (providerKeychainVars.length > 0) refreshKeychainVars();
+        }
+        // Drop the write-through mirror as well. The authority pushed the
+        // resolved value into process.env, and leaving it there would keep the
+        // provider signing requests with a credential the user just deleted —
+        // and keep the sync classifier reporting it as configured — until the
+        // next process. Only cleared when it CAME from a vault; a genuine shell
+        // export is the user's own environment and is not ours to unset.
+        if (changed && (isKcKey || isOpKey)) {
+          delete process.env[selectedProvider.apiKeyEnvVar];
         }
         if (activeEndpointEnvVar && config.endpoints?.[activeEndpointEnvVar]) {
           removeEndpoint(activeEndpointEnvVar);
@@ -1872,15 +2270,24 @@ export function App({ requestLogin }: AppProps = {}) {
           changed = true;
         }
         if (changed) {
+          credentials.invalidate(selectedProvider.catalogName);
           invalidateProbeProxyHandlers(selectedProvider.catalogName);
           invalidateProbeDiscovery(selectedProvider.catalogName);
           // The prior test badge reflected the now-removed credential.
           clearTestResult(selectedProvider.name);
           refreshConfig();
-          setStatusMsg(`Stored config removed for ${selectedProvider.displayName}.`);
-        } else {
-          setStatusMsg("No stored config to remove.");
         }
+        // A failure outranks both the success line and the empty-state line:
+        // it is the only outcome that leaves a credential the user believes is
+        // gone still working.
+        setStatusMsg(
+          failureMsg ??
+            (changed
+              ? removedFrom.length > 0
+                ? `Removed ${selectedProvider.displayName} key from ${removedFrom.join(" + ")}.`
+                : `Stored config removed for ${selectedProvider.displayName}.`
+              : "No stored config to remove.")
+        );
       } else if (key.name === "l") {
         // OAuth login for the selected provider. Signal the wrapper
         // (tui/index.tsx) which slug to log into, then destroy the
@@ -2183,6 +2590,25 @@ export function App({ requestLogin }: AppProps = {}) {
         } else if (selectedOpEntry) {
           void testOpEntry(selectedOpEntry);
         }
+      } else if (key.raw === "C") {
+        // Shift-C — copy EVERY entry. Checked BEFORE the lowercase branch
+        // because `key.name` is "c" for both cases; testing `key.name` first
+        // would make the uppercase binding unreachable.
+        if (opEntries.length === 0) {
+          setStatusMsg("No 1Password entries to copy.");
+        } else {
+          void copyOpToKeychain(opEntries, `all ${opEntries.length} entries`);
+        }
+      } else if (key.name === "c") {
+        // Copy just the selected entry into the macOS Keychain.
+        if (opEntries.length === 0 || !selectedOpEntry) {
+          setStatusMsg("No 1Password entry to copy.");
+        } else {
+          void copyOpToKeychain(
+            [selectedOpEntry],
+            selectedOpEntry.envName ?? selectedOpEntry.value
+          );
+        }
       } else if (key.name === "x") {
         if (opEntries.length === 0 || !selectedOpEntry) {
           setStatusMsg("No 1Password entry to remove.");
@@ -2284,8 +2710,11 @@ export function App({ requestLogin }: AppProps = {}) {
             hasCfgKey={hasCfgKey}
             hasEnvKey={hasEnvKey}
             hasKey={hasKey}
+            authSource={selectedAuthSource}
             isOpKey={isOpKey}
-            isPublicKey={selectedPublicKey}
+            isKcKey={isKcKey}
+            hasKcKey={hasKcKey}
+            keySaveTarget={keychainSupported ? "macOS Keychain" : "config.json"}
             cfgKeyMask={cfgKeyMask}
             envKeyMask={envKeyMask}
             activeEndpoint={activeEndpoint}

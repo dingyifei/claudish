@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tuple-probe": {
+      "command": "bun",
+      "args": ["run", "./tuple-mcp-server.ts"]
+    }
+  }
+}

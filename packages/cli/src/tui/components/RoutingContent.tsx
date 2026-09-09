@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
 import { DEFAULT_ROUTING_RULES } from "../../providers/default-routing-rules.js";
 import { DETAIL_H, getChainProviders } from "../constants.js";
+import { deriveProbeOutcome } from "../probe-outcome.js";
 import { providerIsReady } from "../providers.js";
 import { A, C } from "../theme.js";
 import type { MergedRule, Mode, ProbeEntry, ProbeMode } from "../types.js";
@@ -167,15 +168,19 @@ export function RoutingContent({
 
   if (probeMode === "running" || probeMode === "done") {
     const successEntry = probeResults.find((e) => e.status === "success");
-    const allFailed = probeMode === "done" && !successEntry;
+    const outcome = deriveProbeOutcome(probeMode, probeResults);
+    const allFailed = outcome === "no-route";
+    const unverified = outcome === "unverified";
     const totalMs = successEntry?.ms;
 
     const statusBadge =
-      probeMode === "running"
+      outcome === "running"
         ? { text: "probing...", color: C.yellow }
-        : successEntry
+        : outcome === "routed"
           ? { text: "routed", color: C.green }
-          : { text: "no route", color: C.red };
+          : unverified
+            ? { text: "native — not probed", color: C.cyan }
+            : { text: "no route", color: C.red };
 
     return (
       <box
@@ -200,7 +205,7 @@ export function RoutingContent({
             <span fg={C.dim}>{"  "}</span>
             {probeMode === "done" && (
               <span fg={statusBadge.color} attributes={A.bold}>
-                {successEntry ? "● " : "✗ "}
+                {outcome === "routed" ? "● " : unverified ? "◐ " : "✗ "}
                 {statusBadge.text}
               </span>
             )}
@@ -222,43 +227,49 @@ export function RoutingContent({
           const isSelected = entry.status === "success" && probeMode === "done";
 
           const statusIcon =
-            entry.status === "success"
-              ? "●"
-              : entry.status === "failed"
-                ? "✗"
-                : entry.status === "testing"
-                  ? "◌"
-                  : isNoKey
-                    ? "○"
-                    : isNotReached
-                      ? "·"
-                      : "○";
+            entry.status === "unverified"
+              ? "◐"
+              : entry.status === "success"
+                ? "●"
+                : entry.status === "failed"
+                  ? "✗"
+                  : entry.status === "testing"
+                    ? "◌"
+                    : isNoKey
+                      ? "○"
+                      : isNotReached
+                        ? "·"
+                        : "○";
 
           const statusColor =
-            entry.status === "success"
-              ? C.green
-              : entry.status === "failed"
-                ? C.red
-                : entry.status === "testing"
-                  ? C.yellow
-                  : C.dim;
+            entry.status === "unverified"
+              ? C.cyan
+              : entry.status === "success"
+                ? C.green
+                : entry.status === "failed"
+                  ? C.red
+                  : entry.status === "testing"
+                    ? C.yellow
+                    : C.dim;
 
           const nameCol = entry.displayName.padEnd(18).substring(0, 18);
 
           const statusText =
-            entry.status === "success"
-              ? entry.ms !== undefined
-                ? `${entry.ms}ms`
-                : "success"
-              : entry.status === "failed"
-                ? (entry.error ?? "failed")
-                : entry.status === "testing"
-                  ? "testing..."
-                  : isNoKey
-                    ? "not configured, skipping"
-                    : isNotReached
-                      ? "not reached"
-                      : "waiting";
+            entry.status === "unverified"
+              ? "native — not probed"
+              : entry.status === "success"
+                ? entry.ms !== undefined
+                  ? `${entry.ms}ms`
+                  : "success"
+                : entry.status === "failed"
+                  ? (entry.error ?? "failed")
+                  : entry.status === "testing"
+                    ? "testing..."
+                    : isNoKey
+                      ? "not configured, skipping"
+                      : isNotReached
+                        ? "not reached"
+                        : "waiting";
 
           const reason = PROVIDER_REASONS[entry.provider] ?? entry.provider;
 
@@ -300,6 +311,15 @@ export function RoutingContent({
                     {"Result: "}
                   </span>
                   <span fg={C.red}>{"✗ No provider could serve this model"}</span>
+                </>
+              ) : unverified ? (
+                <>
+                  <span fg={C.cyan} attributes={A.bold}>
+                    {"Result: "}
+                  </span>
+                  <span fg={C.fgMuted}>
+                    {"◐ Served natively on Claude Code's own auth — not probed here"}
+                  </span>
                 </>
               ) : (
                 <>

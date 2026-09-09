@@ -13,12 +13,20 @@
  * Layer 3 follows the `--config <file>` override (config-override.ts): provenance
  * must read the SAME file the credential authority resolves from, and the layer is
  * labeled with the override's real path so the UI names the file actually in play.
+ *
+ * VAULT-HYDRATED VALUES: the macOS Keychain and 1Password both deliver their keys
+ * by write-through into process.env, so by the time this inspects layer 3 they are
+ * indistinguishable from a shell export. Neither can be re-read here cheaply (and
+ * re-reading 1Password could prompt), so origin is recovered from the run-scoped
+ * records the authority keeps — `isKeychainHydratedVar` / `isOpHydratedVar` — and
+ * reported by name rather than as "shell environment".
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parse as parseDotenv } from "dotenv";
+import { isKeychainHydratedVar } from "../auth/credentials/keychain-source.js";
 import { activeGlobalConfigFile, getConfigFileOverride } from "../config-override.js";
 import { isOpHydratedVar } from "./onepassword.js";
 
@@ -134,6 +142,13 @@ export function resolveApiKeyProvenance(envVar: string, aliases?: string[]): Key
       effectiveSource = configLayerLabel();
       layers[1].isActive = true;
       layers[2].isActive = false;
+    } else if (isKeychainHydratedVar(runtimeVar)) {
+      // In process.env, but put there by the keychain step of the credential
+      // authority (or the TUI's startup hydration) — not a genuine shell export.
+      // Checked BEFORE the 1Password branch because the keychain is resolved
+      // first, so a variable both stores could supply was supplied by this one.
+      effectiveSource = "macOS Keychain";
+      layers[2].source = `process.env[${runtimeVar}] (from macOS Keychain)`;
     } else if (isOpHydratedVar(runtimeVar)) {
       // The value sits in process.env, but it was hydrated from 1Password at
       // startup (op:// ref, glob import, or Environment) — not a genuine shell

@@ -25,6 +25,31 @@ You'll see a split terminal with a status bar at the bottom. Press `Ctrl-G` then
 
 ---
 
+## Why a multiplexer, and not just `claude -p`
+
+Headless mode is not interactive-without-a-TTY. It diverges, and at least one divergence is
+silent: an unknown `--agent` name exits 1 with the list of valid agents in interactive mode and
+under plain `-p`, but under `--input-format stream-json` it exits **0**, prints nothing, and runs
+the DEFAULT agent with the full tool set. The run reports `result: success`.
+
+A magmux pane is a **real PTY running a real interactive session** — so the child behaves the way
+interactive Claude Code behaves, not the way print mode does.
+
+Crucially, that does not cost you a terminal. `--headless` refers to *magmux's* output, not the
+pane's: no raw mode, no alternate screen, nothing on stdout, with the socket as the whole
+interface. The panes are still PTYs.
+
+| | child sees | unknown `--agent` | needs a terminal? |
+|---|---|---|---|
+| `claude -p --input-format stream-json` | no TTY, print mode | silently ignored, exit 0 | no |
+| `claude` in a magmux pane, `magmux --headless` | real PTY, interactive | refused, agents listed | no |
+
+So automation does not have to accept print mode's divergences in exchange for being scriptable.
+
+Measurements and the upstream status are in `ai-docs/architecture/headless-vs-interactive.md`.
+
+---
+
 ## With claudish
 
 The `--grid` flag on `claudish team run` launches magmux with one pane per model. Each pane streams output in real time while a status bar tracks progress.

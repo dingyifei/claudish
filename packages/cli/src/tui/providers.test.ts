@@ -60,18 +60,6 @@ describe("providerAuthSource", () => {
     expect(providerAuthSource(def({}), { apiKeys: { [ENV]: "sk-cfg" } })).toBe<AuthSource>("e+c");
   });
 
-  // Regression for the OpenCode Zen bug: a keyless/free provider
-  // (publicKeyFallback) must report a NON-NULL source so it sorts above the
-  // "not configured" divider and shows a ready dot — matching providerIsReady.
-  test("'public' for a keyless provider with publicKeyFallback and no user key", () => {
-    expect(providerAuthSource(def({ publicKeyFallback: true }), EMPTY)).toBe<AuthSource>("public");
-  });
-
-  test("a real env key wins over the public-key affordance", () => {
-    process.env[ENV] = "sk-real";
-    expect(providerAuthSource(def({ publicKeyFallback: true }), EMPTY)).toBe<AuthSource>("env");
-  });
-
   test("local provider: 'local' only when enabled in config", () => {
     const local = def({ isLocal: true, catalogName: "ollama", apiKeyEnvVar: "" });
     expect(providerAuthSource(local, { localProviders: [] })).toBeNull();
@@ -79,7 +67,7 @@ describe("providerAuthSource", () => {
   });
 });
 
-describe("providerIsReady agrees with providerAuthSource for the public case", () => {
+describe("providerIsReady", () => {
   const ENV = "CLAUDISH_TEST_PROVIDERS_KEY";
   let saved: string | undefined;
   beforeEach(() => {
@@ -89,15 +77,6 @@ describe("providerIsReady agrees with providerAuthSource for the public case", (
   afterEach(() => {
     if (saved === undefined) delete process.env[ENV];
     else process.env[ENV] = saved;
-  });
-
-  // The core invariant the OpenCode Zen fix restores: the SOURCE classifier and
-  // the readiness oracle must NOT disagree for a keyless provider, or the row
-  // renders "ready" under "not configured".
-  test("keyless provider is ready AND has a non-null source", () => {
-    const zen = def({ publicKeyFallback: true });
-    expect(providerAuthSource(zen, EMPTY)).not.toBeNull();
-    expect(providerIsReady(zen, EMPTY)).toBe(true);
   });
 
   // Regression for the direct-Gemini false-ready bug: the direct-Gemini row has
@@ -112,7 +91,7 @@ describe("providerIsReady agrees with providerAuthSource for the public case", (
       name: "gemini",
       catalogName: "google",
       apiKeyEnvVar: "CLAUDISH_TEST_PROVIDERS_KEY",
-      // no oauthSlug, no publicKeyFallback, no env/cfg key
+      // no oauthSlug, no env/cfg key
     });
     expect(providerIsReady(directGemini, EMPTY)).toBe(false);
   });

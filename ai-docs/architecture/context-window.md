@@ -1,0 +1,17 @@
+> Both env levers, why the status line reports the ENFORCED window, and local-model context accounting.
+>
+> Extracted from `CLAUDE.md` (v7.64.0). Indexed in [`README.md`](./README.md).
+
+# Context Window and Auto-Compaction (v7.24.0+, status line v7.28.0+)
+
+Claude Code resolves its compaction point as `min(CLAUDE_CODE_AUTO_COMPACT_WINDOW, maxContextTokens(model))`, and `maxContextTokens` falls back to a hardcoded **200,000** for any model name it does not recognise — which is every model claudish proxies. Setting only the first lever therefore accomplishes nothing: the real window is accepted and then thrown away by the `min()`. `resolveContextWindowEnv()` (`claude-runner.ts`) sets **both**, and Claude Code honours `CLAUDE_CODE_MAX_CONTEXT_TOKENS` only for model names not starting with `claude-`, i.e. exactly the pure-proxy case.
+
+**The env is read at SPAWN and never revisited.** A long-running claudish process keeps whatever window it was launched with; upgrading the package on disk does nothing for a live session. Diagnosing this is easy once you know the tell: inside ONE pre-fix process, subagents pinned to `model: "opus"` (a name Claude Code knows as 1M) compact at ~340K while the main thread on the proxied model compacts at ~170K. Ground truth is `compactMetadata.preTokens` in the Claude Code transcript.
+
+**The status line reports the ENFORCED window, not the spec window.** `TokenTracker.writeFile` derives `context_left_percent` from `inputTokens` alone — folding in the session-CUMULATIVE `outputTokens` made the value decay with session AGE and pin at 0 forever once lifetime output passed the window (measured: input 94,018 of a 372,000 window reporting 0% left). Both generated status-line variants then recompute against `min(spec window, CLAUDE_CODE_MAX_CONTEXT_TOKENS ?? 200000, CLAUDE_CODE_AUTO_COMPACT_WINDOW)` and render `18% (164k/200k of 372k)` when those disagree, so a clamp is visible on day one instead of costing days of half-context work.
+
+The status line is a generated **shell one-liner** (and a generated JS file on Windows), so TypeScript cannot catch a typo in it — test the generated artifact by executing it (`status-line-context.test.ts`). `CLAUDISH_TOKEN_FILE` redirects `TokenTracker`'s output path for hermetic tests; do NOT try to move `HOME`, since `homedir()` cannot be re-pointed at runtime in Bun. Bash integer division truncates where JS `Math.round` rounds, so the bash variant uses `((x*200/w)+1)/2` to keep both platforms on the same number.
+
+## Context Tracking for Local Models
+
+Local model APIs (LM Studio, Ollama) report `prompt_tokens` as the **full conversation context** each request, not incremental tokens. The `writeTokenFile` function uses assignment (`=`) not accumulation (`+=`) for input tokens to handle this correctly.

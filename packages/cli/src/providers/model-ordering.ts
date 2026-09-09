@@ -35,6 +35,23 @@ export function extractVersionParts(modelId: string): number[] {
       continue;
     }
 
+    // A PARAMETER COUNT is not a version. `120b` in `gpt-oss-120b-medium` is
+    // 120 billion parameters, but read as a version it outranks every model
+    // ever shipped and pins that row to the top of the picker.
+    //
+    // Only checked BEFORE a version has been found: once `started` is true the
+    // loop's own `^\d{1,2}(\.\d+)?$` guard already rejects these, which is why
+    // `llama-3.3-70b-instruct` -> [3,3] and `qwen3-235b-a22b` -> [3] are
+    // already right. The bug is confined to ids where the count comes FIRST.
+    //
+    // The bound matters: `\d+b` alone would also swallow a legitimate `4b`, and
+    // sizes below ~11B are indistinguishable from version numbers by shape. A
+    // model with no other numeric token then parses as [] and sorts with the
+    // unversioned names, which is the honest answer — it has no stated version.
+    if (!started && /^\d+b$/.test(token) && Number.parseInt(match[0], 10) > 10) {
+      continue;
+    }
+
     if (!started) {
       started = true;
       for (const part of match[0].split(".")) {

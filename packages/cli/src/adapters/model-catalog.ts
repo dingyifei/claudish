@@ -10,13 +10,16 @@
  * constraints, not model metadata.
  */
 
+import type { ReasoningModeCapabilities } from "../model-loader.js";
 import {
+  type CachedSubscriptionPlan,
   type ModelEndpoint,
   type ReasoningCapability,
   type RouteVariant,
   type SlimModelEntry,
   readAllModelsCache,
 } from "../providers/all-models-cache.js";
+import { compareByReleaseDateDesc } from "../providers/model-ordering.js";
 
 export type {
   ModelEndpoint,
@@ -24,6 +27,7 @@ export type {
   ReasoningControl,
   RouteVariant,
 } from "../providers/all-models-cache.js";
+export type { ReasoningModeCapabilities } from "../model-loader.js";
 
 export interface ModelEntry {
   /** Model ID as stored in the slim catalog (not lowercased) */
@@ -118,6 +122,23 @@ export function lookupModelRouteVariant(
 }
 
 /**
+ * `reasoning.mode` support for the exact route selected by `provider`.
+ *
+ * The same base model can support the parameter on one host, reject it on a
+ * second, and remain unverified on a third. Never fall back to model-level
+ * reasoning metadata or another aggregator row.
+ */
+export function lookupRouteReasoningMode(
+  modelId: string,
+  provider: string,
+  cachePath?: string
+): ReasoningModeCapabilities | undefined {
+  return findCacheEntry(modelId, cachePath)?.aggregators?.find(
+    (aggregator) => aggregator.provider === provider
+  )?.reasoning?.mode;
+}
+
+/**
  * The default preset variant for a family on a given provider, if the catalog
  * knows one.
  *
@@ -140,6 +161,55 @@ export function lookupFamilyDefaultVariant(
     if (rv.familyId === familyId || rv.baseModelId === familyId) return entry.modelId;
   }
   return undefined;
+}
+
+/**
+ * Every catalog variant whose preset expands `baseModelId`, optionally narrowed
+ * to one serving provider.
+ *
+ * The inverse of {@link lookupModelRouteVariant}: that answers "which model is
+ * this variant a preset OF?", this answers "which presets exist FOR this
+ * model?".
+ *
+ * This is the sanctioned replacement for a name regex that asks "does this
+ * model support capability X?". The catalog records BOTH halves of the fact —
+ * which base model a preset applies to (`baseModelId`) and what the preset
+ * actually sets (`preset`, in `--model-params` `k=v` syntax) — so the caller
+ * carries neither a model list nor a hardcoded payload. Feed `preset` to
+ * `parseModelParams()` to get the params the provider would have applied.
+ *
+ * Returns [] for a cold cache or a model with no variants. Callers MUST treat
+ * that as "no information" and keep their existing behaviour; absence is never
+ * an error and must never block a request.
+ *
+ * @param provider Only return variants recorded on this serving provider. A
+ *   preset is an observation about ONE provider's roster, not a portable fact
+ *   about the model — the same parameter may not exist on another host — so a
+ *   caller that cannot verify the parameter independently should pass the
+ *   provider it is actually routing to.
+ */
+export function lookupVariantPresets(
+  baseModelId: string,
+  provider?: string,
+  cachePath?: string
+): { modelId: string; preset: string; provider?: string }[] {
+  const cache = readAllModelsCache(cachePath);
+  if (!cache) return [];
+  // Same key rule as findCacheEntry — the caller passes a BARE name, and on the
+  // OpenRouter route a bare name still carries the vendor prefix
+  // ("openai/gpt-5.6-sol") because OpenRouter's API requires it. Comparing raw
+  // strings here matched nothing on precisely the provider whose presets the
+  // catalog records, i.e. the feature was dead where it was meant to work.
+  const wanted = stripVendorPrefix(baseModelId.toLowerCase());
+  const found: { modelId: string; preset: string; provider?: string }[] = [];
+  for (const entry of cache.entries) {
+    const rv = entry.routeVariant;
+    if (!rv?.preset || !rv.baseModelId) continue;
+    if (stripVendorPrefix(rv.baseModelId.toLowerCase()) !== wanted) continue;
+    if (provider !== undefined && rv.provider !== provider) continue;
+    found.push({ modelId: entry.modelId, preset: rv.preset, provider: rv.provider });
+  }
+  return found;
 }
 
 /**
@@ -213,7 +283,8 @@ export type SubscriptionRouting =
 
 /**
  * Resolve how a subscription provider should route a model, from catalog data
- * alone (`subscriptionPlans[]` + `aggregators[].externalId`).
+ * alone (`subscriptionPlans[]` plan IDs joined through cached `queryPlans`,
+ * plus `aggregators[].externalId`).
  *
  * Nothing about which models a plan includes is hardcoded — that is exactly the
  * data that goes stale. Kimi Code shipping K3 while the CLI pinned
@@ -227,21 +298,90 @@ export function resolveSubscriptionRouting(
   const entry = findCacheEntry(modelId, cachePath);
   if (!entry) return { kind: "unknown" };
 
-  if (entry.subscriptionPlans?.includes(provider)) {
+  const cache = readAllModelsCache(cachePath);
+  const providerPlans =
+    cache?.plans?.filter((plan) => plan.routing?.providerUid === provider) ?? [];
+
+  // Legacy v2 caches predate queryPlans and stored provider UIDs directly in
+  // subscriptionPlans. Preserve their old behavior until the next refresh.
+  if (cache?.plans === undefined) {
+    if (entry.subscriptionPlans?.includes(provider)) {
+      const agg = entry.aggregators?.find((a) => a.provider === provider);
+      return agg?.externalId ? { kind: "serves", externalId: agg.externalId } : { kind: "unknown" };
+    }
+    return isLegacySubscriptionPlan(provider, cachePath)
+      ? { kind: "not-served" }
+      : { kind: "unknown" };
+  }
+
+  if (providerPlans.length === 0) return { kind: "unknown" };
+
+  const providerPlanIds = new Set(providerPlans.map((plan) => plan.id));
+  const hasMembership = entry.subscriptionPlans?.some((planId) => providerPlanIds.has(planId));
+  if (hasMembership) {
     const agg = entry.aggregators?.find((a) => a.provider === provider);
     // A plan membership without an aggregator entry has no wire id to send;
-    // treat it as unknown rather than inventing one.
+    // keep the candidate as unknown rather than inventing one. The normal
+    // catalog resolver may still know the canonical provider wire ID.
     return agg?.externalId ? { kind: "serves", externalId: agg.externalId } : { kind: "unknown" };
   }
 
-  // The model doesn't list this plan. Only call that "not served" once we've
-  // confirmed the provider really is a subscription plan somewhere in the
-  // catalog — otherwise a provider with no plan data would lose every route.
-  return isSubscriptionPlan(provider, cachePath) ? { kind: "not-served" } : { kind: "unknown" };
+  // queryModels and queryPlans are separate requests, so a client can briefly
+  // pair a new plan contract with an older slim snapshot. Static absence only
+  // becomes authoritative after this cache demonstrates that it contains at
+  // least one membership row for the provider's plans. Otherwise treating
+  // zero coverage as a complete empty roster would drop every candidate during
+  // a backend rollout (the exact OpenAI/Anthropic gap that motivated the join).
+  const hasPublishedProviderRoster = cache.entries.some((candidate) =>
+    candidate.subscriptionPlans?.some((planId) => providerPlanIds.has(planId))
+  );
+  if (!hasPublishedProviderRoster) return { kind: "unknown" };
+
+  // Absence of evidence is evidence of absence only when the view is whole, and
+  // this one has a hole in it by construction: `providerPlans` above keeps only
+  // plans carrying a `routing.providerUid`, so a plan with no routing block is
+  // never consulted. A SIBLING plan for the same vendor can still publish a
+  // roster, which makes `hasPublishedProviderRoster` true and turns this
+  // provider's silence into a verdict about a plan nobody looked at.
+  //
+  // Measured on the live cache: `alibaba-ai-coding-plan` covers
+  // `qwen3-coder-plus` and carries NO routing block, while
+  // `alibaba-token-plan-individual` and `-team-edition` share
+  // `routing.providerUid: "qwen-cloud"` and do publish memberships. Without this
+  // guard `qwen3-coder-plus` resolved `not-served`, `qwen-cloud` was dropped,
+  // and a holder of Alibaba's $50/month coding plan was billed per token —
+  // the flat-rate-user invariant CLAUDE.md names.
+  //
+  // Deliberately narrow: it only withholds the verdict when a same-vendor plan
+  // is genuinely invisible. Where every plan for the vendor is routable — z-ai's
+  // sole `z-ai-glm-coding-plan`, for one — the view is complete and
+  // `not-served` still stands, so this does not degrade into never dropping
+  // anything. The right long-term fix is a `routing` block on every plan the
+  // backend publishes; this keeps the client honest until then.
+  const vendorsInView = new Set(
+    providerPlans.map((plan) => plan.provider).filter((v): v is string => v !== undefined)
+  );
+  const hasUnroutableSiblingPlan = (cache.plans ?? []).some(
+    (plan) =>
+      plan.provider !== undefined &&
+      vendorsInView.has(plan.provider) &&
+      plan.routing?.providerUid === undefined
+  );
+  if (hasUnroutableSiblingPlan) return { kind: "unknown" };
+
+  // Static absence is conclusive only for catalog-authoritative plans. Client
+  // and hybrid plans may expose additional account-specific models after auth.
+  return providerPlans.every(isCatalogDiscoveredPlan)
+    ? { kind: "not-served" }
+    : { kind: "unknown" };
 }
 
-/** True if any catalog entry lists `provider` as a subscription plan. */
-function isSubscriptionPlan(provider: string, cachePath?: string): boolean {
+function isCatalogDiscoveredPlan(plan: CachedSubscriptionPlan): boolean {
+  return plan.modelDiscovery === "catalog";
+}
+
+/** Legacy provider-UID membership detection for caches without queryPlans. */
+function isLegacySubscriptionPlan(provider: string, cachePath?: string): boolean {
   const cache = readAllModelsCache(cachePath);
   if (!cache) return false;
   return cache.entries.some((e) => e.subscriptionPlans?.includes(provider));
@@ -252,6 +392,19 @@ function isSubscriptionPlan(provider: string, cachePath?: string): boolean {
  * on modelId or aliases. Shared by lookupModel / lookupModelForProvider.
  * Throws if `modelId` contains "@" — callers must strip the provider prefix.
  */
+/**
+ * The catalog's matching key for a model id: lowercased, vendor prefix dropped.
+ *
+ * `openai/gpt-5.6-sol` and `gpt-5.6-sol` are the SAME model — the prefix is
+ * aggregator routing vocabulary, and OpenRouter's route keeps it on the bare
+ * name (see the vendor-prefix note in proxy-server's getOpenRouterHandler).
+ * Every catalog lookup must apply this rule or it silently misses exactly the
+ * models reached through an aggregator.
+ */
+function stripVendorPrefix(lowerId: string): string {
+  return lowerId.includes("/") ? lowerId.substring(lowerId.lastIndexOf("/") + 1) : lowerId;
+}
+
 function findCacheEntry(modelId: string, cachePath?: string): SlimModelEntry | undefined {
   if (modelId.includes("@")) {
     throw new Error(
@@ -263,8 +416,7 @@ function findCacheEntry(modelId: string, cachePath?: string): SlimModelEntry | u
   if (!cache || cache.entries.length === 0) return undefined;
 
   const lower = modelId.toLowerCase();
-  // Vendor-prefixed IDs like "x-ai/grok-beta" — match on segment after "/"
-  const unprefixed = lower.includes("/") ? lower.substring(lower.lastIndexOf("/") + 1) : lower;
+  const unprefixed = stripVendorPrefix(lower);
 
   for (const entry of cache.entries) {
     const entryId = entry.modelId.toLowerCase();
@@ -287,3 +439,117 @@ export const DEFAULT_CONTEXT_WINDOW = 0;
 
 /** Default vision support when no catalog match */
 export const DEFAULT_SUPPORTS_VISION = true;
+
+/**
+ * One catalog hit for a free-text model search.
+ *
+ * `modelId` is the BARE name routing accepts. `aliases` is the load-bearing
+ * field: subscription endpoints speak their own wire ids (`k3` for `kimi-k3`,
+ * `kimi-for-coding` for `kimi-k2.7-code`), and those ids exist in NO
+ * aggregator's namespace. A search that consults only an aggregator listing
+ * therefore reports them as nonexistent, which reads as "unroutable" and sends
+ * the caller to a metered route instead.
+ */
+export interface CatalogSearchMatch {
+  /** Bare catalog identity — the name to hand to routing. */
+  modelId: string;
+  aliases: string[];
+  /** Subscription plans that include this model, verbatim from the catalog. */
+  subscriptionPlans: string[];
+  /** Set when the query matched an alias rather than the model id itself. */
+  matchedAlias?: string;
+}
+
+/**
+ * How one catalog entry matches a query, or undefined when it does not.
+ *
+ * Split out of {@link searchCatalogModels} so the matching RULE reads on its
+ * own: an id hit and an alias hit are different answers, and only the alias
+ * branch can resolve a subscription wire id to its catalog identity.
+ */
+function classifyCatalogHit(
+  entry: SlimModelEntry,
+  q: string
+): { bucket: "exact" | "id" | "alias"; matchedAlias?: string } | undefined {
+  const id = entry.modelId.toLowerCase();
+  if (id === q || stripVendorPrefix(id) === q) return { bucket: "exact" };
+
+  const aliases = entry.aliases ?? [];
+  const exactAlias = aliases.find(
+    (a) => a.toLowerCase() === q || stripVendorPrefix(a.toLowerCase()) === q
+  );
+  if (exactAlias) return { bucket: "exact", matchedAlias: exactAlias };
+
+  if (id.includes(q)) return { bucket: "id" };
+
+  const partialAlias = aliases.find((a) => a.toLowerCase().includes(q));
+  return partialAlias ? { bucket: "alias", matchedAlias: partialAlias } : undefined;
+}
+
+/**
+ * Search the local catalog cache by model id or alias.
+ *
+ * Deliberately separate from the aggregator-listing search in the MCP server:
+ * that one answers "what does OpenRouter sell", this one answers "what name
+ * does claudish know". Only the second can resolve a subscription wire id.
+ *
+ * Ranking is exact-match first (an exact alias hit is the whole point — it is
+ * how `k3` resolves to `kimi-k3`), then substring hits on the id, then
+ * substring hits on an alias.
+ *
+ * Returns [] for a cold or missing cache. Callers MUST treat that as "no
+ * information" rather than "no such model".
+ */
+export function searchCatalogModels(
+  query: string,
+  limit = 10,
+  cachePath?: string
+): CatalogSearchMatch[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+
+  const cache = readAllModelsCache(cachePath);
+  if (!cache || cache.entries.length === 0) return [];
+
+  type Ranked = { match: CatalogSearchMatch; entry: SlimModelEntry };
+  const exact: Ranked[] = [];
+  const idPartial: Ranked[] = [];
+  const aliasPartial: Ranked[] = [];
+
+  for (const entry of cache.entries) {
+    const hit = classifyCatalogHit(entry, q);
+    if (!hit) continue;
+    const ranked: Ranked = {
+      entry,
+      match: {
+        modelId: entry.modelId,
+        aliases: entry.aliases ?? [],
+        subscriptionPlans: entry.subscriptionPlans ?? [],
+        ...(hit.matchedAlias ? { matchedAlias: hit.matchedAlias } : {}),
+      },
+    };
+    if (hit.bucket === "exact") exact.push(ranked);
+    else if (hit.bucket === "id") idPartial.push(ranked);
+    else aliasPartial.push(ranked);
+  }
+
+  // Partial hits arrive in cache order, which buries the canonical model under
+  // every superseded sibling sharing its family name: "kimi" returned five K2
+  // variants and cut off K3 entirely.
+  //
+  // Rank by SPECIFICITY first, freshness second. Freshness alone is wrong here
+  // because release dates are sparse — `kimi-k3` carries none while its own
+  // derivative `kimi-k3-256k` is dated 2026-07-16, and compareByReleaseDateDesc
+  // reads a missing date as the epoch, so the parent sorts below its variant.
+  // The shortest id containing the query is the one with the least extra
+  // material bolted on, which is what someone typing a family name means.
+  const byRelevance = (a: Ranked, b: Ranked) => {
+    const lengthDelta = a.entry.modelId.length - b.entry.modelId.length;
+    if (lengthDelta !== 0) return lengthDelta;
+    return compareByReleaseDateDesc(a.entry, b.entry);
+  };
+  idPartial.sort(byRelevance);
+  aliasPartial.sort(byRelevance);
+
+  return [...exact, ...idPartial, ...aliasPartial].slice(0, limit).map((r) => r.match);
+}

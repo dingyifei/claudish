@@ -269,7 +269,7 @@ export function isRetryableError(status: number, errorBody: string, provider?: s
       lower.includes("unsupported model") ||
       lower.includes("no healthy deployment") ||
       // Gemini Code Assist config-terminal error (the F1-F7 path returns 400 to
-      // surface it inline for an EXPLICIT go@/ag@ selection). But this handler
+      // surface it inline for an EXPLICIT ag@ selection). But this handler
       // only runs for BARE-NAME auto-routing, where Gemini is just the first
       // candidate — a missing project / revoked-client verdict must advance the
       // chain to the next provider (e.g. OpenRouter), not abort it. When Gemini

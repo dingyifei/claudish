@@ -1,9 +1,16 @@
 {
   "version": 1,
-  "presets": [],
+  "presets": [
+    "asd-ste100",
+    "evidence-first",
+    "no-slop",
+    "structured"
+  ],
   "imports": [
+    "user:builtin-explanatory",
+    "project:terminology",
     "community:lej-output-fixer--walk-me-through-it"
   ],
-  "hash": "sha256:37bd448865af7d65c98d956434100b73",
-  "updatedAt": "2026-08-18T15:22:16.747Z"
+  "hash": "sha256:90c075d8ae463c67891b2293c5cd153a",
+  "updatedAt": "2026-08-26T04:22:46.623Z"
 }

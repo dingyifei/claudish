@@ -60,3 +60,30 @@ const TIER_ALIASES: Record<string, ClaudeTier> = {
 export function claudeCodeTierAlias(model: string): ClaudeTier | null {
   return TIER_ALIASES[model.trim().toLowerCase()] ?? null;
 }
+
+/**
+ * Normalize a `--model` value so a native-Anthropic SELECTOR becomes a name
+ * Claude Code actually recognises.
+ *
+ * `internal` and `default` are selectors, not model ids. Claude Code rejects
+ * them outright — measured 2026-08-22, `claudish --model internal --stdin`
+ * exits 1 with `[claude-code:unrecognized_model] {"model":"internal"}` and
+ * "There's an issue with the selected model (internal)". The TIER they select
+ * IS recognised: the same command with `--model opus` exits 0. So the fix is to
+ * hand Claude Code the tier and let IT resolve the tier to the current model —
+ * no id is pinned here, which is what the no-hardcoded-model-data rule requires.
+ * (`--model claude-opus-4-1` also exits 0, but only because Claude Code remaps
+ * it: "automatically remapped to Opus 5". Pinning ids is how the probe's
+ * hardcoded default rotted; the tier cannot rot.)
+ *
+ * Everything else passes through untouched — `claude-*` ids are already valid,
+ * and an explicit `provider@model` spec is not in the alias table at all.
+ *
+ * Applied at the `--model` parse boundary, so EVERY consumer sees the
+ * normalized value: the proxy's native branch, the env handed to Claude Code,
+ * `team` children, and `create_session` children (both spawn `claudish
+ * --model X`, and that child normalizes at its own boundary).
+ */
+export function normalizeNativeModelSpec(spec: string): string {
+  return claudeCodeTierAlias(spec) ?? spec;
+}

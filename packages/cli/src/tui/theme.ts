@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/react */
 import { createTextAttributes } from "@opentui/core";
-import { onThemeModeChange } from "../theme/theme-mode.js";
+import { getTerminalBackground, onThemeModeChange } from "../theme/theme-mode.js";
 
 /**
  * The TUI palette — TWO palettes, selected by the detected terminal theme.
@@ -352,11 +352,104 @@ export function registerPaletteRefresher(fn: () => void): void {
   fn();
 }
 
+/**
+ * The NEUTRAL SURFACES — tokens whose only job is to sit a measured shade away
+ * from the page. When the page moves, these must move with it or the seam the
+ * page adoption removed simply reappears one box further in.
+ *
+ * Deliberately excluded: `bgHighlight` (blue selection wash) and `bgError` (red
+ * failure wash) carry their meaning in their HUE, and `tabActiveBg` / the pill
+ * fills are accents. Re-tinting those would erase the signal they exist to send.
+ */
+const SURFACE_TOKENS = ["bgAlt", "border", "tabInactiveBg", "chipKeyBg", "chipLabelBg"] as const;
+
+/** `#rrggbb` → `[r, g, b]`, or null for anything that isn't one. */
+function hexChannels(hex: string): [number, number, number] | null {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 16);
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+}
+
+/** `[r, g, b]` → `#rrggbb`, clamping each channel into range. */
+function channelsToHex(c: [number, number, number]): string {
+  const hex = c
+    .map((v) =>
+      Math.max(0, Math.min(255, Math.round(v)))
+        .toString(16)
+        .padStart(2, "0")
+    )
+    .join("");
+  return `#${hex}`;
+}
+
+/**
+ * Re-express every neutral surface in the PAGE's colour, by transplanting the
+ * per-channel offset it has from the palette's own page colour.
+ *
+ * OFFSETS, not ratios. DARK's page is `#000000`, and a ratio against zero is
+ * undefined — every derived surface would collapse back to black. The offset
+ * form (`#111111 − #000000 = +17,+17,+17`) works unchanged in both palettes.
+ *
+ * The offset IS the tuning: the palette author chose how far the band sits from
+ * the page, and that distance is preserved channel-for-channel. Only the hue it
+ * is expressed in changes. On a cream terminal `bgAlt` stops being a grey slab
+ * (`#f3f4f6`) and becomes a deeper cream, which is what "quiet band" meant all
+ * along — the grey was only ever standing in for "slightly darker than white".
+ *
+ * Byte-identical when the page equals the palette's own page: the offset then
+ * re-creates the original token exactly, so a plain white or plain black
+ * terminal renders as it did before this existed.
+ */
+function retintSurfaces(palette: TuiPalette, pageHex: string): void {
+  const paletteBg = hexChannels(palette.bg);
+  const page = hexChannels(pageHex);
+  if (!paletteBg || !page) return;
+  for (const token of SURFACE_TOKENS) {
+    const original = hexChannels(palette[token]);
+    if (!original) continue;
+    C[token] = channelsToHex([
+      page[0] + (original[0] - paletteBg[0]),
+      page[1] + (original[1] - paletteBg[1]),
+      page[2] + (original[2] - paletteBg[2]),
+    ]);
+  }
+}
+
 function applyTuiTheme(mode: "light" | "dark" | null): void {
   // Unknown stays DARK — the pre-light-theme status quo, never a guess.
   const palette = mode === "light" ? LIGHT : DARK;
   activeLatencyBuckets = mode === "light" ? LATENCY_BUCKETS_LIGHT : LATENCY_BUCKETS_DARK;
   Object.assign(C, palette);
+  // PAGE COLOUR = the terminal's own background, when the OSC 11 query answered.
+  //
+  // The palettes hardcode `#ffffff` / `#000000`, which is the right light/dark
+  // CLASS but rarely the right shade: on a cream terminal the TUI painted a
+  // white slab inside it, and the seam was obvious at every edge. Adopting the
+  // measured colour makes the page indistinguishable from the terminal while
+  // keeping `C.bg` OPAQUE — which it must stay, because the 1Password
+  // add-wizard is an absolute overlay that relies on it to cover the list
+  // beneath (a transparent page would show the list through the modal).
+  //
+  // The NEUTRAL SURFACES move with it (`retintSurfaces`). Adopting the page
+  // alone was not enough: the header, footer and detail panels are painted in
+  // `bgAlt`, a grey that only ever meant "a shade off white", so on a cream
+  // terminal the seam did not disappear — it moved inward, and every panel
+  // became a grey slab floating on cream. The washes that carry meaning in
+  // their hue (`bgHighlight`, `bgError`) and the accent fills stay put.
+  //
+  // Safe by construction: the mode was classified from THIS colour's luminance,
+  // so the palette's foregrounds were already chosen against it.
+  // Adopted ONLY when the colour's own luminance agrees with the mode being
+  // published. The mode can arrive from OpenTUI's handshake, COLORFGBG or an
+  // explicit CLAUDISH_THEME — none of which know about this colour — and cream
+  // under dark-mode foregrounds is unreadable, which is strictly worse than the
+  // hardcoded page this replaces.
+  const terminalBg = getTerminalBackground();
+  if (terminalBg && terminalBg.mode === mode) {
+    C.bg = terminalBg.hex;
+    retintSurfaces(palette, terminalBg.hex);
+  }
   Object.assign(STAGE_BG, mode === "light" ? STAGE_BG_LIGHT : STAGE_BG_DARK);
   STAGE_BG_ANSI.network = hexToAnsiBg(STAGE_BG.network);
   STAGE_BG_ANSI.server = hexToAnsiBg(STAGE_BG.server);

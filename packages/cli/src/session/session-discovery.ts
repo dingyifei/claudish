@@ -20,7 +20,7 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -42,6 +42,35 @@ export const PROJECTS_DIR = join(homedir(), ".claude", "projects");
  */
 export function slugForPath(absPath: string): string {
   return absPath.replace(/[/.]/g, "-");
+}
+
+/**
+ * Where Claude Code will write the transcript for a session running in `cwd`
+ * under `sessionUuid`. Both halves are known before the child starts — claudish
+ * mints the uuid and passes it as `--session-id` — so this is a derivation, not
+ * a search by mtime.
+ *
+ * **The slug is taken from the REALPATH.** Claude Code resolves symlinks before
+ * slugging, and every other caller here starts from a path git handed it, which
+ * is already real. A path that came from a user (`work_dir`, `process.cwd()`
+ * inside a symlinked worktree, anything under macOS `/tmp` → `/private/tmp`)
+ * has not been resolved, and its raw slug names a directory that does not
+ * exist. That is exactly how the two silent-success sessions' transcripts were
+ * declared "missing": they were under the session's own `work_dir`, in a
+ * project directory nobody thought to look in.
+ *
+ * Falls back to the path as given when it cannot be resolved — a cwd that has
+ * since been deleted should still produce the best guess available, not null.
+ */
+export function transcriptPathFor(cwd: string, sessionUuid: string): string {
+  let real = cwd;
+  try {
+    real = realpathSync(cwd);
+  } catch {
+    // Deleted, unreadable, or never existed. The unresolved slug is still the
+    // right answer whenever no symlink was involved.
+  }
+  return join(PROJECTS_DIR, slugForPath(real), `${sessionUuid}.jsonl`);
 }
 
 /** A resumable session. Fields below `sizeBytes` are absent until `hydrateSession`. */

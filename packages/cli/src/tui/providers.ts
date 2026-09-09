@@ -26,14 +26,6 @@ export interface ProviderDef {
   aliases?: string[];
   isLocal?: boolean;
   /**
-   * If set, the provider is usable WITHOUT any user credential — it ships a
-   * built-in public/free key (e.g. OpenCode Zen). Sourced from the catalog's
-   * `publicKeyFallback`. Such a provider is "ready" even with no env/cfg key,
-   * which is why the readiness/source logic must treat it specially (else it
-   * lands under "not configured" yet probes green — the OpenCode Zen bug).
-   */
-  publicKeyFallback?: boolean;
-  /**
    * If set, this provider supports OAuth login via `claudish login {slug}`.
    * Used by the Providers tab `l` keybinding.
    *
@@ -62,7 +54,6 @@ function toProviderDef(def: ProviderDefinition): ProviderDef {
     defaultEndpoint: def.baseUrl || undefined,
     aliases: def.apiKeyAliases,
     isLocal: def.isLocal,
-    publicKeyFallback: !!def.publicKeyFallback,
     // Sourced from the catalog (provider-definitions.ts), not a duplicate
     // table here. If a provider supports `claudish login {slug}`, the
     // catalog entry declares which slug.
@@ -99,7 +90,7 @@ export function providerAuthSource(
  * The "is this provider authenticated?" decision is routed through the unified
  * credential authority (auth/credentials/authority.js) — the same oracle routing
  * uses (hasCredentialsForProvider). The authority additionally honors the
- * catalog's publicKeyFallback / oauthFallback affordances and any OAuth alias
+ * catalog's oauthFallback affordance, `authScheme: "none"`, and any OAuth alias
  * (e.g. the "google" catalog name resolves to the Gemini Code Assist OAuth
  * credential), so a provider the authority considers authenticated is ready here.
  *
@@ -142,8 +133,8 @@ export function providerIsReady(
  * — even if the user hasn't config-enabled it yet (e.g. a freshly-started
  * Ollama). Without this, a running-but-not-enabled local shows STATUS "running"
  * while sitting BELOW the not-configured divider with a hollow dot — the same
- * source-vs-readiness divergence the publicKeyFallback fix removed for keyless
- * providers.
+ * source-vs-readiness divergence that the (since-removed) publicKeyFallback
+ * affordance was once introduced to fix for keyless providers.
  *
  * `localLiveness` is keyed by catalogName; pass {} when liveness is unknown
  * (collapses to plain providerIsReady).

@@ -153,6 +153,11 @@ export function Footer({ activeTab, mode, probeMode, providerCaps }: FooterProps
       [C.blue, "↑↓", "navigate"],
       [C.green, "a", "add"],
       [C.cyan, "t", "test"],
+      // c / C copy resolved secrets into the macOS Keychain. Shown together
+      // because the pair is only legible as a pair — "copy" alone reads as
+      // clipboard, and "copy all" alone hides the per-entry action.
+      [C.magenta, "c", "→keychain"],
+      [C.magenta, "C", "all→keychain"],
       [C.green, "o", "account"],
       [C.red, "x", "remove"],
       [C.blue, "Tab", "section"],

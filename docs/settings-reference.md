@@ -90,6 +90,47 @@ These are top-level subcommands recognized before flag parsing begins (checked i
 | `claudish telemetry off` | Disable telemetry |
 | `claudish telemetry status` | Show current telemetry consent and configuration |
 | `claudish telemetry reset` | Reset telemetry consent to unasked state |
+| `claudish keychain status` | macOS Keychain backend state and how many keys are stored |
+| `claudish keychain list` | Stored variables, with `••••1234` identification tails (never full values) |
+| `claudish keychain import [opts]` | Copy keys from environment variables and/or 1Password into the Keychain |
+| `claudish keychain set <ENV_VAR>` | Store one key — prompted, or piped on stdin; never passed in argv |
+| `claudish keychain rm <ENV_VAR>` | Remove one key from the Keychain |
+| `claudish keychain enable\|disable` | Turn the backend on/off. Moves no secrets; stored items are left untouched |
+
+**macOS Keychain (macOS only).** Keys are stored as one generic-password item per environment
+variable under the service name `claudish`, so each is individually visible and deletable in
+Keychain Access.app. The Keychain is consulted **after** `config.json` and **before** 1Password —
+it is local and needs no desktop-app handshake, but an explicit environment variable or a
+config-stored key still wins.
+
+`claudish keychain import` options:
+
+| Option | Meaning |
+|---|---|
+| `--from env\|1password\|all` | Which source to copy from (default `all`) |
+| `--only VAR,VAR` | Restrict to these variables |
+| `--dry-run` | Print the plan and stop; writes nothing |
+| `--yes` | Skip the confirmation prompt |
+
+Import prints a plan marking each key `new` / `overwrite` / `unchanged` and asks before writing,
+because an overwritten Keychain value cannot be recovered. Environment variables are collected
+first and 1Password fills only the gaps, matching runtime precedence.
+
+The config TUI's **Providers** tab writes to the Keychain by default on macOS: `s` stores a key
+there (the input box names the destination), and `x` removes the key from both the Keychain and
+`config.json`.
+
+The config TUI's **1Password** tab can copy secrets across without leaving the interface:
+
+| Key | Action |
+|---|---|
+| `c` | Copy the selected entry into the Keychain — a key becomes one item, a set or an environment becomes one item per variable |
+| `C` | Copy **every** 1Password entry into the Keychain (the equivalent of `claudish keychain import --from 1password`) |
+
+Both **overwrite** an existing Keychain item without a confirmation prompt. That is deliberate:
+1Password still holds every value, so a replaced item is a refresh rather than a loss. The status
+line reports exactly what happened — `3 new · 1 replaced` — and names any variable that could not
+be stored.
 
 **Scope flags for profile commands**:
 - `--local`: Target `.claudish.json` in the current working directory
@@ -118,6 +159,7 @@ Claudish automatically loads `.env` from the current working directory at startu
 | `CLAUDISH_CLASSIFIER_MODEL` | Native Claude model the classifier request is rewritten onto; setting it also enables classifier passthrough | derived Sonnet tier |
 | `CLAUDISH_CLASSIFIER_DEBUG` | Set to `1` to append **every** incoming request's model/params/**unredacted `system` array**/headers to `logs/classifier-capture.jsonl`. The `system` array is your full system prompt (`CLAUDE.md`, project rules, output styles) — review before sharing | none (off) |
 | `CLAUDISH_SUMMARIZE_TOOLS` | Summarize tool descriptions (`true` or `1` to enable) | false |
+| `CLAUDISH_KEYCHAIN_FILE` | Point every macOS Keychain operation at a specific keychain FILE instead of your login keychain. Intended for testing — create one with `security create-keychain` (it is not added to the search list, so nothing else on the machine is affected) | none (login keychain) |
 | `CLAUDISH_TELEMETRY` | Override telemetry (`0`, `false`, or `off` to disable) | from config |
 | `CLAUDISH_ACTIVE_MODEL_NAME` | (Internal) Set by Claudish to display model name in status line | auto |
 | `CLAUDISH_IS_LOCAL` | (Internal) Set to `"true"` for local models; used by status line to show "LOCAL" instead of cost | auto |
@@ -163,7 +205,8 @@ Claudish automatically loads `.env` from the current working directory at startu
 | `SAKANA_API_KEY` | Sakana Fugu API / token plan (`sakana@`, `fugu@`) | | https://console.sakana.ai/get-started |
 | `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` | https://console.sakana.ai/get-started |
 | `OLLAMA_API_KEY` | OllamaCloud hosted API (`oc@`, `llama@`, `lc@`, `meta@`) | | https://ollama.com/account |
-| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`); optional for free models (falls back to `"public"` bearer) | | https://opencode.ai/ |
+| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) — **required** | | https://opencode.ai/ |
+| `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`, `zengo@`) — **required** | | https://opencode.ai/ |
 | `XAI_API_KEY` | xAI / Grok (direct API, detected in model selector) | | https://x.ai/ |
 | `LITELLM_API_KEY` | LiteLLM proxy (`ll@`, `litellm@`) | | https://docs.litellm.ai/ |
 | `POE_API_KEY` | Poe (`poe@`) | | https://poe.com/ |
@@ -177,7 +220,9 @@ Claudish automatically loads `.env` from the current working directory at startu
 - Express mode (`VERTEX_API_KEY`): Uses the Gemini API endpoint; supports Gemini models only.
 - OAuth mode (`VERTEX_PROJECT` + Application Default Credentials via `gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`): Supports all Vertex models including partner models (Anthropic Claude, Mistral, etc.).
 
-**Note on OpenCode Zen**: Free-tier models (cost.input === 0) work without any API key; Claudish automatically uses `"Bearer public"`. Paid models on the zen endpoint require `OPENCODE_API_KEY`.
+**Note on OpenCode Zen (changed 2026-08-22)**: `OPENCODE_API_KEY` is now **required** for every model on the zen endpoint. Claudish previously sent `"Bearer public"` when no key was set, on the basis that free-tier models (cost.input === 0) needed no credential. The endpoint answers `401 — Missing API key` to that token, and because the fallback also made the provider report **Ready** without ever issuing a request, the failure only surfaced under a live test. The fallback has been removed; a Zen row with no key now correctly reads "not set".
+
+**Note on OpenCode Zen Go (changed 2026-09-02)**: `zgo@` used to accept `OPENCODE_API_KEY` as an alias, on the documented claim that a key minted for one OpenCode tier is refused by the other with a `401`. That claim was measured and is false — a Zen Go key is accepted by the plain Zen endpoint (`200`), against a bogus-key control that endpoint answers `401`. The alias is removed: `zgo@` requires `OPENCODE_GO_API_KEY`. The reason is billing, not access — `opencode-zen-go` is classified as a flat-rate plan, so a metered Zen key reaching it would have been reported as `SUB` at `$0` while OpenCode billed per token. If you previously ran `zgo@` on `OPENCODE_API_KEY`, set `OPENCODE_GO_API_KEY` to the key your Lite Plan subscription minted.
 
 ### 3.4 Custom Endpoints (Remote Providers)
 
@@ -267,6 +312,7 @@ These are only needed if you want to use your own Google Cloud OAuth application
 - **`defaultProfile`**: Name of the profile to use when `--profile` is not specified.
 - **`defaultProvider`** (v7.0.0+): Default provider for auto-routing. Accepts built-in provider names (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name. See Section 6.1 for precedence. Absent means use legacy auto-detection.
 - **`customEndpoints`** (v7.0.0+): Named map of custom endpoint definitions. See Section 7.5 for schema.
+- **`keychain`** (macOS): `{ "enabled": true }` turns on the macOS Keychain credential backend. It records only that the backend is in USE — the stored variable names are deliberately not mirrored here, because the Keychain enumerates its own contents and a second copy of that list is a second thing that can go stale. Set automatically on the first successful write; `claudish keychain disable` clears it without removing any stored item. When absent or `false`, claudish performs no Keychain I/O at all.
 - **`profiles`**: Map of profile name to profile object. Each profile has:
   - **`name`**: Profile identifier (matches the map key).
   - **`description`**: Optional human-readable description.
@@ -325,6 +371,11 @@ which file the 1Password sources are read from. An override file that names no `
 no 1Password sources at all, so the lazy SDK gate never opens and no auth prompt appears. An
 override file that *does* name an `op://` ref resolves it normally.
 
+The same rule applies to the macOS Keychain: the override changes which file the `keychain.enabled`
+flag is read from. An override file without that flag performs no Keychain I/O; one with it reads
+the same machine Keychain as usual. (To redirect the Keychain itself — for testing — use
+`CLAUDISH_KEYCHAIN_FILE`, which is a separate axis from `--config`.)
+
 ---
 
 ## 5. Provider Routing Syntax
@@ -364,8 +415,8 @@ Provider part is **case-insensitive**. Shortcuts are resolved to canonical provi
 | `sakana`, `fugu` | `sakana` | Sakana Fugu API / token plan (`SAKANA_API_KEY`) |
 | `sc` | `sakana-coding` | Sakana Fugu Subscription (`SAKANA_CODING_API_KEY` or `SAKANA_API_KEY`) |
 | `oc`, `llama`, `lc`, `meta` | `ollamacloud` | OllamaCloud hosted API (`OLLAMA_API_KEY`) |
-| `zen` | `opencode-zen` | OpenCode Zen (`OPENCODE_API_KEY`; optional for free models) |
-| `zengo`, `zgo` | `opencode-zen-go` | OpenCode Zen Go subscription plan |
+| `zen` | `opencode-zen` | OpenCode Zen (`OPENCODE_API_KEY` required) |
+| `zengo`, `zgo` | `opencode-zen-go` | OpenCode Zen Go subscription plan (`OPENCODE_GO_API_KEY` required) |
 | `v`, `vertex` | `vertex` | Vertex AI (`VERTEX_API_KEY` or `VERTEX_PROJECT`) |
 | `mistral` | `mistralai` | Direct Mistral API (`MISTRAL_API_KEY`) |
 | `ag`, `antigravity` | `antigravity` | Gemini via your Antigravity subscription (`claudish login antigravity`) |
@@ -412,7 +463,6 @@ The old `prefix/model` format works but emits a deprecation warning suggesting t
 | `g/` | Google Gemini | `g@` |
 | `gemini/` | Google Gemini | `gemini@` |
 | `ag/`, `antigravity/` | Antigravity (Gemini subscription) | `ag@` |
-| `go/` | _deprecated alias → Antigravity_ | `go@` |
 | `oai/` | OpenAI | `oai@` |
 | `or/` | OpenRouter | `or@` |
 | `mmax/`, `mm/` | MiniMax | `mm@` |
@@ -669,7 +719,7 @@ Each valid custom endpoint calls `registerRuntimeProvider()` (injects into the p
 
 25 vendors ship inside the package as a bundled catalog (`providers/predefined-catalog.ts`). Each row compiles into exactly the complex `customEndpoints` entry documented above and travels the same registration path — there is no separate transport or provider table.
 
-**A bundled row activates only when its key is already present locally** — the vendor's own env var (e.g. `GROQ_API_KEY`), one of its aliases, `CUSTOM_<NAME>_KEY`, or `config.apiKeys`. The check is synchronous and cannot reach 1Password, so a key stored *only* behind an `op://` reference will not make its vendor appear; use `enable` below, or export the variable.
+**A bundled row activates only when its key is already present locally** — the vendor's own env var (e.g. `GROQ_API_KEY`), one of its aliases, `CUSTOM_<NAME>_KEY`, `config.apiKeys`, or (on macOS, when the backend is enabled) the **Keychain**. The check is synchronous. The Keychain qualifies because presence for every vendor is answered by a single enumeration rather than a lookup per vendor; 1Password cannot be reached synchronously at all, so a key stored *only* behind an `op://` reference will not make its vendor appear — use `enable` below, export the variable, or copy it into the Keychain with `claudish keychain import`.
 
 ```json
 {

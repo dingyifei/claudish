@@ -16,6 +16,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { UPSTREAM_ERROR_LOG_ENV } from "./handlers/shared/upstream-error-capture.js";
 import type { ModelStatus, TeamManifest, TeamStatus, VoteResult } from "./team-orchestrator.js";
 
 // ─── Dynamic imports (resolved at runtime so the module doesn't need to exist
@@ -45,6 +46,7 @@ async function withFakeClaudish<T>(
   const originalPath = process.env.PATH;
   const originalClaudishBin = process.env.CLAUDISH_BIN;
   const originalCaptureMode = process.env.CLAUDISH_TEAM_CAPTURE;
+  const originalUpstreamErrorLog = process.env[UPSTREAM_ERROR_LOG_ENV];
   const shimDir = mkdtempSync(join(tmpdir(), "team-orchestrator-shim-"));
   const helperPath = join(
     dirname(fileURLToPath(import.meta.url)),
@@ -62,6 +64,7 @@ async function withFakeClaudish<T>(
     // default-mode assertion depend on the developer's shell.
     delete process.env.CLAUDISH_BIN;
     delete process.env.CLAUDISH_TEAM_CAPTURE;
+    delete process.env[UPSTREAM_ERROR_LOG_ENV];
     process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
     return await callback(helperPath);
   } finally {
@@ -75,6 +78,11 @@ async function withFakeClaudish<T>(
       delete process.env.CLAUDISH_TEAM_CAPTURE;
     } else {
       process.env.CLAUDISH_TEAM_CAPTURE = originalCaptureMode;
+    }
+    if (originalUpstreamErrorLog === undefined) {
+      delete process.env[UPSTREAM_ERROR_LOG_ENV];
+    } else {
+      process.env[UPSTREAM_ERROR_LOG_ENV] = originalUpstreamErrorLog;
     }
     rmSync(shimDir, { recursive: true, force: true });
   }
@@ -273,57 +281,76 @@ describe("team-orchestrator", () => {
     });
   });
 
-  // ── Sentinel model rejection ────────────────────────────────────────────
-  // REGRESSION: sentinel model names leaked to claudish child processes — Fixed in /dev:fix session dev-fix-20260406-131846-32b9662c
+  // ── Native model slots ─────────────────────────────────────────────────────
+  // Was "sentinel model rejection" (91ee9a8). That guard existed because
+  // `internal`/`default` reached Claude Code as literal model names and it
+  // "failed with cryptic model not found errors". The cause is fixed at the
+  // `--model` boundary now (normalizeNativeModelSpec), and a native name is a
+  // runnable slot — verified end to end: a team run with ["internal"] completed
+  // exit 0 having spawned `claudish --model opus …`, and the same run with a
+  // prompt that produced no vote block was reported EMPTY/shape_mismatch rather
+  // than succeeded. Rejecting here would put the internal reviewer back outside
+  // requirePattern, which is the guard that catches a voter that never voted.
 
-  describe("setupSession — sentinel model rejection", () => {
-    it("TEST-17: rejects 'internal' sentinel model", async () => {
+  describe("setupSession — native model slots", () => {
+    it("TEST-NS-01: accepts 'internal' as a runnable slot", async () => {
       const { setupSession } = await getOrchestrator();
 
-      expect(() => setupSession(tempDir, ["internal"], "task")).toThrow(/internal/i);
+      const manifest = setupSession(tempDir, ["internal"], "task");
+      expect(Object.values(manifest.models).map((m) => m.model)).toEqual(["internal"]);
     });
 
-    it("TEST-18: rejects 'default' sentinel model", async () => {
+    it("TEST-NS-02: accepts 'default' as a runnable slot", async () => {
       const { setupSession } = await getOrchestrator();
 
-      expect(() => setupSession(tempDir, ["default"], "task")).toThrow(/default/i);
+      const manifest = setupSession(tempDir, ["default"], "task");
+      expect(Object.values(manifest.models).map((m) => m.model)).toEqual(["default"]);
     });
 
-    it("TEST-19: rejects Claude tier sentinels (opus, sonnet, haiku)", async () => {
+    it("TEST-NS-03: accepts Claude tier names (opus, sonnet, haiku)", async () => {
       const { setupSession } = await getOrchestrator();
 
-      expect(() => setupSession(tempDir, ["opus"], "task")).toThrow(/opus/i);
-      expect(() => setupSession(tempDir, ["sonnet"], "task")).toThrow(/sonnet/i);
-      expect(() => setupSession(tempDir, ["haiku"], "task")).toThrow(/haiku/i);
+      const manifest = setupSession(tempDir, ["opus", "sonnet", "haiku"], "task");
+      expect(
+        Object.values(manifest.models)
+          .map((m) => m.model)
+          .sort()
+      ).toEqual(["haiku", "opus", "sonnet"]);
     });
 
-    it("TEST-20: rejects claude-* model IDs", async () => {
+    it("TEST-NS-04: accepts claude-* model IDs", async () => {
       const { setupSession } = await getOrchestrator();
 
-      expect(() => setupSession(tempDir, ["claude-sonnet-4-6"], "task")).toThrow(
-        /claude-sonnet-4-6/i
+      const manifest = setupSession(
+        tempDir,
+        ["claude-sonnet-4-6", "claude-3-opus-20240229"],
+        "task"
       );
-      expect(() => setupSession(tempDir, ["claude-3-opus-20240229"], "task")).toThrow(
-        /claude-3-opus/i
-      );
+      expect(Object.values(manifest.models).map((m) => m.model)).toEqual([
+        "claude-sonnet-4-6",
+        "claude-3-opus-20240229",
+      ]);
     });
 
-    it("TEST-21: rejects sentinels case-insensitively", async () => {
+    it("TEST-NS-05: preserves the caller's casing as the slot identity", async () => {
       const { setupSession } = await getOrchestrator();
 
-      expect(() => setupSession(tempDir, ["Internal"], "task")).toThrow(/Internal/i);
-      expect(() => setupSession(tempDir, ["OPUS"], "task")).toThrow(/OPUS/i);
+      // The manifest is the run's identity and is echoed back in status//errors,
+      // so it keeps the string the caller passed. Normalization happens in the
+      // CHILD, at its own --model boundary.
+      const manifest = setupSession(tempDir, ["Internal"], "task");
+      expect(Object.values(manifest.models).map((m) => m.model)).toEqual(["Internal"]);
     });
 
-    it("TEST-22: rejects mixed arrays containing sentinels alongside valid models", async () => {
+    it("TEST-NS-06: accepts a native slot alongside external models in one manifest", async () => {
       const { setupSession } = await getOrchestrator();
 
-      expect(() =>
-        setupSession(tempDir, ["gemini-2.0-flash", "internal", "gpt-4o"], "task")
-      ).toThrow(/internal/i);
+      const manifest = setupSession(tempDir, ["gemini-2.0-flash", "internal", "gpt-4o"], "task");
+      expect(Object.keys(manifest.models)).toHaveLength(3);
+      expect(Object.values(manifest.models).map((m) => m.model)).toContain("internal");
     });
 
-    it("TEST-23: accepts valid external model names", async () => {
+    it("TEST-NS-07: accepts valid external model names", async () => {
       const { setupSession } = await getOrchestrator();
 
       // These should NOT throw
@@ -404,7 +431,6 @@ describe("team-orchestrator", () => {
       await withFakeClaudish("fake-claudish.ts", async () => {
         setupSession(tempDir, ["vendor/model"], "Analyze this input");
         const status = await runModels(tempDir, {
-          timeout: 5,
           claudeFlags: ["--print-argv"],
           spawnPlanner,
         });
@@ -449,7 +475,6 @@ describe("team-orchestrator", () => {
       await withFakeClaudish("fake-claudish.ts", async () => {
         setupSession(tempDir, ["vendor/model"], "Analyze this input");
         const status = await runModels(tempDir, {
-          timeout: 5,
           captureMode: "print",
           claudeFlags: ["--print-argv"],
           spawnPlanner,
@@ -464,6 +489,55 @@ describe("team-orchestrator", () => {
         expect(argv).toContain("--quiet");
         expect(argv).not.toContain("--output-format");
         expect(argv).not.toContain("--verbose");
+      });
+    });
+
+    it("gives every model slot its own upstream-error log path", async () => {
+      const { runModels, setupSession } = await getOrchestrator();
+      const spawnPlanner = mock(async () => ({ pinned: new Map<string, string>() }));
+
+      await withFakeClaudish("fake-claudish.ts", async () => {
+        setupSession(tempDir, ["vendor/model-a", "vendor/model-b"], "Analyze this input");
+        const status = await runModels(tempDir, {
+          claudeFlags: ["--print-env", UPSTREAM_ERROR_LOG_ENV],
+          spawnPlanner,
+        });
+
+        const manifest = readJson<TeamManifest>(join(tempDir, "manifest.json"));
+        const paths = Object.keys(manifest.models).map((anonId) => {
+          expect(status.models[anonId].state).toBe("COMPLETED");
+          const childEnv = JSON.parse(
+            readFileSync(join(tempDir, `response-${anonId}.md`), "utf-8").trim()
+          ) as Record<string, string | null>;
+          const path = childEnv[UPSTREAM_ERROR_LOG_ENV];
+
+          expect(path).toBe(join(tempDir, "errors", `${anonId}-upstream.jsonl`));
+          expect(dirname(path!)).toBe(join(tempDir, "errors"));
+          expect(path).toContain(anonId);
+          return path;
+        });
+
+        expect(new Set(paths).size).toBe(paths.length);
+      });
+    });
+
+    it("omits upstreamErrorLogPath from a recorded error when the child wrote no file", async () => {
+      const { runModels, setupSession } = await getOrchestrator();
+      const spawnPlanner = mock(async () => ({ pinned: new Map<string, string>() }));
+
+      await withFakeClaudish("fake-claudish.ts", async () => {
+        setupSession(tempDir, ["vendor/failing-model"], "Analyze this input");
+        await runModels(tempDir, {
+          claudeFlags: ["--fail"],
+          spawnPlanner,
+        });
+
+        const recorded = readJson<TeamStatus>(join(tempDir, "status.json"));
+        const [anonId, modelStatus] = Object.entries(recorded.models)[0];
+        expect(modelStatus.state).toBe("FAILED");
+        expect(modelStatus.error).toBeDefined();
+        expect(modelStatus.error).not.toHaveProperty("upstreamErrorLogPath");
+        expect(existsSync(join(tempDir, "errors", `${anonId}-upstream.jsonl`))).toBe(false);
       });
     });
   });
@@ -490,7 +564,6 @@ describe("team-orchestrator", () => {
         const recoveredDir = join(tempDir, "recovered");
         setupSession(recoveredDir, ["vendor/model"], input);
         const recoveredStatus = await runModels(recoveredDir, {
-          timeout: 5,
           requirePattern: "```vote",
           spawnPlanner,
         });
@@ -512,7 +585,6 @@ describe("team-orchestrator", () => {
         const printDir = join(tempDir, "print");
         setupSession(printDir, ["vendor/model"], input);
         const printStatus = await runModels(printDir, {
-          timeout: 5,
           captureMode: "print",
           requirePattern: "```vote",
           spawnPlanner,

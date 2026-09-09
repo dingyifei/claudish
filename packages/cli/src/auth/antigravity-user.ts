@@ -16,11 +16,48 @@
 import { log } from "../logger.js";
 
 /**
- * The Antigravity backend. Same host the retired Code Assist path used — the
- * split was never about the endpoint, it was about which OAuth client minted
- * the token.
+ * The Antigravity backend host.
+ *
+ * IT IS A DIFFERENT HOST FROM CODE ASSIST'S, and that is the whole point.
+ *
+ * `ag@` was built from the remains of the removed `gemini-codeassist` provider
+ * (v7.36.0). The token was swapped to Antigravity's; the HOST was kept, under a
+ * comment asserting "the split was never about the URL, it was about which
+ * OAuth client minted the token." That assertion was wrong, and it cost a full
+ * debugging session: presenting an Antigravity token to `cloudcode-pa` gets you
+ * answered AS Code Assist — the product Google retired for individuals.
+ *
+ * Measured 2026-08-24, one Google AI Ultra account, same token, same project,
+ * same model, only the host varying:
+ *
+ *     cloudcode-pa.googleapis.com        generate gemini-3.6-flash-high -> 429
+ *     daily-cloudcode-pa.googleapis.com  generate gemini-3.6-flash-high -> 200
+ *
+ * On `cloudcode-pa` that account reads `currentTier: free-tier`, is served a
+ * roster of `gemini-2.5-*` and editor-internal `chat_*`/`tab_*` ids, reports
+ * every quota bucket at 100% forever (nothing is ever consumed), and can
+ * generate with EXACTLY the two `tab_*` completion models — free Code Assist's
+ * remaining entitlement — while all 28 chat models return a contentless
+ * `RESOURCE_EXHAUSTED`. None of that is a rate limit; it is the wrong product.
+ *
+ * `agy` 1.1.18 has never called anything else: 2,822 requests across 73 log
+ * files spanning a week, 100% to `daily-`, 0% to `cloudcode-pa`.
+ *
+ * `AICODE_ENDPOINT_URL` is the override `agy` itself reads, kept so a user on a
+ * different release track can point claudish wherever their own CLI goes.
  */
-const ANTIGRAVITY_API_BASE = "https://cloudcode-pa.googleapis.com/v1internal";
+const ANTIGRAVITY_DEFAULT_HOST = "https://daily-cloudcode-pa.googleapis.com";
+
+/** Resolve the backend host at CALL time, so the override is honoured. */
+export function antigravityHost(): string {
+  const override = process.env.AICODE_ENDPOINT_URL?.trim();
+  return override ? override.replace(/\/+$/, "") : ANTIGRAVITY_DEFAULT_HOST;
+}
+
+/** `<host>/v1internal` — the prefix every Antigravity call shares. */
+function apiBase(): string {
+  return `${antigravityHost()}/v1internal`;
+}
 
 /**
  * The served set changes on the daily-quota cadence, not per request, and both
@@ -78,7 +115,7 @@ export function resetAntigravityUserCache(): void {
 
 /** loadCodeAssist with the Antigravity identity (minimal `{ ideType }` metadata). */
 async function callLoadCodeAssistAntigravity(accessToken: string): Promise<LoadCodeAssistResponse> {
-  const res = await fetch(`${ANTIGRAVITY_API_BASE}:loadCodeAssist`, {
+  const res = await fetch(`${apiBase()}:loadCodeAssist`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -190,7 +227,7 @@ export async function retrieveUserQuota(
   projectId: string
 ): Promise<{ buckets?: QuotaBucket[] } | null> {
   try {
-    const res = await fetch(`${ANTIGRAVITY_API_BASE}:retrieveUserQuota`, {
+    const res = await fetch(`${apiBase()}:retrieveUserQuota`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -224,6 +261,29 @@ interface FetchAvailableModelsResponse {
   models?: Record<string, AntigravityModelRecord>;
   /** Backend-provided default model id (e.g. "gemini-3.6-flash-high"). */
   defaultAgentModelId?: string;
+  /**
+   * Ids bound to a SPECIAL PURPOSE inside the editor, not general chat.
+   *
+   * Despite the name, `tabModelIds` holds the `chat_*` ids on this account —
+   * the backend's naming, not ours. Each of these is a list of ids reserved for
+   * one editor feature, and none of them belongs in a model picker.
+   */
+  tabModelIds?: string[];
+  imageGenerationModelIds?: string[];
+  mqueryModelIds?: string[];
+  webSearchModelIds?: string[];
+  commitMessageModelIds?: string[];
+  audioTranscriptionModelIds?: string[];
+  /**
+   * Retired ids, mapped to their replacement:
+   * `{"gemini-3.1-pro-high": {"newModelId": "gemini-pro-agent"}}`.
+   *
+   * A MAP, not an array. This is load-bearing: `gemini-3.1-pro-high` is still
+   * present in `models` and still looks like a normal id, but generating with it
+   * returns `400 INVALID_ARGUMENT` — the deprecation is the only warning the
+   * backend gives, and claudish was throwing it away.
+   */
+  deprecatedModelIds?: Record<string, { newModelId?: string }>;
 }
 
 /** What the backend reports about one served model. */
@@ -253,6 +313,19 @@ export interface AntigravityServedModels {
    * why the disagreement went unnoticed: the models people look at are fine.
    */
   meta: Record<string, AntigravityModelMeta>;
+  /**
+   * Ids the backend DECLARES are not user-selectable chat models — the union of
+   * `isInternal: true`, every special-purpose role list, and every deprecated id.
+   *
+   * Declared, not guessed. Before this existed claudish filtered on an
+   * `id.startsWith("chat_")` naming hunch, which is both fragile (the ids carry
+   * build numbers) and incomplete: it could never have known that
+   * `gemini-3.1-pro-high` — an ordinary-looking id, present in `models`, with
+   * full capability flags — is retired and answers `400 INVALID_ARGUMENT`.
+   */
+  excludedIds?: Set<string>;
+  /** Retired id → its replacement, so a request for one can name the other. */
+  deprecatedReplacements?: Record<string, string>;
 }
 
 let agServedCache: AntigravityServedModels | null = null;
@@ -279,7 +352,7 @@ export async function getServedAntigravityModels(
     return agServedCache;
   }
   try {
-    const res = await fetch(`${ANTIGRAVITY_API_BASE}:fetchAvailableModels`, {
+    const res = await fetch(`${apiBase()}:fetchAvailableModels`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -312,7 +385,37 @@ export async function getServedAntigravityModels(
           }
           meta[id] = entry;
         }
-        agServedCache = { servedIds, defaultId, meta };
+
+        // WHAT THE BACKEND DECLARES UNSELECTABLE — three independent signals,
+        // all of them stated outright rather than inferred from the id.
+        const excludedIds = new Set<string>();
+        for (const [id, record] of Object.entries(data.models ?? {})) {
+          if ((record as { isInternal?: boolean })?.isInternal === true) excludedIds.add(id);
+        }
+        // MODALITY lists only. `imageGenerationModelIds` and
+        // `audioTranscriptionModelIds` name models that do not produce chat text
+        // at all (`gemini-3.1-flash-image` reports no `maxOutputTokens`), and
+        // `tabModelIds` names the inline-completion pair.
+        //
+        // Deliberately NOT excluded: `mqueryModelIds`, `webSearchModelIds`,
+        // `commitMessageModelIds`. Those are ROLE ASSIGNMENTS of an ordinary
+        // model — all three name `gemini-3.1-flash-lite` on this account, which
+        // generates chat perfectly well. Treating a role as a disqualification
+        // dropped a real model from the picker.
+        for (const list of [
+          data.tabModelIds,
+          data.imageGenerationModelIds,
+          data.audioTranscriptionModelIds,
+        ]) {
+          for (const id of list ?? []) excludedIds.add(id);
+        }
+        const deprecatedReplacements: Record<string, string> = {};
+        for (const [oldId, info] of Object.entries(data.deprecatedModelIds ?? {})) {
+          excludedIds.add(oldId);
+          if (info?.newModelId) deprecatedReplacements[oldId] = info.newModelId;
+        }
+
+        agServedCache = { servedIds, defaultId, meta, excludedIds, deprecatedReplacements };
         agServedCacheAt = now;
         return agServedCache;
       }
@@ -323,6 +426,9 @@ export async function getServedAntigravityModels(
     log(`[Antigravity] fetchAvailableModels error: ${err}`);
   }
   if (agServedCache) return agServedCache;
+  // The degraded path knows NOTHING about exclusions — it never saw a response.
+  // Returning empty collections would assert "there are none", which is a claim
+  // we cannot make; the fields are optional and consumers default them.
   return { servedIds: [], defaultId: null, meta: {} };
 }
 

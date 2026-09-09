@@ -39,7 +39,7 @@ When a model ID is provided, it's resolved in this order:
 | `kimi/`, `moonshot/` | Kimi/Moonshot | `MOONSHOT_API_KEY` or `KIMI_API_KEY` | Anthropic-compatible |
 | `glm/`, `zhipu/` | GLM/Zhipu | `ZHIPU_API_KEY` or `GLM_API_KEY` | OpenAI-compatible |
 | `oc/` | OllamaCloud | `OLLAMA_API_KEY` | Cloud-hosted Ollama |
-| `zen/` | OpenCode Zen | None (free models) | Free tier available |
+| `zen/` | OpenCode Zen | `OPENCODE_API_KEY` | API key required |
 | `or/` | OpenRouter | `OPENROUTER_API_KEY` | Explicit OpenRouter prefix |
 
 ## Execution Order

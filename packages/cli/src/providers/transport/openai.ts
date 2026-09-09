@@ -9,6 +9,8 @@
 import { isQuotaExhaustionError } from "../../handlers/shared/quota-exhaustion.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
 import { log } from "../../logger.js";
+import type { DiscoveryOutcome } from "./probe-discovery.js";
+import { discoverProviderProbeModel } from "./provider-model-discovery.js";
 import type { ProviderTransport, StreamFormat } from "./types.js";
 
 export class OpenAIProviderTransport implements ProviderTransport {
@@ -88,6 +90,19 @@ export class OpenAIProviderTransport implements ProviderTransport {
       Object.assign(headers, this.provider.headers);
     }
     return headers;
+  }
+
+  /**
+   * Discover from the provider definition's authenticated model-list endpoint.
+   *
+   * OpenAI-compatible subscriptions such as Sakana Subscription and Grok
+   * Build have account-scoped rosters that are not interchangeable with their
+   * metered siblings. The shared helper uses the same credential authority and
+   * model-discovery cache as the picker, so probe fallback never guesses a
+   * cross-silo model id.
+   */
+  async discoverProbeModel(exclude?: ReadonlySet<string>): Promise<DiscoveryOutcome> {
+    return discoverProviderProbeModel(this.provider.name, this.displayName, exclude);
   }
 
   /**

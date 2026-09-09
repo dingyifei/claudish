@@ -1,6 +1,37 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getProviderByName, toRemoteProvider } from "./provider-definitions.js";
 import { createHandlerForProvider } from "./provider-profiles.js";
+
+// The composition table must not read the ambient ~/.claudish/all-models.json.
+const fixtureDir = mkdtempSync(join(tmpdir(), "provider-profiles-"));
+const catalogCachePath = join(fixtureDir, "all-models.json");
+
+afterAll(() => {
+  rmSync(fixtureDir, { recursive: true, force: true });
+});
+
+writeFileSync(
+  catalogCachePath,
+  JSON.stringify({
+    version: 2,
+    lastUpdated: new Date().toISOString(),
+    entries: [
+      {
+        modelId: "acme-responses-x1.0",
+        aliases: [],
+        sources: {},
+        endpoints: {
+          openai: { api: "responses", toolsWithReasoning: "requires-responses" },
+        },
+        tokenParam: "max_output_tokens",
+      },
+    ],
+    models: [],
+  })
+);
 
 interface Composition {
   transport: string;
@@ -17,6 +48,7 @@ async function describeHandler(providerName: string, modelName: string): Promise
     targetModel: modelName,
     port: 1234,
     sharedOpts: {},
+    catalogCachePath,
   } as any);
 
   return handler.describeComposition();
@@ -112,6 +144,7 @@ describe("OpenAI Responses-API gate", () => {
     endpoint: "https://api.openai.com/v1/chat/completions",
   } as const;
   const openAICompositionCases = [
+    { model: "acme-responses-x1.0", expected: responsesComposition },
     { model: "gpt-5.3-codex", expected: responsesComposition },
     { model: "gpt-5-codex", expected: responsesComposition },
     { model: "gpt-5.1-codex-max", expected: responsesComposition },

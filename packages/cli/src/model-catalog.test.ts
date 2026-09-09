@@ -20,7 +20,11 @@ import { join } from "node:path";
 import { AnthropicAPIFormat } from "./adapters/anthropic-api-format.js";
 import { GLMModelDialect } from "./adapters/glm-model-dialect.js";
 import { MiniMaxModelDialect } from "./adapters/minimax-model-dialect.js";
-import { lookupModel, lookupModelForProvider } from "./adapters/model-catalog.js";
+import {
+  lookupModel,
+  lookupModelForProvider,
+  searchCatalogModels,
+} from "./adapters/model-catalog.js";
 
 const MINIMAX_API_KEY = process.env.MINIMAX_CODING_API_KEY || process.env.MINIMAX_API_KEY;
 const SKIP_REAL_API = !MINIMAX_API_KEY;
@@ -143,6 +147,28 @@ beforeAll(() => {
       sources: {},
       contextWindow: 202_752,
     },
+    {
+      modelId: "kimi-k3",
+      aliases: ["moonshotai/kimi-k3", "k3"],
+      sources: {},
+      subscriptionPlans: ["kimi-coding", "opencode-zen-go"],
+    },
+    {
+      modelId: "kimi-k3-256k",
+      aliases: [],
+      sources: {},
+      releaseDate: "2026-07-16",
+    },
+    {
+      modelId: "kimi-k3-fast",
+      aliases: [],
+      sources: {},
+    },
+    {
+      modelId: "kimi-k2.6",
+      aliases: [],
+      sources: {},
+    },
   ];
 
   writeFileSync(
@@ -242,6 +268,80 @@ describe("Group 1: Model Catalog — lookupModelForProvider()", () => {
     expect(() => lookupModelForProvider("cx@gpt-5.6-sol", "openai-codex", mockCachePath)).toThrow(
       "@"
     );
+  });
+});
+
+describe("searchCatalogModels", () => {
+  test("resolves an exact alias to the catalog identity and reports the alias", () => {
+    const results = searchCatalogModels("k3", 10, mockCachePath);
+
+    expect(results[0]?.modelId).toBe("kimi-k3");
+    expect(results[0]?.matchedAlias).toBe("k3");
+  });
+
+  test("leaves matchedAlias unset for an exact model id", () => {
+    const results = searchCatalogModels("kimi-k3", 10, mockCachePath);
+
+    expect(results[0]?.modelId).toBe("kimi-k3");
+    expect(results[0]?.matchedAlias).toBeUndefined();
+  });
+
+  test("ranks the shorter canonical model ahead of a newer dated variant", () => {
+    const results = searchCatalogModels("kimi", 10, mockCachePath);
+
+    expect(results[0]?.modelId).toBe("kimi-k3");
+  });
+
+  test("ranks an exact alias ahead of partial model id matches", () => {
+    const results = searchCatalogModels("k3", 10, mockCachePath);
+
+    expect(results[0]?.modelId).toBe("kimi-k3");
+    expect(results[0]?.matchedAlias).toBe("k3");
+    expect(results.slice(1).some((result) => result.modelId === "kimi-k3-256k")).toBe(true);
+  });
+
+  test("preserves subscription plans and defaults missing plans to an empty array", () => {
+    const withPlans = searchCatalogModels("kimi-k3", 10, mockCachePath);
+    const withoutPlans = searchCatalogModels("kimi-k3-fast", 10, mockCachePath);
+
+    expect(withPlans[0]?.subscriptionPlans).toEqual(["kimi-coding", "opencode-zen-go"]);
+    expect(withoutPlans[0]?.subscriptionPlans).toEqual([]);
+  });
+
+  test("matches model ids case-insensitively", () => {
+    const results = searchCatalogModels("KIMI-K3", 10, mockCachePath);
+
+    expect(results[0]?.modelId).toBe("kimi-k3");
+  });
+
+  test("matches vendor-prefixed queries to the bare catalog identity", () => {
+    const results = searchCatalogModels("moonshotai/kimi-k3", 10, mockCachePath);
+
+    expect(results[0]?.modelId).toBe("kimi-k3");
+  });
+
+  test("returns no more than the requested limit", () => {
+    const results = searchCatalogModels("kimi", 2, mockCachePath);
+
+    expect(results).toHaveLength(2);
+  });
+
+  test("returns no matches for empty or whitespace-only queries", () => {
+    expect(searchCatalogModels("", 10, mockCachePath)).toEqual([]);
+    expect(searchCatalogModels("   ", 10, mockCachePath)).toEqual([]);
+  });
+
+  test("returns no matches when the cache is missing or unreadable", () => {
+    const missingCachePath = join(tmpDir, "missing-search-cache.json");
+    const unreadableCachePath = join(tmpDir, "unreadable-search-cache.json");
+    writeFileSync(unreadableCachePath, "not valid json", "utf-8");
+
+    expect(searchCatalogModels("kimi", 10, missingCachePath)).toEqual([]);
+    expect(searchCatalogModels("kimi", 10, unreadableCachePath)).toEqual([]);
+  });
+
+  test("returns no matches when the query does not match the catalog", () => {
+    expect(searchCatalogModels("definitely-not-a-model", 10, mockCachePath)).toEqual([]);
   });
 });
 

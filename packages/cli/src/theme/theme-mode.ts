@@ -9,10 +9,16 @@
  *
  *   1. `CLAUDISH_THEME=light|dark` — explicit user override, and the deterministic
  *      lever tests and screenshot harnesses use. Always wins.
- *   2. `COLORFGBG` — set by some terminals (iTerm2, rxvt). Free and synchronous.
- *   3. An OSC 11 query — ask the terminal its background color over the tty and
- *      classify by WCAG relative luminance. Bounded by a timeout: a terminal that
- *      never answers must not stall startup, and `null` simply means "unknown".
+ *   2. An OSC 11 query — ask the terminal its background color over the tty and
+ *      classify by WCAG relative luminance. A MEASUREMENT, so it also yields the
+ *      background COLOUR itself (see `getTerminalBackgroundHex`). Bounded by a
+ *      timeout: a terminal that never answers must not stall startup.
+ *   3. `COLORFGBG` — set by some terminals (iTerm2, rxvt). Free and synchronous,
+ *      but only a HINT: it is written once and goes stale, and tmux inherits a
+ *      stale value across a theme change. Measured on a real cream terminal it
+ *      reported `15;0` ("dark") while OSC 11 returned `#f9f6da` ("light"). It is
+ *      therefore the fallback, not the primary — used when nobody answers OSC,
+ *      and by the sync path, which cannot await.
  *
  * `null` (unknown) is a real state, not an error: every consumer treats it as
  * "behave exactly as claudish behaved before light-theme support" — the dark
@@ -62,6 +68,7 @@ export function onThemeModeChange(cb: (mode: TerminalThemeMode | null) => void):
  */
 export function resetThemeModeForTests(): void {
   setThemeMode(null);
+  background = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +132,67 @@ export function classifyOscBackground(reply: string): TerminalThemeMode | null {
 }
 
 /**
+ * The terminal's ACTUAL background as `#rrggbb`, from the same OSC 11 reply.
+ * Exported for tests.
+ *
+ * The classifier above reduces this reply to one bit and discards the colour,
+ * which is why the TUI painted `#ffffff` over a cream terminal and `#000000`
+ * over a soft-black one: correct light/dark, visibly wrong shade. The full-screen
+ * page cannot simply be transparent — the 1Password add-wizard is an absolute
+ * overlay that relies on an opaque `C.bg` to occlude the list beneath it — so
+ * matching the terminal exactly is how the page becomes invisible while STAYING
+ * opaque.
+ */
+export function parseOscBackgroundHex(reply: string): string | null {
+  const m = reply.match(/\]11;rgb:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})/);
+  if (!m) return null;
+  const byte = (hex: string): string => {
+    const max = 16 ** hex.length - 1;
+    const v = Math.round((Number.parseInt(hex, 16) / max) * 255);
+    return v.toString(16).padStart(2, "0");
+  };
+  return `#${byte(m[1]!)}${byte(m[2]!)}${byte(m[3]!)}`;
+}
+
+/**
+ * Terminal background colour, once an OSC 11 query has answered. `null` means
+ * unknown — under a pipe, a `dumb` terminal, or a terminal that never replies —
+ * and every consumer must fall back to its palette's own page colour rather
+ * than guessing.
+ */
+let background: { hex: string; mode: TerminalThemeMode } | null = null;
+
+export function getTerminalBackgroundHex(): string | null {
+  return background?.hex ?? null;
+}
+
+/**
+ * The measured background AND the light/dark mode its own luminance implies.
+ *
+ * The pair travels together so a consumer can refuse to paint the colour under
+ * a palette chosen for the OTHER mode. That is a real risk rather than a
+ * theoretical one: the published mode can come from somewhere else entirely —
+ * OpenTUI's own handshake, `COLORFGBG`, or an explicit `CLAUDISH_THEME` — and
+ * cream under dark-mode foregrounds is unreadable, which is strictly worse than
+ * the hardcoded page colour this replaces.
+ */
+export function getTerminalBackground(): { hex: string; mode: TerminalThemeMode } | null {
+  return background;
+}
+
+/** Test seam — also cleared by {@link resetThemeModeForTests}. */
+export function setTerminalBackgroundHex(hex: string | null): void {
+  if (!hex) {
+    background = null;
+    return;
+  }
+  const mode = classifyOscBackground(
+    `]11;rgb:${hex.slice(1, 3)}/${hex.slice(3, 5)}/${hex.slice(5, 7)}`
+  );
+  background = mode ? { hex, mode } : null;
+}
+
+/**
  * Ask the terminal for its background color (OSC 11) and classify it.
  *
  * Only runs when stdin AND stdout are TTYs — the query goes out on stdout and the
@@ -162,7 +230,13 @@ export async function queryTerminalThemeMode(timeoutMs = 150): Promise<TerminalT
       // Reply ends with BEL or ST (ESC \).
       // biome-ignore lint/suspicious/noControlCharactersInRegex: the OSC 11 reply terminator IS a control char (BEL or ESC \)
       if (/\]11;[^\x07\x1b]*(\x07|\x1b\\)/.test(buffer)) {
-        finish(classifyOscBackground(buffer));
+        // Keep the COLOUR as well as the light/dark bit — the TUI paints its
+        // page with it so the page matches the terminal exactly. Both are
+        // derived from THIS reply, so they cannot disagree.
+        const mode = classifyOscBackground(buffer);
+        const hex = parseOscBackgroundHex(buffer);
+        background = hex && mode ? { hex, mode } : null;
+        finish(mode);
       }
     };
 
@@ -192,17 +266,45 @@ export async function queryTerminalThemeMode(timeoutMs = 150): Promise<TerminalT
 export async function detectAndSetThemeMode(): Promise<TerminalThemeMode | null> {
   const override = themeModeOverride();
   if (override) {
+    // An explicit CLAUDISH_THEME is a choice of PALETTE, so the terminal's own
+    // colour is not adopted — the user may well be forcing dark on a light
+    // terminal, and painting their background under our dark foregrounds would
+    // be unreadable. Skipping the OSC round-trip entirely is also free here.
+    setTerminalBackgroundHex(null);
     setThemeMode(override);
     return override;
   }
-  const fromEnv = themeModeFromColorFgBg();
-  if (fromEnv) {
-    setThemeMode(fromEnv);
-    return fromEnv;
+
+  // OSC 11 IS AUTHORITATIVE, ABOVE COLORFGBG. It used to be the last resort,
+  // short-circuited whenever COLORFGBG answered. Two measurements on a real
+  // terminal overturned that ordering:
+  //
+  //   COLORFGBG="15;0"                     → "dark"   (bg slot 0 = black)
+  //   OSC 11 reply, 19ms                   → "light", background #f9f6da
+  //
+  // The terminal is genuinely cream. COLORFGBG was simply WRONG — it is a hint
+  // the emulator sets once, and tmux inherits a stale value that survives a
+  // theme change. Believing it produced a dark palette on a light terminal AND
+  // discarded the only accurate reading available.
+  //
+  // An OSC reply is a MEASUREMENT of the actual background, and it settles the
+  // mode and the colour together, so the two can never contradict each other —
+  // which is what made the previous "sources disagree" reconciliation
+  // necessary. That reconciliation is gone with it.
+  //
+  // COLORFGBG remains the fallback for terminals that do not answer (and the
+  // sync path, which cannot await, still has nothing else). Cost when nobody
+  // answers is one bounded 150ms wait per interactive launch; the measured
+  // reply here arrived in 19ms.
+  const fromOsc = await queryTerminalThemeMode(150);
+  if (fromOsc) {
+    setThemeMode(fromOsc);
+    return fromOsc;
   }
-  const fromOsc = await queryTerminalThemeMode();
-  setThemeMode(fromOsc);
-  return fromOsc;
+
+  const fromEnv = themeModeFromColorFgBg();
+  setThemeMode(fromEnv);
+  return fromEnv;
 }
 
 /**

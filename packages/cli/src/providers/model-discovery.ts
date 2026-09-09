@@ -49,6 +49,29 @@ export interface DiscoveredModel {
    */
   releaseDate?: string;
   /**
+   * Ignore the CATALOG's release date for this row, ordering it by the version
+   * encoded in its id instead.
+   *
+   * For a roster of tuned VARIANTS the catalog does not list, a catalog date is
+   * not a fresher signal — it is a date for a DIFFERENT model. Antigravity is
+   * the case: measured 2026-08-24, 6 of its 19 served ids had a catalog date and
+   * every one of those six was an OLD base model, while every new variant had
+   * none:
+   *
+   *     dated    gemini-2.5-flash          2025-04-17
+   *     dated    gemini-3-flash            2025-12-17
+   *     UNDATED  gemini-3.6-flash-high            —
+   *     UNDATED  gemini-3.7-flash-tiered          —
+   *
+   * `compareByReleaseDateDesc` puts undated rows after dated ones, so a 2025
+   * model sat at the top of the picker and the newest model on the plan sat at
+   * the bottom — the exact complaint that prompted this. With the catalog date
+   * suppressed the whole roster falls through to the version-parts rule and
+   * orders 3.7 > 3.6 > 3.5 > 3.1 > 3 > 2.5, which is what the user meant by
+   * "newest first".
+   */
+  ignoreCatalogReleaseDate?: boolean;
+  /**
    * Variant metadata, for providers that encode knobs INTO their model ids.
    *
    * Most endpoints report a flat list where each id is already the thing a

@@ -2,19 +2,19 @@
  * Unit tests for providers/routing-rules.ts
  *
  * Tests matchRoutingRule, buildRoutingChain, loadRoutingRules, mergeRoutingRules,
- * and route() without hitting any real APIs (file-system config is unavoidable
- * for loadRoutingRules itself, so we assert weakly there).
+ * and route() without hitting any real APIs or machine routing configuration.
  *
  * Run: bun test packages/cli/src/providers/routing-rules.test.ts
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { credentials } from "../auth/credentials/authority.js";
 import { __resetSniffForTests } from "../auth/credentials/op-source.js";
+import type { RecommendedModelsDoc } from "../model-loader.js";
 import type { RoutingRules } from "../profile-config.js";
 import { type DiskCacheV2, type SlimModelEntry, writeAllModelsCache } from "./all-models-cache.js";
 import { DISPLAY_NAMES } from "./auto-route.js";
@@ -24,15 +24,54 @@ import { invalidateModelDiscovery } from "./model-discovery.js";
 import type { ProviderDefinition } from "./provider-definitions.js";
 import {
   buildRoutingChain,
+  loadRoutingRules,
   matchRoutingRule,
   mergeRoutingRules,
   normalizeGlmSlug,
+  retainKnownCatalogRoutingRules,
   route,
 } from "./routing-rules.js";
 import { clearRuntimeRegistry, registerRuntimeProvider } from "./runtime-providers.js";
 
 const SYNTHETIC_MODEL_ID = "acme-x1.0";
 const SYNTHETIC_MINIMAX_EXTERNAL_ID = "ACME-X1.0";
+const CATALOG_EXACT_MODEL_ID = "grok-4.6";
+
+const CATALOG_EXACT_ROUTE_DOC: RecommendedModelsDoc = {
+  version: "test",
+  lastUpdated: "2026-09-03T00:00:00.000Z",
+  models: [
+    {
+      id: CATALOG_EXACT_MODEL_ID,
+      name: "Grok 4.6",
+      description: "Synthetic catalog route used to isolate rule composition",
+      provider: "xAI",
+      category: "subscription",
+      priority: 1,
+      pricing: { input: "N/A", output: "N/A", average: "N/A" },
+      context: "N/A",
+      subscriptions: [
+        {
+          plan: "OpenCode Zen Go",
+          command: "zengo@grok-4.6",
+          routingProvider: "opencode-zen-go",
+          tier: "general",
+        },
+      ],
+    },
+  ],
+};
+
+function loadRulesWithCatalogExact(
+  globalRules: RoutingRules = {},
+  localRules: RoutingRules = {}
+): RoutingRules {
+  return loadRoutingRules({
+    globalRules,
+    localRules,
+    recommendedModels: CATALOG_EXACT_ROUTE_DOC,
+  });
+}
 
 function seedDefaultCatalog(entries: DiskCacheV2["entries"]): () => void {
   _setCatalogEntriesForTest(entries);
@@ -46,7 +85,8 @@ function makeTempCatalog(
     subscriptionPlans?: string[];
   },
   /** Plan names to mark as active subscription plans in the catalog (defaults to the model's own plans). */
-  plans: string[] = model.subscriptionPlans ?? []
+  plans: string[] = model.subscriptionPlans ?? [],
+  routingProviderByPlan: Record<string, string> = {}
 ): { path: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "claudish-routing-test-"));
   const path = join(dir, "all-models.json");
@@ -73,8 +113,8 @@ function makeTempCatalog(
     subscriptionPlans: model.subscriptionPlans ?? [],
     aggregators:
       model.externalId && model.subscriptionPlans
-        ? model.subscriptionPlans.map((provider) => ({
-            provider,
+        ? model.subscriptionPlans.map((planId) => ({
+            provider: routingProviderByPlan[planId] ?? planId,
             externalId: model.externalId!,
             confidence: "scrape_verified" as const,
           }))
@@ -86,6 +126,14 @@ function makeTempCatalog(
     lastUpdated: new Date().toISOString(),
     entries,
     models: [],
+    plans: plans.map((plan) => ({
+      id: plan,
+      modelDiscovery: "catalog",
+      routing: {
+        providerUid: routingProviderByPlan[plan] ?? plan,
+        nativeModelProviders: [],
+      },
+    })),
   };
   writeAllModelsCache(cache, path);
   return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
@@ -376,14 +424,71 @@ describe("buildRoutingChain", () => {
 });
 
 // ---------------------------------------------------------------------------
-// loadRoutingRules — smoke test (always returns RoutingRules now)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// mergeRoutingRules — pure merge semantics (testable without disk I/O)
+// loadRoutingRules — source composition without disk I/O
 // ---------------------------------------------------------------------------
 
 describe("loadRoutingRules merges defaults", () => {
+  // The three behavioural tests below seed `sources.recommendedModels`, but the
+  // v9.0.1 path bypassed that seam and read a homedir-derived cache path. They
+  // can therefore stay green on a cold CI checkout; this source-boundary guard
+  // survives that cold cache by forbidding model-loader runtime imports here.
+  test("keeps model-loader imports type-only so routing rules cannot read ambient cache state", () => {
+    const source = readFileSync(join(import.meta.dir, "routing-rules.ts"), "utf8");
+    const modelLoaderImports = [
+      ...source.matchAll(
+        /(?:^|\n)\s*import\s+[^;]*?(?:from\s+)?["']\.\.\/model-loader\.js["']\s*;/g
+      ),
+    ].map((match) => match[0].trim());
+    const valueImports = modelLoaderImports.filter(
+      (statement) => !/^import\s+type\b/.test(statement)
+    );
+
+    expect(valueImports).toEqual([]);
+  });
+
+  test("default glob stays reachable when the catalog has an exact model key", () => {
+    // Catalog keys are exact, so retaining one here used to bypass the broader
+    // fallback chain solely because exact matching runs before glob matching.
+    const rules = loadRulesWithCatalogExact();
+
+    expect(matchRoutingRule(CATALOG_EXACT_MODEL_ID, rules)).toEqual(
+      DEFAULT_ROUTING_RULES["grok-*"]
+    );
+  });
+
+  test("user glob wins when the catalog has an exact model key", () => {
+    const userRules: RoutingRules = { "grok-*": ["x-ai", "openrouter"] };
+
+    // Docs recommend family globs; an exact cache row must not silently make a
+    // user's supported configuration style unreachable.
+    const rules = loadRulesWithCatalogExact(userRules);
+
+    expect(matchRoutingRule(CATALOG_EXACT_MODEL_ID, rules)).toEqual(userRules["grok-*"]);
+  });
+
+  test("returns only rule keys supplied by defaults or user config", () => {
+    const globalRules: RoutingRules = { "team-*": ["openrouter"] };
+    const localRules: RoutingRules = { "project-model": ["x-ai"] };
+
+    // Cache contents vary by machine and over time, so they cannot be allowed
+    // to expand the effective configuration's key space.
+    const rules = loadRulesWithCatalogExact(globalRules, localRules);
+    const configuredRules = mergeRoutingRules(DEFAULT_ROUTING_RULES, globalRules, localRules);
+
+    expect(Object.keys(rules).sort()).toEqual(Object.keys(configuredRules).sort());
+  });
+
+  test("catalog routes keep known providers and cannot shadow defaults with an unknown provider", () => {
+    expect(
+      retainKnownCatalogRoutingRules({
+        "mixed-model": ["future-provider@future-wire", "openrouter@vendor/model"],
+        "future-only-model": ["future-provider@future-wire"],
+      })
+    ).toEqual({
+      "mixed-model": ["openrouter@vendor/model"],
+    });
+  });
+
   test("with no user rules: merge returns defaults exactly", () => {
     const merged = mergeRoutingRules(DEFAULT_ROUTING_RULES, {}, {});
     expect(merged).toEqual(DEFAULT_ROUTING_RULES);
@@ -501,9 +606,11 @@ describe("route()", () => {
   // test module's top-level credential probe can prewarm real credentials.
   // Invalidate before and after each test to isolate host and fake keys.
   beforeEach(() => {
-    // Disable 1Password for routing tests so route()'s credential resolution
-    // never pulls a real op:// key from the host config (which would make a
-    // "no credentials → no-route" assertion fail). Mock-free env flag → no bleed.
+    // Credential resolution is env → aliases → config → keychain → op://.
+    // These tests predate the keychain source and originally disabled only
+    // op://, leaving host keychain entries able to satisfy "no credentials"
+    // assertions. Disable both external stores with the mock-free env flags.
+    process.env.CLAUDISH_DISABLE_KEYCHAIN = "1";
     process.env.CLAUDISH_DISABLE_OP = "1";
     __resetSniffForTests();
     credentials.invalidate();
@@ -515,6 +622,7 @@ describe("route()", () => {
   });
 
   afterEach(() => {
+    delete process.env.CLAUDISH_DISABLE_KEYCHAIN;
     delete process.env.CLAUDISH_DISABLE_OP;
     __resetSniffForTests();
     // Restore env vars (preserves the host's actual config for other tests).
@@ -613,11 +721,28 @@ describe("route()", () => {
   });
 
   test("gpt-5 (bare) with OPENAI_CODEX_API_KEY → primary openai-codex", async () => {
-    process.env.OPENAI_CODEX_API_KEY = "sk-codex-test";
-    const plan = await route("gpt-5", DEFAULT_ROUTING_RULES);
-    expect(plan.kind).toBe("ok");
-    if (plan.kind !== "ok") return;
-    expect(plan.primary.provider).toBe("openai-codex");
+    // Assert rule composition with an empty catalog (an absent cache file),
+    // not Codex model support: live Codex returns 400 with "The 'gpt-5' model
+    // is not supported when using Codex with a ChatGPT account".
+    //
+    // In a dev environment where codex-oauth.json exists, codex is genuinely
+    // credentialed regardless of the fake env key. Skip the strict assertion
+    // there, matching the sibling credential test. openai-codex declares no
+    // modelDiscovery, so only the catalog cache, not live discovery, is a factor.
+    const codexOauth = join(homedir(), ".claudish", "codex-oauth.json");
+    if (existsSync(codexOauth)) return;
+
+    const dir = mkdtempSync(join(tmpdir(), "claudish-routing-empty-catalog-test-"));
+    const cachePath = join(dir, "all-models.json");
+    try {
+      process.env.OPENAI_CODEX_API_KEY = "sk-codex-test";
+      const plan = await route("gpt-5", DEFAULT_ROUTING_RULES, undefined, cachePath);
+      expect(plan.kind).toBe("ok");
+      if (plan.kind !== "ok") return;
+      expect(plan.primary.provider).toBe("openai-codex");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("qwen3.7-plus prefers qwen-cloud over qwen-payg when both credentials are present", async () => {
@@ -665,9 +790,10 @@ describe("route()", () => {
       {
         modelId: "kimi-k3",
         externalId: "k3",
-        subscriptionPlans: ["kimi-coding"],
+        subscriptionPlans: ["kimi-code"],
       },
-      ["kimi-coding"]
+      ["kimi-code"],
+      { "kimi-code": "kimi-coding" }
     );
     try {
       const plan = await route("kimi-k3", DEFAULT_ROUTING_RULES, undefined, path);
@@ -677,6 +803,79 @@ describe("route()", () => {
       expect(plan.primary.modelSpec).toBe("kc@k3");
     } finally {
       cleanup();
+    }
+  });
+
+  test("joins commercial plan IDs to provider UIDs before dropping an unserved route", () => {
+    const { path, cleanup } = makeTempCatalog({ modelId: "kimi-unserved" }, ["kimi-code"], {
+      "kimi-code": "kimi-coding",
+    });
+    try {
+      expect(
+        buildRoutingChain(["kimi-coding", "kimi"], "kimi-unserved", path).map(
+          (candidate) => candidate.provider
+        )
+      ).toEqual(["kimi"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("keeps candidates when queryPlans is newer than a zero-coverage slim snapshot", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-routing-skewed-plan-test-"));
+    const path = join(dir, "all-models.json");
+    writeAllModelsCache(
+      {
+        version: 2,
+        lastUpdated: new Date().toISOString(),
+        entries: [{ modelId: "gpt-rollout-model", aliases: [], sources: {} }],
+        models: [],
+        plans: [
+          {
+            id: "openai-codex",
+            modelDiscovery: "catalog",
+            routing: { providerUid: "openai-codex", nativeModelProviders: ["openai"] },
+          },
+        ],
+      },
+      path
+    );
+    try {
+      expect(buildRoutingChain(["openai-codex", "openai"], "gpt-rollout-model", path)).toHaveLength(
+        2
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps client-discovered subscription candidates when static membership is absent", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-routing-client-plan-test-"));
+    const path = join(dir, "all-models.json");
+    writeAllModelsCache(
+      {
+        version: 2,
+        lastUpdated: new Date().toISOString(),
+        entries: [{ modelId: "grok-account-model", aliases: [], sources: {} }],
+        models: [],
+        plans: [
+          {
+            id: "xai-supergrok",
+            modelDiscovery: "client",
+            routing: { providerUid: "grok-subscription", nativeModelProviders: ["x-ai"] },
+          },
+        ],
+      },
+      path
+    );
+    try {
+      expect(
+        buildRoutingChain(["grok-subscription", "x-ai"], "grok-account-model", path).map(
+          (candidate) => candidate.provider
+        )
+      ).toEqual(["grok-subscription", "x-ai"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -752,14 +951,31 @@ describe("route()", () => {
   });
 
   test("ok plan returns primary plus fallbacks in order", async () => {
-    process.env.OPENAI_CODEX_API_KEY = "cx-test";
-    process.env.OPENAI_API_KEY = "oai-test";
-    process.env.OPENROUTER_API_KEY = "or-test";
-    const plan = await route("gpt-5", DEFAULT_ROUTING_RULES);
-    expect(plan.kind).toBe("ok");
-    if (plan.kind !== "ok") return;
-    expect(plan.primary.provider).toBe("openai-codex");
-    expect(plan.fallbacks.map((r) => r.provider)).toEqual(["openai", "openrouter"]);
+    // Assert rule composition with an empty catalog (an absent cache file),
+    // not Codex model support: live Codex returns 400 with "The 'gpt-5' model
+    // is not supported when using Codex with a ChatGPT account".
+    //
+    // In a dev environment where codex-oauth.json exists, codex is genuinely
+    // credentialed regardless of the fake env key. Skip the strict assertion
+    // there, matching the sibling credential test. openai-codex declares no
+    // modelDiscovery, so only the catalog cache, not live discovery, is a factor.
+    const codexOauth = join(homedir(), ".claudish", "codex-oauth.json");
+    if (existsSync(codexOauth)) return;
+
+    const dir = mkdtempSync(join(tmpdir(), "claudish-routing-empty-catalog-test-"));
+    const cachePath = join(dir, "all-models.json");
+    try {
+      process.env.OPENAI_CODEX_API_KEY = "cx-test";
+      process.env.OPENAI_API_KEY = "oai-test";
+      process.env.OPENROUTER_API_KEY = "or-test";
+      const plan = await route("gpt-5", DEFAULT_ROUTING_RULES, undefined, cachePath);
+      expect(plan.kind).toBe("ok");
+      if (plan.kind !== "ok") return;
+      expect(plan.primary.provider).toBe("openai-codex");
+      expect(plan.fallbacks.map((r) => r.provider)).toEqual(["openai", "openrouter"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -772,6 +988,7 @@ describe("route() with defaultProvider", () => {
   // test module's top-level credential probe can prewarm real credentials.
   // Invalidate before and after each test to isolate host and fake keys.
   beforeEach(() => {
+    process.env.CLAUDISH_DISABLE_KEYCHAIN = "1";
     process.env.CLAUDISH_DISABLE_OP = "1";
     __resetSniffForTests();
     credentials.invalidate();
@@ -782,6 +999,7 @@ describe("route() with defaultProvider", () => {
   });
 
   afterEach(() => {
+    delete process.env.CLAUDISH_DISABLE_KEYCHAIN;
     delete process.env.CLAUDISH_DISABLE_OP;
     __resetSniffForTests();
     for (const key of ENV_KEYS_TO_CLEAR) {

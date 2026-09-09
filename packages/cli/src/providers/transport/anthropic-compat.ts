@@ -9,15 +9,9 @@
 import { credentials } from "../../auth/credentials/authority.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
 import { log } from "../../logger.js";
-import {
-  describeDiscoveryFailure,
-  discoverProviderModels,
-  getDiscoveryFailure,
-  rankDiscoveredModels,
-} from "../model-discovery.js";
-import { getProviderByName } from "../provider-definitions.js";
 import { isTerminal429 } from "./openai.js";
-import { type DiscoveryOutcome, isChatCapable } from "./probe-discovery.js";
+import type { DiscoveryOutcome } from "./probe-discovery.js";
+import { discoverProviderProbeModel } from "./provider-model-discovery.js";
 import type { ProviderTransport, StreamFormat } from "./types.js";
 
 export class AnthropicProviderTransport implements ProviderTransport {
@@ -129,53 +123,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * hardcoding model ids here would rot the moment Alibaba ships the next one.
    */
   async discoverProbeModel(exclude?: ReadonlySet<string>): Promise<DiscoveryOutcome> {
-    const def = getProviderByName(this.provider.name);
-    if (!def?.modelDiscovery) {
-      return {
-        model: null,
-        reason: `${this.displayName} publishes no live model list (no modelDiscovery endpoint) — its probe model must come from the cloud catalog`,
-      };
-    }
-
-    const discovered = await discoverProviderModels(this.provider.name);
-    if (discovered.length === 0) {
-      // Prefer the REAL reason over the generic guess. This used to read
-      // "check the API key and that the subscription is active" for every
-      // failure mode — advice that is wrong for an unreachable endpoint and
-      // unhelpfully vague for a rejected key, since Alibaba serves several
-      // mutually-isolated plan hosts that reject each other's keys identically.
-      const failure = getDiscoveryFailure(this.provider.name);
-      return {
-        model: null,
-        reason: failure
-          ? `${this.displayName}: ${describeDiscoveryFailure(failure)}`
-          : `${this.displayName} listed no models at ${def.modelDiscovery.path} — check the API key and that the subscription is active`,
-      };
-    }
-
-    // Rank by live capability first, then drop anything that can't answer a
-    // chat probe (image / TTS / embedding rows).
-    const ranked = rankDiscoveredModels(discovered)
-      .map((m) => m.id)
-      .filter(isChatCapable);
-    if (ranked.length === 0) {
-      return {
-        model: null,
-        reason: `no chat-capable model among the ${discovered.length} listed by ${this.displayName}`,
-      };
-    }
-
-    // `exclude` carries the models this probe round already tried, so a
-    // transient per-model failure advances to the next candidate instead of
-    // failing the provider outright.
-    const pick = ranked.find((m) => !exclude?.has(m));
-    if (!pick) {
-      return {
-        model: null,
-        reason: `all ${ranked.length} candidate model(s) already tried`,
-      };
-    }
-    return { model: pick };
+    return discoverProviderProbeModel(this.provider.name, this.displayName, exclude);
   }
 
   /**
@@ -234,7 +182,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
       kimi: "Kimi",
       "kimi-coding": "Kimi Coding",
       "qwen-cloud": "Qwen Plan",
-      "qwen-payg": "Qwen PAYG",
+      "qwen-payg": "Qwen API",
       moonshot: "Kimi",
       "z-ai": "Z.AI",
     };
