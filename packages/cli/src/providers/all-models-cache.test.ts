@@ -14,6 +14,7 @@ import {
   type DiskCacheV2,
   type SlimModelEntry,
   readAllModelsCache,
+  reasoningStatusOf,
   writeAllModelsCache,
 } from "./all-models-cache.js";
 
@@ -204,5 +205,41 @@ describe("all-models-cache helpers", () => {
     expect(result).not.toBeNull();
     expect(result!.models).toEqual([{ id: "openai/gpt-4" }]);
     expect(result!.entries).toEqual([]);
+  });
+});
+
+describe("reasoningStatusOf", () => {
+  test("keeps explicit unknown truthful even when coarse thinking support is true", () => {
+    expect(
+      reasoningStatusOf({
+        ...sampleEntry("orion-8.0-future", "future-labs/orion-8.0-future"),
+        reasoningStatus: "unknown",
+        supportsThinking: true,
+      })
+    ).toBe("unknown");
+  });
+
+  test("returns explicit known", () => {
+    expect(
+      reasoningStatusOf({
+        ...sampleEntry("orion-8.1-future", "future-labs/orion-8.1-future"),
+        reasoningStatus: "known",
+      })
+    ).toBe("known");
+  });
+
+  test("infers only from a self-describing reasoning record in older caches", () => {
+    expect(
+      reasoningStatusOf({
+        ...sampleEntry("legacy-described", "future-labs/legacy-described"),
+        reasoning: { supported: true, control: "toggle" },
+      })
+    ).toBe("known");
+    expect(
+      reasoningStatusOf({
+        ...sampleEntry("legacy-undescribed", "future-labs/legacy-undescribed"),
+        supportsThinking: true,
+      })
+    ).toBe("unknown");
   });
 });

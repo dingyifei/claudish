@@ -10,8 +10,8 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isNativeClaudeModelId } from "./classifier-passthrough.js";
 import { EFFORT_LEVELS, isEffortLevel } from "./adapters/base-api-format.js";
+import { isNativeClaudeModelId } from "./classifier-passthrough.js";
 import { ENV } from "./config.js";
 import { buildLegacyHint, resolveDefaultProvider } from "./default-provider.js";
 import {
@@ -62,6 +62,7 @@ import { fetchOllamaModels } from "./providers/ollama-discovery.js";
 import { type ProbeResult, describeProbeState } from "./providers/probe-live.js";
 import { pinProbeModelSpec, probeProviderRoute } from "./providers/probe-runner.js";
 import { BUILTIN_PROVIDERS, getProviderByName } from "./providers/provider-definitions.js";
+import { resolveProviderSlug } from "./providers/provider-slug-resolve.js";
 import {
   buildRoutingChain,
   loadRoutingRules,
@@ -135,6 +136,12 @@ function clearAllModelCaches(): void {
 export function parseAdvisorFlag(value: string): {
   models: string[];
   collector: string | null;
+  /**
+   * True only when `collector` is the default `"haiku"` supplied above (2+
+   * models, no ":"), not a collector the user typed. Startup drops a defaulted
+   * collector that cannot be called, but refuses a named one (advisor-startup.ts).
+   */
+  collectorDefaulted: boolean;
 } {
   const colonIdx = value.lastIndexOf(":");
   let advisorPart: string;
@@ -164,7 +171,11 @@ export function parseAdvisorFlag(value: string): {
     collector = collectorPart;
   }
 
-  return { models, collector };
+  return {
+    models,
+    collector,
+    collectorDefaulted: models.length > 1 && collectorPart === undefined,
+  };
 }
 
 /**
@@ -390,7 +401,13 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       const parsed = parseAdvisorFlag(modelsArg);
       config.advisorModels = parsed.models;
       config.advisorCollector = parsed.collector;
-      config.monitor = true;
+      config.advisorCollectorDefaulted = parsed.collectorDefaulted;
+      // NOT `config.monitor = true`. Monitor forces every request to
+      // NativeHandler (proxy-server.ts:564), which made `--advisor --model
+      // grok-4.6` serve grok from api.anthropic.com. The advisor is its own
+      // independent flag now; the launch bits a no-model advisor session still
+      // needs from monitor are handled by isAdvisorNativeSession().
+      config.advisor = true;
     } else if (arg === "--stdin") {
       config.stdin = true;
     } else if (arg === "--free") {
@@ -543,7 +560,7 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       // Reset accumulated cost statistics
       config.resetCosts = true;
     } else if (arg === "--version") {
-      printVersion();
+      await printVersion();
       process.exit(0);
     } else if (arg === "--help" || arg === "-h") {
       printHelp();
@@ -644,9 +661,25 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       // Pick up --provider <slug> anywhere in the argv. We DON'T consume it
       // from the loop — it's read-once here and harmless to let the outer
       // passthrough swallow it later because we exit before that.
+      //
+      // Both spellings are read. `--provider=x-ai` used to match nothing, so
+      // the flag was silently dropped and the FULL top-100 printed — a wrong
+      // answer that looks like a right one, which is the same failure class as
+      // the empty-for-a-valid-slug case below.
       const providerIdx = args.indexOf("--provider");
-      const providerSlug =
-        providerIdx !== -1 && providerIdx + 1 < args.length ? args[providerIdx + 1] : null;
+      const inlineProvider = args.find((a) => a.startsWith("--provider="));
+      let providerSlug: string | null = null;
+      if (inlineProvider) {
+        providerSlug = inlineProvider.slice("--provider=".length);
+      } else if (providerIdx !== -1) {
+        const next = args[providerIdx + 1];
+        providerSlug = next && !next.startsWith("--") ? next : "";
+      }
+      if (providerSlug === "") {
+        console.error("--provider needs a slug: claudish --models --provider <slug>");
+        console.error("Run `claudish --providers` for the full list.");
+        process.exit(1);
+      }
 
       if (forceUpdate) clearAllModelCaches();
 
@@ -777,16 +810,23 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
     config.claudeArgs.push("--verbose");
   }
 
+  // Remove any placeholder API keys so Claude Code uses its stored credentials.
+  // A placeholder is claudish's OWN (a nested claudish session leaves one behind),
+  // never a credential: captured into config.anthropicApiKey below it would be
+  // handed to NativeHandler, which sends it to api.anthropic.com and gets a 401.
+  // --monitor has always scrubbed it; `--advisor` keeps doing so now that it no
+  // longer implies monitor.
+  if (
+    (config.monitor || config.advisor) &&
+    process.env.ANTHROPIC_API_KEY?.includes("placeholder")
+  ) {
+    delete process.env.ANTHROPIC_API_KEY;
+  }
+
   // Handle monitor mode setup
   if (config.monitor) {
     // Monitor mode: proxies to real Anthropic API for monitoring/debugging
     // Uses Claude Code's native authentication (from `claude auth login`)
-    //
-    // Remove any placeholder API keys so Claude Code uses its stored credentials
-    if (process.env.ANTHROPIC_API_KEY?.includes("placeholder")) {
-      delete process.env.ANTHROPIC_API_KEY;
-    }
-
     if (!config.quiet) {
       console.log("[claudish] Monitor mode enabled - proxying to real Anthropic API");
       console.log("[claudish] Using Claude Code's native authentication");
@@ -1088,11 +1128,85 @@ async function printTop100(jsonOutput: boolean): Promise<void> {
 }
 
 /**
+ * Say what the typed token IS, rather than reporting an empty catalog.
+ *
+ * Three facts, each printed only when true: the near-miss slugs, the routing
+ * prefix the token really belongs to, and where the full vocabulary lives. The
+ * `--json` form carries the same three so a script does not have to scrape
+ * prose, and both exit non-zero — this is a user error, not an empty result.
+ */
+function printUnknownProviderSlug(
+  typedSlug: string,
+  resolved: ReturnType<typeof resolveProviderSlug>,
+  catalogSize: number,
+  jsonOutput: boolean
+): void {
+  if (jsonOutput) {
+    console.log(
+      JSON.stringify(
+        {
+          error: `"${typedSlug}" is not a provider slug in the model catalog`,
+          provider: typedSlug,
+          suggestions: resolved.suggestions.map((s) => s.slug),
+          routingPrefixOwner: resolved.routingOwner,
+          validSlugs: catalogSize,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  console.error(`\n❌ "${typedSlug}" is not a provider slug in the model catalog.`);
+  if (resolved.suggestions.length > 0) {
+    const list = resolved.suggestions
+      .map((s) => `${s.slug} (${s.count} active model${s.count === 1 ? "" : "s"})`)
+      .join(", ");
+    console.error(`\n   Did you mean: ${list}`);
+  }
+  if (resolved.routingOwner) {
+    console.error(
+      `\n   "${typedSlug}" IS a claudish routing prefix for the "${resolved.routingOwner}" provider —` +
+        `\n   use it with --model: claudish --model ${typedSlug}@<model-id>` +
+        "\n   Routing prefixes and catalog vendor slugs are different vocabularies."
+    );
+  }
+  console.error(`\n   claudish --providers    lists all ${catalogSize} catalog slugs`);
+  console.error(
+    `   claudish -s ${typedSlug}${" ".repeat(Math.max(1, 12 - typedSlug.length))}searches model ids instead\n`
+  );
+}
+
+/**
  * Print the Firebase catalog filtered to a single provider slug. No local
  * footer — this view is explicitly scoped by the user and cross-cutting
  * probes would be noise.
  */
-async function printByProvider(providerSlug: string, jsonOutput: boolean): Promise<void> {
+async function printByProvider(typedSlug: string, jsonOutput: boolean): Promise<void> {
+  // Validate against the catalog's OWN vocabulary before querying it. An
+  // unknown token used to produce "No active models found for provider X",
+  // which states a fact about the catalog that is false for every token from a
+  // different vocabulary — `moonshot` is a routing prefix, and the vendor is in
+  // the catalog as `moonshotai`. See providers/provider-slug-resolve.ts.
+  //
+  // A failure to fetch the list is NOT a validation failure: `resolveProviderSlug`
+  // fails open on an empty list, so a catalog outage degrades to the old
+  // behaviour rather than to a confident rejection.
+  let catalogProviders: Awaited<ReturnType<typeof getProviderList>> = [];
+  try {
+    catalogProviders = await getProviderList();
+  } catch {
+    // Fail open — the query below still runs.
+  }
+
+  const resolved = resolveProviderSlug(typedSlug, catalogProviders);
+  if (resolved.kind === "unknown") {
+    printUnknownProviderSlug(typedSlug, resolved, catalogProviders.length, jsonOutput);
+    process.exit(1);
+  }
+
+  const providerSlug = resolved.canonical ?? typedSlug;
   let models: ModelDoc[];
   try {
     models = await getModelsByProvider(providerSlug, 200);
@@ -1112,9 +1226,12 @@ async function printByProvider(providerSlug: string, jsonOutput: boolean): Promi
   }
 
   if (models.length === 0) {
+    // A KNOWN slug with nothing active is a different fact from an unknown
+    // slug, and has a different remedy, so it keeps its own wording.
     console.log(
-      `\nNo active models found for provider "${providerSlug}". Try \`claudish -s <query>\` to search the full catalog.\n`
+      `\nProvider "${providerSlug}" is in the catalog but has no active models right now.`
     );
+    console.log("Try `claudish -s <query>` to search the full catalog.\n");
     return;
   }
 
@@ -1256,10 +1373,37 @@ async function printRecommendedModels(jsonOutput: boolean, forceUpdate: boolean)
 // now go directly through `getRecommendedModels()` in model-loader.ts.
 
 /**
- * Print version information
+ * Print version information.
+ *
+ * Two renderings, because `--version` has two audiences:
+ *  - piped or redirected (`VERSION=$(claudish --version)`, the Homebrew release
+ *    test in release.yml) gets the single parseable line it always got, and no
+ *    network call;
+ *  - a TTY gets the wordmark, the version, and — if npm has a newer build — the
+ *    update notice.
+ *
+ * The update lookup is cache-first (24h, shared with the startup check). On a
+ * cold cache it makes ONE short attempt: `--version` must stay quick, so a slow
+ * registry costs 1.5s and then prints nothing rather than stalling.
  */
-function printVersion(): void {
-  console.log(`claudish version ${VERSION}`);
+async function printVersion(): Promise<void> {
+  if (!process.stdout.isTTY) {
+    console.log(`claudish version ${VERSION}`);
+    return;
+  }
+
+  const { printLogo } = await import("./branding.js");
+  printLogo(process.stdout, { version: VERSION, trailingBlankLine: false });
+
+  const { getLatestVersionCached, isUpgrade, formatUpdateNotice } = await import(
+    "./update-checker.js"
+  );
+  const latestVersion = await getLatestVersionCached({ timeoutMs: 1500 });
+  if (latestVersion && isUpgrade(latestVersion, VERSION)) {
+    console.log("");
+    console.log(formatUpdateNotice(VERSION, latestVersion));
+  }
+  console.log("");
 }
 
 /**
@@ -2231,7 +2375,7 @@ ${h("OPTIONS")}
   ${green("--stdin")}                  Read prompt from stdin (large prompts / piping)
   ${green("--free")}                   Show only FREE models in the interactive selector
   ${green("--monitor")}                Monitor mode - proxy to REAL Anthropic API and log traffic
-  ${green("--advisor")} ${yellow('"m1,m2[:collector]"')}  Multi-model advisor replacement (implies --monitor)
+  ${green("--advisor")} ${yellow('"m1,m2[:collector]"')}  Multi-model advisor replacement (works with any --model)
   ${green("--model-params")} ${yellow('"k=v,..."')}  Extra request params merged into the payload (e.g. reasoning.mode=pro)
   ${green("--effort-override")} ${yellow("<level>")}  Pin reasoning effort verbatim, skipping the per-model clamp
   ${green("--pro-on-ultracode")}       Apply the model's catalog preset while in ultracode (opt-in)

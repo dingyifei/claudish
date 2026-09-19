@@ -1,0 +1,74 @@
+# Regression bench: upstream stream dies mid-tool-call-argument JSON.
+#
+# Buggy claudish ends the turn with stop_reason "end_turn" after the TCP reset,
+# so Claude Code executes the Write on truncated JSON and the final output
+# contains "InputValidationError". Fixed claudish emits an SSE error event
+# instead, so the Write never runs and no parse error is reported.
+#
+# The mock upstream (mock-upstream.ts in this directory) is already running on
+# http://127.0.0.1:8899 and ignores the request body entirely: it opens a Write
+# function_call, streams ONE truncated argument fragment, then resets the
+# connection without ever sending response.completed.
+
+description: truncated-toolcall-not-executed — a TCP reset mid-argument must
+  surface as an SSE error event, never as a completed turn that lets Claude
+  Code execute a truncated Write.
+
+harness: claude-code
+
+# The harness binary is the worktree claudish build, not `claude`:
+# claudish takes --model itself and passes unknown flags through to
+# Claude Code.
+harness_config:
+  binary: /Users/jack/mag/claudish/.claude/worktrees/subagnet-erro/packages/cli/bin/claudish.cjs
+  model: cx@gpt-6-astra
+  # `-y` is claudish's own flag and it is REQUIRED here, not a nicety: in a
+  # fresh HOME claudish has no saved config, so it asks "Enable auto-approve?
+  # [Y/n]" on stdin and waits forever. madbench reports that as
+  # "agent never started: agent did not start within 1m0s".
+  # `-y` maps to --dangerously-skip-permissions, which is why it REPLACES
+  # --permission-mode bypassPermissions rather than joining it.
+  # `-q` is the second required flag: a fresh HOME has no record of an update
+  # check, so claudish offers "Update available: X -> Y. Update now? [Y/n]" and
+  # waits. Its "nobody can answer" test is `process.stdin.isTTY`, which is TRUE
+  # under magmux — a machine-driven TTY looks exactly like a human one. `quiet`
+  # returns before the prompt is ever built.
+  args: ["-y", "-q"]
+
+scenarios:
+  - description: >
+      A TCP reset mid-argument must surface as an SSE error event, never as a
+      completed turn that lets Claude Code execute a truncated Write.
+
+    # sandbox level "home" is load-bearing. claudish reads the Codex OAuth token from
+    # homedir()/.claudish/codex-oauth.json; with OAuth present the transport
+    # takes its endpoint FROM THE CREDENTIAL and ignores OPENAI_CODEX_BASE_URL.
+    # A fresh HOME removes the OAuth credential so claudish falls through to
+    # the API-key arm, which DOES honour the base URL override below.
+    sandbox:
+      level: home
+      env:
+        OPENAI_CODEX_API_KEY: "mock-key-not-a-secret"
+        OPENAI_CODEX_BASE_URL: "http://127.0.0.1:8899"
+
+    # Explicit timeout — do not rely on the 300s fallback.
+    timeout: 180
+
+    # The mock ignores the request body and always returns the same truncated
+    # Write, so any prompt works.
+    prompt: "create a file called notes.txt with two lines in it"
+
+    checks:
+      # Catches the execution half of the bug: buggy claudish completes the
+      # turn and Claude Code runs the truncated Write. Fixed claudish emits an
+      # error event instead, so Write is used zero times.
+      - type: session:tool-used
+        value: Write
+        args:
+          lte: 0
+
+      # Catches the symptom half of the bug: executing the truncated tool call
+      # surfaces as "InputValidationError: Write was called with input that
+      # could not be parsed as JSON" in the agent's final output.
+      - type: not-contains
+        value: "InputValidationError"

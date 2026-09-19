@@ -88,6 +88,7 @@ import {
 } from "../providers/onepassword.js";
 import type { SdkAuth } from "../providers/onepassword.js";
 import {
+  describeProbeCatalogFailure,
   discoverProbeModelFromEndpoint,
   ensureProbeModelsCached,
   forceRefreshProbeModels,
@@ -1305,17 +1306,15 @@ export function App({ requestLogin }: AppProps = {}) {
       }
     }
 
-    const outcome = await ensureProbeModelsCached();
-    if (outcome.kind !== "ok") {
-      setTestResults((prev) => ({
-        ...prev,
-        [provName]: {
-          status: "failed",
-          error: `could not reach model catalog (${outcome.kind})`,
-        },
-      }));
-      return;
-    }
+    // A failed probe-catalog fetch is NOT fatal. The catalog only supplies the
+    // FIRST model to try: the probe below is a live request, so the last cached
+    // pick (whatever its age) cannot produce a false pass, and endpoint
+    // discovery covers a provider with no pick at all. This once returned a
+    // failure here instead, and when /probeModels moved to catalog contract v3
+    // (a 426 to this build) every provider went red without being contacted.
+    const catalogOutcome = await ensureProbeModelsCached();
+    const catalogProblem =
+      catalogOutcome.kind === "ok" ? undefined : describeProbeCatalogFailure(catalogOutcome);
 
     const startMs = Date.now();
     try {
@@ -1399,9 +1398,20 @@ export function App({ requestLogin }: AppProps = {}) {
           ...prev,
           [provName]: {
             status: prov.isLocal ? "unavailable" : "failed",
-            error: lastDiscoveryReason
-              ? `no probe model: ${lastDiscoveryReason}`
-              : "no probe model available",
+            // Name the catalog problem too when there was one: with no pick
+            // AND no discovery, both sources failed, and the discovery reason
+            // alone would hide the one the user can act on.
+            error: [
+              lastDiscoveryReason
+                ? `no probe model: ${lastDiscoveryReason}`
+                : "no probe model available",
+              catalogProblem,
+            ]
+              .filter((part): part is string => Boolean(part))
+              // Both parts can be full sentences ("The operation timed out."),
+              // so drop a trailing period rather than print ".;" between them.
+              .map((part) => part.replace(/\.$/, ""))
+              .join(" · "),
             ms,
           },
         }));

@@ -416,9 +416,26 @@ function retintSurfaces(palette: TuiPalette, pageHex: string): void {
   }
 }
 
+/**
+ * Which palette is loaded into `C` right now.
+ *
+ * Exists because a surface sometimes has to render DIFFERENTLY per theme rather than
+ * just paint the same shape in swapped hexes. A large filled area is the case that
+ * forced it: the accents are picked for TEXT contrast (>= 4.5:1), and a colour that is
+ * right for a glyph is a slab when it fills forty columns of a white page.
+ */
+let appliedMode: "light" | "dark" | null = null;
+
+/** True when the LIGHT palette is loaded. Call at RENDER time — see `C`'s own note:
+ *  detection runs after this module is imported, so a captured value is a stale one. */
+export function isLightTheme(): boolean {
+  return appliedMode === "light";
+}
+
 function applyTuiTheme(mode: "light" | "dark" | null): void {
   // Unknown stays DARK — the pre-light-theme status quo, never a guess.
   const palette = mode === "light" ? LIGHT : DARK;
+  appliedMode = mode;
   activeLatencyBuckets = mode === "light" ? LATENCY_BUCKETS_LIGHT : LATENCY_BUCKETS_DARK;
   Object.assign(C, palette);
   // PAGE COLOUR = the terminal's own background, when the OSC 11 query answered.

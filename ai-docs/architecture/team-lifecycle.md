@@ -61,11 +61,74 @@ Frames keep arriving during a long tool call — Claude Code emits `tool_progres
 heartbeats every 30 s — which is exactly why this signal stays honest where the
 token-flow timestamp did not.
 
+**The liveness maps describe RUNNING slots only.** `idle_seconds_by_slot`,
+`activity_by_slot` and `live_output_bytes_by_slot` skip any slot whose `state` is
+not `RUNNING`; an exited slot's outcome is its `state`. The run stays registered
+until its LAST slot settles, so before 2026-09-12 an exited slot kept answering:
+activity frozen at `waiting_for_input`, idle counting up from its exit. Measured in
+a real status payload: `completedAt + idle_seconds` landed on the poll time for
+both finished slots (idle 57 s and 571 s), while the third slot was still working.
+A caller read `waiting_for_input` as a slot that needed an answer, which `team`
+has no way to send.
+
 **The caller decides, and `cancel` is how it acts.** `cancelTeamRun` is the only
 thing that kills a slot. It kills the process GROUP: `claudish` is a launcher
 that runs the real CLI under Bun, which runs `claude`, so signalling the direct
 child reaches only the launcher and leaves the tree billing and holding the
 response pipe open.
+
+## `outputSize` is not a progress signal, and callers read it as one
+
+`outputSize` is written exactly once per slot, in `finish()`, so a RUNNING slot
+carries the `0` it was initialised with for its whole life. This is correct — the
+field means "size of the final answer" and there is no final answer yet — and it
+is also the single most misread number the tool emits.
+
+Measured 2026-09-08, session `dev-feature-advisor-any-model-20260909-0001`: an
+orchestrator polling a four-slot review panel saw
+
+```json
+"01": { "state": "RUNNING", "exitCode": null, "outputSize": 0 }
+```
+
+against a `startedAt` twenty-two minutes old, and told the user the slot had
+produced nothing in twenty-two minutes. It had produced plenty;
+`idle_seconds_by_slot` for that slot was 2. The orchestrator caught itself on the
+next poll and had to correct the report in front of the user.
+
+Nothing in the payload contradicted the misreading. The `note` explained
+`idle_seconds_by_slot` and `activity_by_slot` and said nothing about
+`outputSize`, and the skill's own step-2 example showed `outputSize` on the
+COMPLETED slot and omitted it from the RUNNING one — the one place a reader could
+have been warned instead skipped the case.
+
+**The fix publishes the number that was already being counted.**
+`ModelRuntime.getByteCount()` has always tracked answer bytes as they arrive, in
+the same unit `outputSize` ends up holding (recovered prose, not raw
+stream-json). `teamSlotLiveBytes()` exports it and `mode: "status"` returns it as
+`live_output_bytes_by_slot`. A running slot now has a true volume number beside
+its true liveness numbers.
+
+**`outputSize` itself was deliberately not changed.** Making it report live bytes
+while RUNNING would have made the misleading number true, at the cost of the one
+distinction a caller actually needs: `formatTeamResult` and `classifyRunOutput`
+both read `outputSize` as final-answer size, and an EMPTY slot is defined by that
+field being small. Overload it and `0` no longer separates "still working" from
+"exited having produced nothing". One name, one meaning.
+
+**The note is keyed on RUNNING, not on liveness.** The previous note appeared only
+when `teamSlotIdleSeconds()` returned non-null, i.e. only for runs this server
+spawned. A run whose server restarted under it still shows RUNNING slots from
+`status.json`, with all three liveness maps null — which is precisely a reader
+about to misjudge an `outputSize` of 0, and now the one who most needs telling.
+The not-live wording names no liveness field, because naming a null field sends
+the reader after evidence that is not there.
+
+Guarded by `packages/cli/src/team-status-payload.test.ts`. The load-bearing
+assertion is the ordering one: `outputSize` must appear in the note BEFORE
+`live_output_bytes_by_slot`. A plain "does the note mention outputSize" check
+survives gutting the warning, because the remedy clause mentions the field too;
+the ordering check does not.
 
 ## Why `run` does not block
 
@@ -131,6 +194,20 @@ it"), so dropping *valid* JSON was the stricter rule, not the looser one.
 This was caught by the `--print-argv` test, whose fake child prints a JSON array
 to stdout: under the reducer's default the argv never reached the response file
 and the slot was classified EMPTY.
+
+### Team must settle the reducer itself
+
+A `result` frame moves the reducer to `waiting_for_input`, on the premise that
+stdin is still open and the supervisor decides what happens next. The channel's
+`SessionManager` is that supervisor and calls `settle()`. `team` closes stdin at
+spawn, so the premise never holds, and until 2026-09-12 nothing settled the
+reducer: it stayed in `waiting_for_input` after the child had exited.
+
+`finish()` now settles it to the outcome it just recorded (COMPLETED → `completed`,
+EMPTY or FAILED → `failed`, a cancelled slot → `cancelled`, TIMEOUT → `timeout`)
+and only then disposes it. The dispose moved out of `finalizeCapture` because a
+disposed reducer ignores `settle()`, and `finish()` runs later, off the output
+stream's "close".
 
 ## Spawn plumbing: what was shared, and what was deliberately not
 

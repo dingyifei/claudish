@@ -6,11 +6,15 @@
  * - Model-specific system prompts (Grok XML fix, Gemini reasoning suppression)
  * - stream_options: { include_usage: true }
  * - include_reasoning for models that support it
- * - removeUriFormat on tool schemas
+ * - the shared OpenAI tool-schema sanitizer
  * - Tool choice mapping from Claude format
  */
 
-import { removeUriFormat } from "../transform.js";
+import {
+  convertToolsToOpenAI,
+  mapToolChoiceToOpenAI,
+} from "../handlers/shared/format/openai-tools.js";
+import type { StreamFormat } from "../providers/transport/types.js";
 import { type AdapterResult, BaseAPIFormat } from "./base-api-format.js";
 import { resolveModelDialect } from "./dialect-manager.js";
 
@@ -93,17 +97,14 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
   // ─── Tool conversion with uri format removal ──────────────────────
 
   override convertTools(claudeRequest: any, _summarize = false): any[] {
-    // Convert to OpenAI format, but strip uri format from schemas
-    return (
-      claudeRequest.tools?.map((tool: any) => ({
-        type: "function",
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: removeUriFormat(tool.input_schema),
-        },
-      })) || []
-    );
+    // Was its own copy calling removeUriFormat directly, which skipped three
+    // guards the shared sanitizer applies: the top-level oneOf/anyOf collapse,
+    // the never-undefined `parameters` object, and the pattern-portability
+    // strip that Claude Code 2.1.266's Artifact tool needs. OpenRouter forwards
+    // to OpenAI models, so it inherits OpenAI's schema validator too.
+    //
+    // `summarize` stays ignored, as this override has always ignored it.
+    return convertToolsToOpenAI(claudeRequest, false);
   }
 
   // ─── Payload with OpenRouter-specific fields ───────────────────────
@@ -132,15 +133,12 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
       payload.thinking = claudeRequest.thinking;
     }
 
-    // Tool choice mapping from Claude format
-    if (claudeRequest.tool_choice) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
-      }
+    const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+    if (toolChoice !== undefined) {
+      payload.tool_choice = toolChoice;
     }
+
+    this.applyOpenAISamplingParams(payload, claudeRequest);
 
     return payload;
   }
@@ -152,6 +150,15 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
     // plus its own reasoning knob). OpenRouter always re-labels the wire to
     // openai-sse, so the Anthropic branch is unreachable here either way.
     return this.innerAdapter.prepareRequest(request, originalRequest);
+  }
+
+  override setResponseWireFormat(format: StreamFormat | undefined): void {
+    // The inner adapter runs its OWN prepareRequest template (above), so it
+    // encodes into its own bindings and needs the same answer to "can this
+    // response be decoded". Without this it would fall back to its dialect's
+    // self-declared `getStreamFormat()`.
+    super.setResponseWireFormat(format);
+    this.innerAdapter.setResponseWireFormat(format);
   }
 
   override getToolNameMap(): Map<string, string> {

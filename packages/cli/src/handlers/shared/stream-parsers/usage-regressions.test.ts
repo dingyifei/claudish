@@ -172,6 +172,11 @@ describe("messageStartUsage", () => {
     expect(messageStartUsage(priorInputTokens)).toEqual({
       input_tokens: expected,
       output_tokens: 1,
+      // Seeded, not omitted: Claude Code's per-key usage merge ignores a delta
+      // value of 0, so an absent seed leaves the accumulated count `undefined`
+      // and the client's raw three-way sum becomes NaN. See message-start-usage.ts.
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
     });
   });
 });
@@ -202,25 +207,45 @@ describe("closing message_delta usage", () => {
   const parsers: Array<{
     name: string;
     create: (promptTokens: number) => Response;
+    /**
+     * Does this parser still OMIT a zero input count?
+     *
+     * openai-sse no longer does. It now ships the three-way input split
+     * (`input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens`)
+     * as one group, and a group with a hole in it is worse than no group: the
+     * client sums the three to size the conversation. Emitting an explicit 0 is
+     * behaviourally identical for the client anyway — its usage merge only takes
+     * a delta value greater than zero, so a `0` and an absent key both leave the
+     * message_start seed standing — so this is a wire-bytes change, not a
+     * semantic one. See usage-cache-split.test.ts for the split's own gate.
+     */
+    omitsZeroInput: boolean;
   }> = [
-    { name: "openai-sse", create: (promptTokens) => createOpenAiStream(undefined, promptTokens) },
+    {
+      name: "openai-sse",
+      create: (promptTokens) => createOpenAiStream(undefined, promptTokens),
+      omitsZeroInput: false,
+    },
     {
       name: "gemini-sse",
       create: (promptTokens) => createGeminiStream(undefined, promptTokens),
+      omitsZeroInput: true,
     },
     {
       name: "ollama-jsonl",
       create: (promptTokens) => createOllamaStream(undefined, promptTokens),
+      omitsZeroInput: true,
     },
   ];
 
   for (const parser of parsers) {
-    test(`${parser.name} includes positive input tokens and omits zero`, async () => {
+    test(`${parser.name} includes positive input tokens`, async () => {
       const positive = closingUsage(await parseClaudeSseStream(parser.create(456)));
       const zero = closingUsage(await parseClaudeSseStream(parser.create(0)));
 
       expect(positive.input_tokens).toBe(456);
-      expect(zero).not.toHaveProperty("input_tokens");
+      if (parser.omitsZeroInput) expect(zero).not.toHaveProperty("input_tokens");
+      else expect(zero.input_tokens).toBe(0);
     });
   }
 });

@@ -158,3 +158,113 @@ test("stops keep-alive pings when the downstream reader is cancelled", async () 
     process.off("unhandledRejection", captureError);
   }
 }, 10000);
+
+describe("OpenAI Responses SSE stream error with a truncated tool call", () => {
+  const SOCKET_DIED = new TypeError("The socket connection was closed unexpectedly");
+
+  function readFixtureLines(): string[] {
+    return readFileSync(
+      new URL(
+        "../../../test-fixtures/sse-responses/gpt-5.6-sol-responses-turn1.sse",
+        import.meta.url
+      ),
+      "utf8"
+    ).split("\n");
+  }
+
+  function erroringResponse(lines: string[]): Response {
+    const bytes = new TextEncoder().encode(`${lines.join("\n")}\n`);
+    let delivered = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!delivered) {
+          delivered = true;
+          controller.enqueue(bytes);
+          return;
+        }
+        controller.error(SOCKET_DIED);
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }
+
+  // Cut a few lines after the FIRST response.function_call_arguments.delta:
+  // its event line, its data line, and the blank separator. One argument
+  // fragment has streamed; output_item.done for that call has not.
+  function truncatedToolCallResponse(): Response {
+    const lines = readFixtureLines();
+    const firstDelta = lines.findIndex(
+      (line) => line === "event: response.function_call_arguments.delta"
+    );
+    if (firstDelta === -1) {
+      throw new Error("Fixture changed: no function_call_arguments.delta line");
+    }
+    return erroringResponse(lines.slice(0, firstDelta + 3));
+  }
+
+  // Cut before the first function_call output_item.added frame, during
+  // response.output_text.delta: no tool call is in flight when the socket dies.
+  function midTextResponse(): Response {
+    const lines = readFixtureLines();
+    const firstFunctionCallData = lines.findIndex((line) => line.includes("function_call"));
+    if (firstFunctionCallData === -1) {
+      throw new Error("Fixture changed: no function_call frame");
+    }
+    return erroringResponse(lines.slice(0, firstFunctionCallData - 1));
+  }
+
+  function stopReason(event: ClaudeEvent): string | undefined {
+    return (event.data.delta as { stop_reason?: string } | undefined)?.stop_reason;
+  }
+
+  test("a tool call cut off mid-arguments ends the turn with an error event", async () => {
+    const parsedResponse = createResponsesStreamHandler(
+      createMockContext(),
+      truncatedToolCallResponse(),
+      { modelName: "gpt-5.6-sol" }
+    );
+    const events = await parseClaudeSseStream(parsedResponse);
+
+    const errorEvent = events.find((event) => event.data.type === "error");
+    expect(errorEvent).toBeDefined();
+    expect((errorEvent?.data as { error?: { type?: string } }).error?.type).toBe("api_error");
+
+    const endTurn = events.find(
+      (event) => event.data.type === "message_delta" && stopReason(event) === "end_turn"
+    );
+    expect(endTurn).toBeUndefined();
+
+    const toolStarts = events.filter(
+      (event) =>
+        event.data.type === "content_block_start" &&
+        (event.data as { content_block?: { type?: string } }).content_block?.type === "tool_use"
+    );
+    expect(toolStarts.length).toBeGreaterThan(0);
+
+    const startIndices = events
+      .filter((event) => event.data.type === "content_block_start")
+      .map((event) => (event.data as { index?: number }).index);
+    const stopIndices = events
+      .filter((event) => event.data.type === "content_block_stop")
+      .map((event) => (event.data as { index?: number }).index);
+    for (const index of startIndices) {
+      expect(stopIndices.filter((stopIndex) => stopIndex === index)).toHaveLength(1);
+    }
+  });
+
+  test("a stream error with no tool call in flight keeps the inline text and end_turn", async () => {
+    const parsedResponse = createResponsesStreamHandler(createMockContext(), midTextResponse(), {
+      modelName: "gpt-5.6-sol",
+    });
+    const events = await parseClaudeSseStream(parsedResponse);
+
+    const endTurn = events.find(
+      (event) => event.data.type === "message_delta" && stopReason(event) === "end_turn"
+    );
+    expect(endTurn).toBeDefined();
+    expect(extractText(events)).toContain("[Stream error:");
+  });
+});

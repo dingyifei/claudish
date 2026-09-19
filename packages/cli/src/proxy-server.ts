@@ -10,9 +10,15 @@ import { isAutoModeClassifierRequest, looksLikeClassifierShape } from "./behavio
 import { loadHookRules } from "./behavior/hooks.js";
 import { parseBehaviorConfig, registerHookRules } from "./behavior/index.js";
 import { rewriteClassifierForNative } from "./classifier-passthrough.js";
+import {
+  type AdvisorPresenceMonitor,
+  createAdvisorPresenceMonitor,
+  withAdvisorSwap,
+} from "./handlers/advisor-decorator.js";
 import { ComposedHandler, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
+import { loadAdvisorSwapConfig } from "./handlers/native-handler-advisor.js";
 import { NativeHandler } from "./handlers/native-handler.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
 import type { ModelHandler } from "./handlers/types.js";
@@ -26,6 +32,7 @@ import {
   resolveTargetForCatalog,
   warmCatalog,
 } from "./providers/catalog-client.js";
+import { CatalogIncompatibleError } from "./providers/catalog-compatibility.js";
 import { getEndpointUnavailableReason } from "./providers/endpoint-diagnostics.js";
 import {
   ensureEndpointsRegistered,
@@ -61,6 +68,19 @@ class RoutingError extends Error {
     super(message);
     this.name = "RoutingError";
   }
+}
+
+/**
+ * Terminal for the same reason a RoutingError is: no provider can be chosen.
+ *
+ * `routeBare` throws `CatalogIncompatibleError` rather than returning a
+ * `no-route`, so it arrives here as an exception and would otherwise fall into
+ * the 500 branch below — where Claude Code's own retry loop would replay the
+ * request ten times and show "API error · Retrying" instead of the one sentence
+ * that names the fix. Grouped with RoutingError so it renders inline as a 400.
+ */
+function isTerminalRoutingFailure(e: unknown): e is Error {
+  return e instanceof RoutingError || e instanceof CatalogIncompatibleError;
 }
 
 /**
@@ -314,6 +334,28 @@ export async function createProxyServer(
     options.advisorModels,
     options.advisorCollector
   );
+
+  /**
+   * The advisor for ANY main model. `withAdvisorSwap` is applied to the RESULT
+   * of `getHandlerForRequest` at the request site — never inside it, and never
+   * to a FallbackHandler candidate: `FallbackHandler` tests its candidates with
+   * `instanceof ComposedHandler`, and `count_tokens` tests the resolved handler
+   * with `instanceof NativeHandler`; a wrapper in either place hides them.
+   *
+   * With the advisor off (no --advisor, no CLAUDISH_SWAP_ADVISOR=1) this
+   * returns the handler itself: no swap, no scan, no records (BC20). The
+   * monitor branch of `getHandlerForRequest` is untouched; a `--monitor`
+   * launch without the advisor never reaches the wrapper.
+   */
+  const advisorPresence = createAdvisorPresenceMonitor();
+  const withAdvisor = (handler: ModelHandler, presence?: AdvisorPresenceMonitor): ModelHandler =>
+    withAdvisorSwap(
+      handler,
+      loadAdvisorSwapConfig(options.advisorModels, options.advisorCollector),
+      {
+        presence,
+      }
+    );
   /**
    * Request-shaping options that must reach EVERY ComposedHandler, whatever
    * route built it. Defined once and spread at each construction site (and
@@ -1205,7 +1247,7 @@ export async function createProxyServer(
       const txt = JSON.stringify(body);
       return c.json({ input_tokens: Math.ceil(txt.length / 4) });
     } catch (e) {
-      if (e instanceof RoutingError) {
+      if (isTerminalRoutingFailure(e)) {
         return c.json(wrapAnthropicError(400, e.message, "invalid_request_error"), 400);
       }
       return c.json(wrapAnthropicError(500, String(e)), 500);
@@ -1262,7 +1304,10 @@ export async function createProxyServer(
           // configuration (see classifier-passthrough.ts — deleting it turns
           // adaptive thinking ON). Log first: it reads the original body.model.
           rewriteClassifierForNative(body, options.classifier.model);
-          return await nativeHandler.handle(c, body);
+          // Wrapped like every other request so the advisor work NativeHandler
+          // used to do here still happens; not counted by the absent-tool
+          // monitor, which watches the main loop.
+          return await withAdvisor(nativeHandler).handle(c, body);
         }
         // Marker missed on a classifier-shaped request: detection is a string
         // match against a prompt Anthropic can reword without notice, and it
@@ -1279,7 +1324,9 @@ export async function createProxyServer(
         }
       }
 
-      const handler = await getHandlerForRequest(body.model);
+      // The advisor wrapper goes on the RESOLVED handler (FallbackHandler
+      // included), once per request. See `withAdvisor` above.
+      const handler = withAdvisor(await getHandlerForRequest(body.model), advisorPresence);
 
       // Route. The `await` is load-bearing: `return handler.handle(...)` hands
       // the promise back BEFORE it settles, so a rejection escapes this
@@ -1291,7 +1338,7 @@ export async function createProxyServer(
       // Routing failures are terminal — surface as a non-retryable 400 so the
       // client shows the real reason (e.g. missing key) instead of looping on
       // "API error · Retrying". Other errors stay 500.
-      if (e instanceof RoutingError) {
+      if (isTerminalRoutingFailure(e)) {
         return c.json(wrapAnthropicError(400, e.message, "invalid_request_error"), 400);
       }
       return c.json(wrapAnthropicError(500, String(e)), 500);

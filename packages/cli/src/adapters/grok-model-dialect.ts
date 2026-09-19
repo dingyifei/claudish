@@ -212,35 +212,41 @@ export class GrokModelDialect extends BaseAPIFormat {
    * multi-agent models are not served on chat completions at all. Retrying that
    * without the parameter fails identically, so it must not match here.
    */
-  recoverFromRejection(payload: any, errorText: string): { payload: any; note: string } | null {
-    if (!payload || payload.reasoning_effort === undefined) return null;
-
-    // Case 1: the model does not take the parameter at all → drop it for good.
-    if (isReasoningEffortRejection(errorText)) {
-      rememberReasoningEffortRejected(this.modelId);
-      const next = { ...payload };
-      delete next.reasoning_effort;
-      return { payload: next, note: `dropped reasoning_effort for ${this.modelId}` };
-    }
-
-    // Case 2: the parameter is fine but this VALUE is not → step down one rung.
-    const rejected = rejectedReasoningEffortValue(errorText);
-    if (rejected) {
-      rememberReasoningEffortValueRejected(this.modelId, rejected);
-      const fallback = fallbackReasoningEffortValue(rejected);
-      const next = { ...payload };
-      if (fallback) {
-        next.reasoning_effort = fallback;
-        return {
-          payload: next,
-          note: `reasoning_effort "${rejected}" -> "${fallback}" for ${this.modelId}`,
-        };
+  override recoverFromRejection(
+    payload: any,
+    errorText: string
+  ): { payload: any; note: string } | null {
+    if (payload?.reasoning_effort !== undefined) {
+      // Case 1: the model does not take the parameter at all → drop it for good.
+      if (isReasoningEffortRejection(errorText)) {
+        rememberReasoningEffortRejected(this.modelId);
+        const next = { ...payload };
+        delete next.reasoning_effort;
+        return { payload: next, note: `dropped reasoning_effort for ${this.modelId}` };
       }
-      delete next.reasoning_effort;
-      return { payload: next, note: `dropped unsupported reasoning_effort for ${this.modelId}` };
+
+      // Case 2: the parameter is fine but this VALUE is not → step down one rung.
+      const rejected = rejectedReasoningEffortValue(errorText);
+      if (rejected) {
+        rememberReasoningEffortValueRejected(this.modelId, rejected);
+        const fallback = fallbackReasoningEffortValue(rejected);
+        const next = { ...payload };
+        if (fallback) {
+          next.reasoning_effort = fallback;
+          return {
+            payload: next,
+            note: `reasoning_effort "${rejected}" -> "${fallback}" for ${this.modelId}`,
+          };
+        }
+        delete next.reasoning_effort;
+        return { payload: next, note: `dropped unsupported reasoning_effort for ${this.modelId}` };
+      }
     }
 
-    return null;
+    // Not about reasoning_effort (or none was sent): let the base try its own
+    // speculative parameters. Dropping this delegation would silently remove
+    // stop/top_p recovery for every grok model.
+    return super.recoverFromRejection(payload, errorText);
   }
 
   /**
@@ -282,9 +288,15 @@ export class GrokModelDialect extends BaseAPIFormat {
   }
 
   /**
-   * Reset internal state (useful between requests)
+   * Reset internal state (useful between requests).
+   *
+   * `super.reset()` is load-bearing: it mints this request's tool-name
+   * bindings. Without it they accumulate for the life of the process, because
+   * this override used to replace the base entirely — harmless while nothing
+   * encoded names, not harmless now.
    */
-  reset(): void {
+  override reset(): void {
+    super.reset();
     this.xmlBuffer = "";
   }
 }

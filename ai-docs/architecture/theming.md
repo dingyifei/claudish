@@ -106,3 +106,39 @@ Testing gotcha: `setThemeMode` flips a process-global palette and Bun runs
 sibling test files in one process — always restore (`resetThemeModeForTests()`
 re-publishes `null`; it deliberately does NOT clear the listener registry,
 which would freeze the palette for every later test file).
+
+## A colour for a glyph is not a colour for an area (v9.0.8, `isLightTheme`)
+
+`LIGHT`'s accents are chosen so TEXT clears 4.5:1 on white: `#1d4ed8`, `#dc2626`,
+`#15803d`. That is the right test for a letter and the wrong one for a filled
+region. The session summary card drew its meters as `█` runs in those same
+hexes, which on a cream terminal read as slabs — Jack's words were "the colours
+are too hard" and "the progress bars are too heavy, getting all the attention".
+
+The fix is a rendering difference, not a palette change, so it needs to know
+which palette is loaded. `theme.ts` now records the applied mode and exports
+`isLightTheme()`; `session-summary.ts` wraps every large fill in `area()`, which
+is `lighten(hex, 0.55)` on light and the identity on dark. Dark is deliberately
+untouched: neon on true black is the btop look every other claudish surface
+renders, and lightening there washes it out.
+
+Call `isLightTheme()` at RENDER time. It is the same rule as `C.*` and it fails
+the same silent way: detection runs after this module is imported, so a value
+captured at module load is the pre-detection default forever.
+
+Two related decisions in the same card, both about meaning rather than colour:
+
+1. **Meters are capped at 30 columns**, not sized to the leftover width. Filling
+   the leftovers made the charts grow with the terminal while the numbers stayed
+   put, so on a wide window the card was mostly bar.
+2. **The savings meter encodes the AMOUNT saved against the dearest baseline**,
+   on the neutral `volume` ramp — not the fraction of its own baseline avoided,
+   on the red-to-green `savings` ramp. The fraction is 100% for every row of
+   every free session, so it drew two identical full gradient bars: the loudest
+   mark on the card, carrying nothing. Measured against the dearest baseline the
+   rows differ and the difference is the ratio between what those baselines
+   charge. The percentage stayed, as text.
+
+Prices are printed in body ink. Green is this palette's "ok", the figures are
+facts rather than verdicts, and the FREE badge two rows above already says free
+in colour.

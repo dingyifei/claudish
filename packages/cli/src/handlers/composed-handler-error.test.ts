@@ -99,6 +99,7 @@ interface CapturedErrorBody {
   error?: {
     type?: string;
     message?: string;
+    upstream_status?: number;
   };
 }
 
@@ -155,6 +156,64 @@ describe("ComposedHandler.handle — error surfacing wiring", () => {
     // Rich, attributed, includes the real upstream message.
     expect(captured.body?.error?.message).toContain("Sakana Fugu error (HTTP 429)");
     expect(captured.body?.error?.message).toContain("exceeded your current quota");
+  });
+
+  test("a context overflow reaches the client LEADING with `prompt is too long`", async () => {
+    // The whole point of item 8: providers state the overflow in their own
+    // words, and no Anthropic client matches those words. Without the phrase the
+    // client classifies this as a generic invalid request and never offers to
+    // compact. Asserted through the handler, not the builder, because the
+    // builder being right proves nothing if the wiring never asks for it.
+    stubUpstream(400, {
+      error: {
+        message:
+          "This model's maximum context length is 128000 tokens. However, your messages resulted in 200000 tokens.",
+        type: "invalid_request_error",
+        code: "context_length_exceeded",
+      },
+    });
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(captured.status).toBe(400);
+    expect(captured.body?.error?.type).toBe("invalid_request_error");
+    expect(captured.body?.error?.message?.startsWith("prompt is too long")).toBe(true);
+    // The 400-remap contract: the real upstream status still rides along, and
+    // the provider's own sentence is still there for a human to read.
+    expect(captured.body?.error?.upstream_status).toBe(400);
+    expect(captured.body?.error?.message).toContain("maximum context length is 128000 tokens");
+  });
+
+  test("a 413 overflow is remapped to 400 and keeps its upstream status", async () => {
+    stubUpstream(413, {
+      error: { message: "Payload too large: the prompt exceeds this model's context window" },
+    });
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(captured.status).toBe(400);
+    expect(captured.body?.error?.message?.startsWith("prompt is too long")).toBe(true);
+    expect(captured.body?.error?.upstream_status).toBe(413);
+  });
+
+  test("a parameter rejection is NOT relabelled as an oversized prompt", async () => {
+    // The ordering guard, end to end. `max_output_tokens` contains the word
+    // "tokens"; adapters.md records the incident where that alone was enough to
+    // report a 6.7 KB prompt against a 1.05M window as too large.
+    stubUpstream(400, {
+      error: {
+        message: "Unknown parameter: 'max_output_tokens'.",
+        type: "invalid_request_error",
+        param: "max_output_tokens",
+        code: "unknown_parameter",
+      },
+    });
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(captured.body?.error?.message ?? "").not.toContain("prompt is too long");
+    // Unchanged from before item 8: not terminal, so the status passes through.
+    expect(captured.status).toBe(400);
   });
 
   test("terminal auth 401 is surfaced as 400 (not silently retried)", async () => {

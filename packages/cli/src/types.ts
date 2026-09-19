@@ -112,8 +112,26 @@ export interface ClaudishConfig {
   inputFile?: string; // File path for prompt input (-f / --file)
 
   // Advisor mode
+  /**
+   * --advisor was given on THIS launch. Independent of `monitor`: the advisor no
+   * longer borrows monitor mode (which forces ALL traffic to NativeHandler and so
+   * served a foreign `--model` from api.anthropic.com).
+   *
+   * Deliberately LAUNCH-ONLY — it is absent from `ClaudishProfileConfig` on purpose,
+   * so the advisor can never be switched on by stored config. Nothing to add to
+   * loadConfig's allowlist because nothing is loaded.
+   */
+  advisor?: boolean;
   advisorModels?: string[]; // Advisor models from --advisor flag
   advisorCollector?: string | null; // Collector model (null = no synthesis)
+  /**
+   * True when `advisorCollector` was NOT named by the user: `parseAdvisorFlag`
+   * supplied its default (`haiku`, for 2+ panel models with no `:`). Startup
+   * treats the two differently — a NAMED collector that cannot be called is a
+   * refusal, a DEFAULTED one is dropped (collector → null) with a notice. See
+   * advisor-startup.ts. Launch-only, like `advisor`: never in ClaudishProfileConfig.
+   */
+  advisorCollectorDefaulted?: boolean;
 
   // Persistent proxy daemon
   /**

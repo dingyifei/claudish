@@ -679,8 +679,24 @@ function accountStreamEvent(rawEvent: string): {
   if (typeof text === "string" && text.length > 0) {
     contentDelta = true;
     textChars = text.length;
-  } else if (parsed?.type === "content_block_delta" || parsed?.type === "content_block_start") {
+  } else if (parsed?.type === "content_block_delta") {
     contentDelta = true;
+  } else if (parsed?.type === "content_block_start") {
+    // A block that has only been OPENED is not output yet. Every `text` and
+    // `thinking` block starts empty and is filled by the deltas above, which are
+    // counted on their own — so counting the start as well only ever moves TTFT
+    // earlier than the first token.
+    //
+    // It became load-bearing when openai-sse started emitting an EMPTY text block
+    // for a turn that ended normally having produced nothing (so that `content`
+    // is never an empty array, a shape Anthropic's API does not produce). That
+    // block carries no delta, and counting it as visible output reported a model
+    // that said nothing as a healthy link — which is the exact reading this
+    // function exists to prevent.
+    //
+    // A `tool_use` start is the exception: the block start IS the call, and a
+    // tool call is output.
+    contentDelta = parsed.content_block?.type === "tool_use";
   }
 
   // Exact usage: Claude reports cumulative output_tokens on message_delta /

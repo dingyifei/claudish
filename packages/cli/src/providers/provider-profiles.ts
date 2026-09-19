@@ -44,6 +44,7 @@ import { LiteLLMProviderTransport } from "./transport/litellm.js";
 import { OllamaProviderTransport } from "./transport/ollamacloud.js";
 import { OpenAICodexTransport } from "./transport/openai-codex.js";
 import { OpenAIProviderTransport } from "./transport/openai.js";
+import { OpenCodeZenTransport } from "./transport/opencode-zen.js";
 import { VertexProviderTransport, parseVertexModel } from "./transport/vertex-oauth.js";
 
 // ---------------------------------------------------------------------------
@@ -366,8 +367,11 @@ export const glmProfile: ProviderProfile = {
  * empty here, exactly as for any other keyed provider without a key.
  *
  * Model routing inside the profile:
- *   - GPT-* models    → OpenAIProviderTransport (/v1/responses) + CodexAPIFormat (Responses API)
- *   - All other models → OpenAIProviderTransport (/v1/chat/completions) + OpenAIAPIFormat (delta-aware)
+ *   - GPT-* models    → OpenCodeZenTransport (/v1/responses) + CodexAPIFormat (Responses API)
+ *   - All other models → OpenCodeZenTransport (/v1/chat/completions) + OpenAIAPIFormat (delta-aware)
+ *
+ * Both branches use OpenCodeZenTransport, the OpenAI transport plus the per-conversation
+ * `x-opencode-session` header that Zen Go answers `400 MissingSessionID` without.
  *
  * MiniMax models take the SAME OpenAI path as everything else. They briefly had
  * their own Anthropic branch (AnthropicProviderTransport + AnthropicAPIFormat),
@@ -406,7 +410,7 @@ export const openCodeZenProfile: ProviderProfile = {
     // GPT models are served via the OpenAI Responses API (/v1/responses), not /v1/chat/completions.
     if (ctx.modelName.toLowerCase().startsWith("gpt-")) {
       const responsesProvider = { ...ctx.provider, apiPath: "/v1/responses" };
-      const transport = new OpenAIProviderTransport(responsesProvider, ctx.modelName, zenApiKey);
+      const transport = new OpenCodeZenTransport(responsesProvider, ctx.modelName, zenApiKey);
       const adapter = new CodexAPIFormat(ctx.modelName);
       const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
         adapter,
@@ -419,7 +423,7 @@ export const openCodeZenProfile: ProviderProfile = {
       return handler;
     }
 
-    const transport = new OpenAIProviderTransport(ctx.provider, ctx.modelName, zenApiKey);
+    const transport = new OpenCodeZenTransport(ctx.provider, ctx.modelName, zenApiKey);
     const adapter = new OpenAIAPIFormat(ctx.modelName);
     const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
       adapter,

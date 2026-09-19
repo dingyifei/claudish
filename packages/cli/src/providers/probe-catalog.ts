@@ -12,14 +12,22 @@
  * `models-index/TASK_probe_models_endpoint.md`.
  *
  * Lazy fetch: the first caller to need a probe model triggers a network
- * fetch. Subsequent reads hit the disk cache. On fetch failure the cache
- * stays empty and callers see `null` — the TUI surfaces this as
- * "could not reach model catalog" rather than running with stale data.
+ * fetch. Subsequent reads hit the disk cache. A failed fetch never overwrites
+ * the cache, and `getProbeModel` returns the last cached pick whatever its age.
+ *
+ * Using an old pick is safe, which is why a failed fetch is not fatal to the
+ * TUI. The pick is only the first model to TRY: the probe is a live request to
+ * the provider, so an outdated pick cannot produce a false pass. At worst it
+ * fails model-not-found and the TUI moves on to endpoint discovery. Failing
+ * every provider on a failed fetch — the previous behaviour — turned the v3
+ * cutover (this endpoint answers 426 to a v2 build) into 18 red rows, none of
+ * which had contacted its provider.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { isIncompatibleContractVersion, parseContractEnvelope } from "./catalog-compatibility.js";
 
 const PROBE_MODELS_URL = "https://us-central1-claudish-6da10.cloudfunctions.net/probeModels";
 // 1h TTL (matches the server's own instance cache). A 24h TTL meant a
@@ -48,9 +56,42 @@ export type FetchOutcome =
   | { kind: "timeout" }
   | { kind: "network"; reason: string }
   | { kind: "http"; status: number }
-  | { kind: "invalid"; reason: string };
+  | { kind: "invalid"; reason: string }
+  /**
+   * The endpoint answered in a catalog contract this build cannot read: a 426,
+   * or a body whose `contractVersion` is newer than this build supports. Kept
+   * apart from `http` because it is not a connectivity problem, and a caller
+   * that reports it as one sends the user to debug a working network.
+   */
+  | { kind: "incompatible"; serverContractVersion: number | null };
 
 let _inFlight: Promise<FetchOutcome> | null = null;
+
+/**
+ * One line naming why the probe catalog supplied no fresh pick, for the TUI.
+ *
+ * Only a connectivity failure says "could not reach". A contract mismatch says
+ * what it is: the network is fine, and a message that blames it sends the user
+ * to debug the wrong thing.
+ */
+export function describeProbeCatalogFailure(
+  outcome: Exclude<FetchOutcome, { kind: "ok" }>
+): string {
+  switch (outcome.kind) {
+    case "incompatible":
+      return outcome.serverContractVersion === null
+        ? "model catalog uses a newer contract than this build reads"
+        : `model catalog uses contract v${outcome.serverContractVersion}, newer than this build reads`;
+    case "http":
+      return `model catalog returned HTTP ${outcome.status}`;
+    case "timeout":
+      return "could not reach model catalog (timeout)";
+    case "network":
+      return `could not reach model catalog (${outcome.reason})`;
+    case "invalid":
+      return `model catalog response unreadable (${outcome.reason})`;
+  }
+}
 
 export function readProbeModelsCache(
   path: string = PROBE_MODELS_CACHE_PATH
@@ -102,7 +143,22 @@ export async function fetchProbeModels(
     };
   }
 
-  if (!response.ok) return { kind: "http", status: response.status };
+  if (!response.ok) {
+    // /probeModels negotiates the catalog contract like queryModels does, so at
+    // the v3 cutover it answers this build 426. Read the body before calling it
+    // a plain HTTP failure. The body is optional: a bare 426 is still a verdict.
+    let errorBody: unknown = null;
+    try {
+      errorBody = await response.json();
+    } catch {
+      // No JSON body. The status alone decides below.
+    }
+    const envelope = parseContractEnvelope(errorBody);
+    if (response.status === 426 || isIncompatibleContractVersion(envelope.contractVersion)) {
+      return { kind: "incompatible", serverContractVersion: envelope.contractVersion };
+    }
+    return { kind: "http", status: response.status };
+  }
 
   let body: unknown;
   try {
@@ -112,6 +168,13 @@ export async function fetchProbeModels(
       kind: "invalid",
       reason: e instanceof Error ? e.message : "json parse error",
     };
+  }
+  // A 200 in a newer contract is the same verdict. It must be caught here,
+  // before `isValidResponse`, which would otherwise report it as "missing
+  // providers map" and hide the real cause.
+  const bodyEnvelope = parseContractEnvelope(body);
+  if (isIncompatibleContractVersion(bodyEnvelope.contractVersion)) {
+    return { kind: "incompatible", serverContractVersion: bodyEnvelope.contractVersion };
   }
   if (!isValidResponse(body)) {
     return { kind: "invalid", reason: "missing providers map" };

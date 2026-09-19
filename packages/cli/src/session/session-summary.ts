@@ -18,9 +18,10 @@
  * alignment, and Jack asked for the probe TUI's look, which uses none.
  */
 
-import { C } from "../tui/theme.js";
+import { C, isLightTheme } from "../tui/theme.js";
+import { lighten } from "../tui/viz/color.js";
 import { padStartTo, padTo, truncate } from "../tui/viz/text.js";
-import { ramps, tokens } from "../tui/viz/tokens.js";
+import { type Ramp, ramps, tokens } from "../tui/viz/tokens.js";
 import {
   type BarSegment,
   RESET,
@@ -60,6 +61,31 @@ function toolOther(): string {
   return C.dim;
 }
 
+/**
+ * A fill colour for a large AREA, as opposed to a colour for a glyph.
+ *
+ * `C`'s light accents are picked for TEXT contrast: `#1d4ed8`, `#dc2626` and friends all
+ * clear 4.5:1 on white, which is what a letter needs. Forty columns of solid `█` in the
+ * same hex is not a letter, it is a slab, and on a cream page it takes the eye before
+ * the numbers beside it do. Scaling toward white keeps the hue identity — the bar is
+ * still recognisably the blue one — at a weight that lets the card read as text with a
+ * chart in it rather than a chart with some text.
+ *
+ * Dark is left alone: neon on true black is the btop look the rest of claudish already
+ * renders, and lightening there would wash it out rather than calm it.
+ *
+ * Called at RENDER time, like every `C` read (see the `toolColors` note above).
+ */
+function area(hex: string): string {
+  return isLightTheme() ? lighten(hex, 0.55) : hex;
+}
+
+/** `area()` across a gradient's stops, preserving the non-empty tuple `Ramp` requires. */
+function areaRamp(ramp: Ramp): Ramp {
+  const [first, ...rest] = ramp;
+  return [area(first), ...rest.map(area)];
+}
+
 const MIN_W = 62;
 const MAX_W = 96;
 /** Border + one space of padding on each side. */
@@ -93,6 +119,13 @@ export interface SummaryInput {
   resumeModelSpec: string | null;
   /** Session UUID to resume, when one could be found. */
   resumeId: string | null;
+  /**
+   * Directory the resume command must run from, or null when the caller's own directory
+   * will do. Set for a git worktree, which is the case where the user is most likely to
+   * be somewhere else — or nowhere, the worktree having been removed — by the time they
+   * paste the line.
+   */
+  resumeCwd?: string | null;
   /** Non-zero when the child exited badly — the card says so instead of implying success. */
   exitCode: number;
 }
@@ -102,8 +135,19 @@ export interface SummaryInput {
  * newline, so the caller decides the stream (stdout when interactive, stderr in print
  * mode, where stdout belongs to the machine-readable output).
  */
+/**
+ * Quote a path for the shell, only when it needs it.
+ *
+ * The resume line is meant to be copied and run, so a path holding a space has to
+ * survive the paste. Unquoted for the ordinary case, because a line wrapped in quotes
+ * that did not need them reads like it came from a script rather than from a prompt.
+ */
+function shellArg(path: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, `'\\''`)}'`;
+}
+
 export function renderSessionSummary(input: SummaryInput): string[] {
-  const { stats, modelSpec, resumeModelSpec, resumeId, exitCode } = input;
+  const { stats, modelSpec, resumeModelSpec, resumeId, resumeCwd, exitCode } = input;
   const W = cardWidth();
   const inner = W - CHROME;
   const out: string[] = [];
@@ -146,10 +190,19 @@ export function renderSessionSummary(input: SummaryInput): string[] {
   // Every data row is `label | bar | right-aligned values`, with the bar taking all the
   // space the other two do not. Sizing the bar to the leftovers is what keeps the card
   // free of the dead gutter a fixed-width bar leaves down the right-hand side.
+  // The bar is CAPPED rather than sized to the leftovers. Filling every spare column
+  // made the bars the widest thing on the card at any terminal width, so on a wide
+  // window the card grew and the charts grew with it while the numbers stayed the same
+  // size. A bounded bar plus a gap keeps the proportion fixed: the meter is a reference
+  // mark beside the value, and the value is what is being read.
   const VALUE_W = 24;
-  const barW = Math.max(12, inner - LABEL_W - VALUE_W);
+  const BAR_MAX = 30;
+  const barW = Math.max(12, Math.min(BAR_MAX, inner - LABEL_W - VALUE_W));
+  const barGap = Math.max(0, inner - LABEL_W - barW - VALUE_W);
   const dataRow = (label: string, bar: string, values: string): void => {
-    row(dim(padTo(label, LABEL_W)) + bar + padVisible(values, VALUE_W, "right"));
+    row(
+      dim(padTo(label, LABEL_W)) + bar + " ".repeat(barGap) + padVisible(values, VALUE_W, "right")
+    );
   };
 
   // ── context ───────────────────────────────────────────────────────────────
@@ -159,7 +212,7 @@ export function renderSessionSummary(input: SummaryInput): string[] {
     const pct = stats.contextUsed * 100;
     dataRow(
       "context",
-      meter(pct, barW, ramps.load),
+      meter(pct, barW, areaRamp(ramps.load)),
       body(padStartTo(`${Math.round(pct)}%`, 4)) +
         dim(`  ${compact(stats.inputTokens)}/${compact(stats.contextWindow)}`)
     );
@@ -180,8 +233,8 @@ export function renderSessionSummary(input: SummaryInput): string[] {
     "tokens",
     stackedBar(
       [
-        { value: stats.inputTokens, color: C.blue },
-        { value: stats.outputTokens, color: C.cyan },
+        { value: stats.inputTokens, color: area(C.blue) },
+        { value: stats.outputTokens, color: area(C.cyan) },
       ],
       barW
     ),
@@ -192,8 +245,8 @@ export function renderSessionSummary(input: SummaryInput): string[] {
       "spend",
       stackedBar(
         [
-          { value: stats.inputCostUsd, color: C.blue },
-          { value: stats.outputCostUsd, color: C.cyan },
+          { value: stats.inputCostUsd, color: area(C.blue) },
+          { value: stats.outputCostUsd, color: area(C.cyan) },
         ],
         barW
       ),
@@ -207,8 +260,13 @@ export function renderSessionSummary(input: SummaryInput): string[] {
     const other = toolOther();
     const shown = stats.toolCalls.slice(0, toolCols.length);
     const rest = stats.toolCalls.slice(toolCols.length).reduce((a, t) => a + t.count, 0);
-    const segs: BarSegment[] = shown.map((t, i) => ({ value: t.count, color: toolCols[i]! }));
-    if (rest > 0) segs.push({ value: rest, color: other });
+    // The BAR takes the tinted fill; the legend below keeps the full-strength colour,
+    // because there the hue is carried by a few glyphs of text and needs the contrast.
+    const segs: BarSegment[] = shown.map((t, i) => ({
+      value: t.count,
+      color: area(toolCols[i]!),
+    }));
+    if (rest > 0) segs.push({ value: rest, color: area(other) });
 
     dataRow(
       "tools",
@@ -227,28 +285,40 @@ export function renderSessionSummary(input: SummaryInput): string[] {
   blank();
 
   // ── cost and savings ──────────────────────────────────────────────────────
+  // Money is printed in body ink, not in green.
+  //
+  // Green is this palette's "ok" and it was doing no work here: every price on the card
+  // is a fact, not a verdict, and `free` already has the FREE badge two rows above
+  // saying so in colour. Painting the figures too left the card with three greens
+  // competing and the eye landing on the least surprising one.
   row(
     dim(padTo("cost", LABEL_W)) +
-      paint(
-        stats.isFree ? "free" : usd(stats.costUsd),
-        stats.isFree ? tokens.success : tokens.text,
-        true
-      ) +
+      paint(stats.isFree ? "free" : usd(stats.costUsd), tokens.text, true) +
       (stats.isEstimated && !stats.isFree ? dim("  estimated") : "")
   );
 
+  // The bar length is the amount saved measured against the DEAREST baseline, not the
+  // fraction of its own baseline that each row avoided.
+  //
+  // The fraction is 100% for every row of every FREE session — nothing was spent, so
+  // everything was avoided — which drew two identical full bars, the loudest mark on the
+  // card, carrying no information. Against the dearest baseline the same two rows say
+  // something true and different: `vs Opus` fills and `vs Sonnet` sits at 40%, which is
+  // the ratio between what those two would have charged. The percentage did not
+  // disappear, it moved to the text, where a number that is often constant belongs.
+  const dearest = Math.max(0, ...stats.savings.map((s) => s.baselineUsd));
   for (const s of stats.savings) {
     const label = padTo(`vs ${s.label}`, LABEL_W);
     if (s.savedUsd >= 0) {
-      // Fraction of the baseline price avoided — bounded, so: gradient meter, on the
-      // REVERSED ramp, because here a full bar is the best outcome.
       const pct = s.baselineUsd > 0 ? (s.savedUsd / s.baselineUsd) * 100 : 0;
+      // `volume`, not `savings`: the bar now encodes a MAGNITUDE (how much money), and
+      // per the ramp's own note a magnitude with no valence stays inside one hue family.
+      // The red-to-green ramp would claim the small saving is a bad one.
+      const share = dearest > 0 ? (s.savedUsd / dearest) * 100 : 0;
       dataRow(
         label,
-        meter(pct, barW, ramps.savings),
-        paint(padStartTo(`${Math.round(pct)}%`, 4), tokens.success) +
-          dim(" saved ") +
-          paint(usd(s.savedUsd), tokens.success)
+        meter(share, barW, areaRamp(ramps.volume)),
+        dim(`${padStartTo(`${Math.round(pct)}%`, 4)} saved `) + body(usd(s.savedUsd))
       );
     } else {
       // Costing MORE than Claude is a real outcome and is reported as one. The row keeps
@@ -256,7 +326,7 @@ export function renderSessionSummary(input: SummaryInput): string[] {
       // misread as a saving.
       dataRow(
         label,
-        meter(0, barW, ramps.savings),
+        meter(0, barW, areaRamp(ramps.volume)),
         dim("over by ") + paint(usd(-s.savedUsd), tokens.error)
       );
     }
@@ -275,7 +345,15 @@ export function renderSessionSummary(input: SummaryInput): string[] {
     // `resumeModelSpec`. A resume that re-reads the user's profile is correct; one that
     // pins a bare name can route to a different provider than the session used.
     const modelFlag = resumeModelSpec ? `--model ${resumeModelSpec} ` : "";
-    out.push(`claudish ${modelFlag}--resume ${resumeId}`);
+    // A `cd` is prepended when the session ran in a WORKTREE.
+    //
+    // Claude Code files a session under a directory key derived from the cwd, so
+    // `--resume <id>` only resolves from the directory the session ran in. The main
+    // checkout is usually where the user already is; a worktree never is. The line as it
+    // stood was therefore a command that silently found nothing precisely in the case
+    // where the id was hardest to recover by hand.
+    const prefix = resumeCwd ? `cd ${shellArg(resumeCwd)} && ` : "";
+    out.push(`${prefix}claudish ${modelFlag}--resume ${resumeId}`);
   }
 
   return out;

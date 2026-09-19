@@ -168,6 +168,14 @@ team: 2 models, 2 done, 7s, 102.9k tok, $0.104
 
 **Knobs**: `onProgress` (callback) and `progressIntervalSeconds` (default 5) on `TeamRunOptions`.
 
+**A third transport reaches the polling orchestrator** (v9.2.0). The two above reach an agent's
+context and a human's terminal; neither reaches a caller polling `team(mode:"status")`, which is
+how every review panel actually watches a run. That caller had only `outputSize`, which is written
+once at completion and so reads 0 for a slot's whole life — and orchestrators read it as progress
+and reported working slots as dead. `live_output_bytes_by_slot` now carries the same live count
+`status.txt` shows, in the same unit `outputSize` ends up holding. See
+`ai-docs/architecture/team-lifecycle.md`.
+
 **Implementation**: `packages/cli/src/team-stats.ts`, wired in `team-orchestrator.ts` (ticker +
 child env) and `mcp-server.ts` (`ChannelNotifier` passed into `defineTools`).
 
@@ -247,6 +255,34 @@ never hold one. v7.33.0 ships the reachable version instead: `claudish login
 antigravity` installs and delegates to `agy`, which owns the whole credential
 lifecycle. Refresh delegates the same way (`agy models`). Do not re-open this
 expecting a claudish-native OAuth flow.
+
+---
+
+## The two bundled `claudish-usage` SKILL.md copies are stale and never mention `team`
+
+Status: not started.
+
+`skills/claudish-usage/SKILL.md` and `packages/cli/skills/claudish-usage/SKILL.md` (the
+latter shipped in the npm package's `files` array and installed into a project by
+`cli.ts:2408`) were last touched at v4.5.1. Neither mentions `team` at all, and they have
+drifted from each other on model ids (`openai/gpt-5` vs `openai/gpt-5.3`).
+
+They are NOT the plugin skill. The skill agents actually load is
+`plugins/claudish/skills/claudish-usage/SKILL.md` in the magus-src repo, which is current
+and which carries the `team` lifecycle documentation. So these two copies cannot teach a
+wrong `team` procedure — they say nothing about `team` — but a user who runs the
+install-skill path gets a document that is four major versions behind on everything else.
+
+Found while fixing the `outputSize`-as-progress misreading (v9.2.0); deliberately left
+alone there, because rewriting an unrelated stale document inside a bug fix is scope creep.
+
+**Trigger condition**: someone reports confusion from the installed skill, OR the
+install-skill path is touched for any other reason. Whoever picks it up must first decide
+whether these copies should exist at all — a third copy of a document whose real home is
+another repo is the actual defect, and deleting them plus pointing the CLI at the plugin
+may be the correct fix rather than syncing a third copy forever.
+
+**Effort**: small to decide, medium if the answer is "sync", small if the answer is "delete".
 
 ---
 
@@ -377,3 +413,180 @@ does a dialect-aware native-value path earn its complexity.
 
 **Do not** widen `EffortLevel` itself to accommodate one provider. It is the canonical
 vocabulary Claude Code emits, and the clamp table is what maps it onto each provider.
+
+---
+
+## Route `--advisor` panel calls through subscription-aware routing
+
+Status: not started. Deliberately out of scope for the any-model advisor work.
+
+Every `--advisor` panel model and collector is called through `advisorRouteFor`
+(`handlers/native-handler-advisor.ts`) with a raw metered API key: api.openai.com with
+`OPENAI_API_KEY`, the direct Gemini API with `GEMINI_API_KEY`, api.anthropic.com with
+`ANTHROPIC_API_KEY` for a Claude collector, and OpenRouter with `OPENROUTER_API_KEY` for
+everything else. It never calls `route()`. So a Codex, SuperGrok or Antigravity subscriber pays
+per token for panel calls, and a `cx@` or `gk@` panel spec goes to OpenRouter.
+
+This is visible, not silent: the startup notice prints each panel model's host and key with
+"billed per token" under "panel calls never use a subscription", and a panel model with no key
+is refused at startup.
+
+**Why parked.** Making the panel subscription-aware means sending each panel call through the
+routing chain (the credential authority's OAuth arms, per-provider transports,
+`SUBSCRIPTION_PROVIDERS` billing) instead of one bare `fetch` per model. That rewrites the advice
+retrieval path, which the stub paths and origin records were built around, and the feature's
+out-of-scope list protected panel behaviour.
+
+**Trigger condition** (either is sufficient):
+
+1. A user asks to run the panel on their subscription, or reports unexpected metered spend from
+   panel calls.
+2. The panel's advice retrieval path is being reworked for another reason.
+
+**Must still hold after the change:** origin records still separate `upstream` from `stub` per
+model; billing is decided by the credential that signed (`RequestAuth.arm`), never by the
+provider name (CLAUDE.md invariants); the startup refusal and notice keep reading the same single
+routing function as the runtime.
+
+**Effort**: medium to large.
+
+Reference: `ai-docs/architecture/advisor.md` ("Panel routing and billing");
+`ai-docs/reports/advisor-scope-decisions-20260910.md`.
+
+---
+
+## `--advisor`: a reasoning-only panel reply is recorded as a stub
+
+Status: not started. Recorded as a known limitation of the any-model advisor work.
+
+`extractChatCompletionText` (`packages/cli/src/handlers/native-handler-advisor.ts:2179-2187`)
+reads only `choices[0].message.content`, as a string or as an array of text parts. If a
+reasoning model answers HTTP 200 with its text in a reasoning field and `content` null or empty,
+the check at `:2152` records `origin: "stub"` with "HTTP 200 but the response carried no advice
+text". The main model then receives a failure, not advice, for a call that was billed.
+
+This is visible, not silent: the failure text names the model, the call raises one warning, and
+the `advisor_call` record says `stub`.
+
+**Why parked.** Two questions come first. The field that carries reasoning differs between
+providers, so the shape must come from a real captured response, never a guessed one (fixtures
+come from real debug logs). And reasoning without a final answer is the model's working, not its
+conclusion; whether it counts as advice is a product decision.
+
+**Trigger condition**: a real run shows a panel model returning reasoning with empty content, or
+a user reports stub advice from a reasoning model.
+
+**Must still hold after the change:** a reply with no text at all stays `stub`; if reasoning is
+accepted as advice, the `advisor_call` record says so, so a reader can tell it apart from an
+answer.
+
+**Effort**: small.
+
+Reference: `ai-docs/reports/advisor-build-report-20260911.md` ("Known limitations").
+
+---
+
+## `openai-sse` parser: one `catch` drops every per-chunk error without a log line
+
+Status: not started. Found during the any-model advisor work; not specific to the advisor.
+
+In `packages/cli/src/handlers/shared/stream-parsers/openai-sse.ts`, the `try` at `:534` opens
+with `JSON.parse(dataStr)` and closes at `:896` with `} catch (e) {}`. It covers the parse and
+all chunk handling after it: usage, text deltas, reasoning, and tool calls. Any exception in
+those 360 lines is dropped, and the loop moves to the next line. A malformed chunk, or a bug in
+tool-call handling, can drop a tool call while the turn still ends with `end_turn`.
+
+The raw chunk is logged verbatim at `:528` under `--debug`, so the input survives. The fact that
+it was dropped does not. `openai-sse` is the default stream format for every adapter that does
+not override it (`packages/cli/src/adapters/base-api-format.ts:605`), so the effect reaches most
+foreign providers. During the advisor work this cost a full investigation of the SSE log
+truncation defect.
+
+The catches at `:267` and `:270` are different: they guard `enqueue` and `close` on a stream
+that can already be closed, and are correct.
+
+**Why parked.** Out of scope for the advisor work, and the file is shared by every OpenAI-shaped
+provider, so a change needs its own test run across the stream-format fixtures.
+
+**Trigger condition**: the next edit to `openai-sse.ts`, or any report of a tool call that
+vanished or a turn that ended early on an OpenAI-shaped provider.
+
+**Must still hold after the change:** one bad chunk still does not end the stream; the error is
+logged with enough context to find the chunk in a debug log; the replayed fixtures in
+`format-translation.test.ts` stay green.
+
+**Effort**: small for a log line; medium if the `try` is narrowed to the parse.
+
+---
+
+## Local `bun run test` skips the macOS bridge suite
+
+Status: not started. Local only; CI is not affected.
+
+`package.json:23` runs `bun run --cwd packages/cli test && bun run --cwd packages/macos-bridge
+test`. On `bun` 1.4.0 the two `displayWidth` Unicode-oracle tests in
+`packages/cli/src/tui/viz/color.test.ts` fail, the CLI suite exits non-zero, and `&&` stops
+before the bridge suite starts. A local `bun run test` therefore reports nothing about the
+bridge.
+
+CI pins `bun` 1.3.10 (`.github/workflows/test.yml:58`), where the CLI suite is green and the
+bridge suite runs: run `34544453952` on the `v9.3.0` merge printed `Ran 3257 tests across 211
+files`, then `Ran 20 tests across 1 file`.
+
+**Why parked.** Nothing is unguarded in CI today. The risk arrives when the CI pin moves to a
+`bun` version where the two tests fail: CI then goes red and, the same way, stops running the
+bridge suite.
+
+**Trigger condition**: the CI `bun` pin is raised, or someone relies on a local run to check a
+bridge change.
+
+**Must still hold after the change:** the root `test` script still fails when either suite
+fails; both suites report even when the first one fails.
+
+**Effort**: small.
+
+---
+
+## Regression test: a Responses stream that dies mid tool-call
+
+Status: DONE. Fix shipped, unit test written and mutation-proven, and the client-side
+behaviour verified end to end against a real Claude Code run (see
+`ai-docs/reports/truncated-toolcall-live-verification.md`). Kept here for the method,
+which is reusable for any "does the harness honour this wire signal" question.
+
+The fix is in `openai-responses-sse.ts`: when `openToolBlocks` is non-empty in the
+parser's catch block, the turn ends with an SSE `error` event instead of `end_turn`,
+so Claude Code cannot execute a tool call whose argument JSON was cut mid-object.
+Rationale and the evidence behind it: `ai-docs/architecture/adapters.md`, section
+"A stream that dies mid tool-call".
+
+**Trigger condition**: a stable connection to the Codex backend. Nothing else blocks it.
+
+**The spec** (kept here because `ai-docs/sessions/` does not survive a fresh clone):
+
+Append one `describe` block to
+`packages/cli/src/handlers/shared/stream-parsers/openai-responses-sse.test.ts`, reusing
+its `createMockContext` / `parseClaudeSseStream` helpers. Derive the upstream body from
+the REAL capture `test-fixtures/sse-responses/gpt-5.6-sol-responses-turn1.sse` — do not
+hand-write SSE. In that fixture the first `function_call` item is added at line 94, its
+first argument delta is line 97, and it completes at line 103.
+
+- Test 1 — cut the fixture just after line 97, then `controller.error(new TypeError("The
+  socket connection was closed unexpectedly"))`, which is the production error text.
+  Assert: an `event: error` frame with `error.type === "api_error"`; NO `message_delta`
+  carrying `stop_reason: "end_turn"`; a `tool_use` `content_block_start` WAS emitted (or
+  the test can pass vacuously by the tool never starting); every block start has exactly
+  one matching stop.
+- Test 2 — cut during `response.output_text.delta`, before any `function_call` item, and
+  error the stream identically. Assert `stop_reason: "end_turn"` and a text block
+  containing `[Stream error:`. This pins the branch that must NOT change.
+
+**Acceptance criterion**: mutation-test it. Force the `if (toolCallCutOff)` condition to
+`false`, confirm test 1 goes red and test 2 stays green, then restore the file by copy —
+never `git checkout` or `git stash`, the index is shared with sibling worktrees.
+
+**VERIFIED 2026-09-10**: Claude Code DOES discard a partial tool block on a mid-stream
+`error` event. Measured before/after against the same mock upstream: released v9.0.8
+executed the truncated `Write` and returned `InputValidationError`, while the fixed build
+executed no tool at all and retried the turn. Method and raw evidence:
+`ai-docs/reports/truncated-toolcall-live-verification.md`.

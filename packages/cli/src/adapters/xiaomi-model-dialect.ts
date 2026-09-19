@@ -19,19 +19,11 @@ export class XiaomiModelDialect extends BaseAPIFormat {
     };
   }
 
-  override getToolNameLimit(): number {
-    return 64;
-  }
-
-  protected override prepareRequestCommon(request: any, _originalRequest: any): any {
-    // Truncate tool names to 64 chars — a wire-agnostic API constraint.
-    this.truncateToolNames(request);
-    if (request.messages) {
-      this.truncateToolNamesInMessages(request.messages);
-    }
-
-    return request;
-  }
+  // The 64-char limit and the truncation call that used to stand here are gone:
+  // `BaseAPIFormat.getToolNameLimit()` now returns 64 for every OpenAI-shaped
+  // wire, and `prepareRequest`'s template applies it. Xiaomi enforces the limit
+  // strictly, which is why this dialect was the only adapter in the tree that
+  // ever truncated at all — it is no longer special.
 
   protected override applyNativeReasoning(request: any, originalRequest: any): any {
     // Xiaomi's own API doesn't support thinking params.

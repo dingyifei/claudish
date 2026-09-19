@@ -52,8 +52,19 @@ export interface ProviderTransport {
   /** Get the full API endpoint URL for a request */
   getEndpoint(model?: string): string;
 
-  /** Get HTTP headers (may be async for OAuth token refresh) */
-  getHeaders(): Promise<Record<string, string>>;
+  /**
+   * Get HTTP headers (may be async for OAuth token refresh).
+   *
+   * `claudeRequest` is the ORIGINAL inbound Claude-format body, for a header that
+   * carries conversation identity (OpenCode Zen's `x-opencode-session`). Besides
+   * `transformPayload`, this is the only hook that can see that identity, and the
+   * value must be derived from the argument on every call — never stashed on the
+   * instance in `transformPayload` and read back here, because one transport
+   * serves overlapping requests from different conversations (the same race as
+   * `classifyTerminalError` below). Optional, so existing implementers that
+   * ignore it are untouched.
+   */
+  getHeaders(claudeRequest?: unknown): Promise<Record<string, string>>;
 
   /**
    * Override the adapter's stream format selection.

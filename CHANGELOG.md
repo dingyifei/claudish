@@ -2,6 +2,245 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [9.7.1] - 2026-09-18
+
+### Bug Fixes
+
+- stop Test All failing every provider when the probe catalog is unreadable *(tui)* ([`e5d3cc5`](https://github.com/MadAppGang/claudish/commit/e5d3cc543ee57ecd55a1ed1ea3c8cb414447f354))
+
+### Documentation
+
+- report the models-index v3 cutover to the backend([`a7c2b3a`](https://github.com/MadAppGang/claudish/commit/a7c2b3a2df9b675dac804efa626bb7c5195cfa85))
+- update CHANGELOG.md for v9.7.0([`06a82a5`](https://github.com/MadAppGang/claudish/commit/06a82a579d083addca59836e4dd0d9304748be62))
+
+## [9.7.0] - 2026-09-18
+
+### Bug Fixes
+
+- stop the incompatibility guard exiting, and let the sentinel expire *(catalog)* ([`eec9e7e`](https://github.com/MadAppGang/claudish/commit/eec9e7e156a1f832cc5219c35fadd7499f44837a))
+
+### Documentation
+
+- record the v3 remediation and d0c1538 reviews([`8bb4097`](https://github.com/MadAppGang/claudish/commit/8bb4097fca452cfd16b23ade3a30b3b42c95dfdd))
+- review the models-index v3 implementation from the client side([`510e7cd`](https://github.com/MadAppGang/claudish/commit/510e7cdd8d893b41c232f3612584e5140c968443))
+- update CHANGELOG.md for v9.6.1([`e712718`](https://github.com/MadAppGang/claudish/commit/e712718d94d23c43b3d6cddd5fab100a7ba6ed75))
+
+### New Features
+
+- refuse a stale cache when the catalog contract moves ahead *(catalog)* ([`cb46b0a`](https://github.com/MadAppGang/claudish/commit/cb46b0a04f0642f810ad763f28a6bda02f176568))
+
+## [9.6.1] - 2026-09-17
+
+### Bug Fixes
+
+- tell --models --provider users which vocabulary their slug is from *(cli)* ([`a01f759`](https://github.com/MadAppGang/claudish/commit/a01f759834f79ada24a6df9b737fd656663e59ab))
+- separate SSE streams by upstream response id *(test-fixtures)* ([`4d5ae9f`](https://github.com/MadAppGang/claudish/commit/4d5ae9fc80e3f0ce1e86a5f63219a907d4dfa3f7))
+- unwrap <tool_call> envelopes before the strict parser sees them *(tools)* ([`58b5775`](https://github.com/MadAppGang/claudish/commit/58b577512cbd37e37844c07ba5b496670c0309de))
+
+### Documentation
+
+- update CHANGELOG.md for v9.6.0([`590777b`](https://github.com/MadAppGang/claudish/commit/590777b7e5c8ae8dc7e917bea0ee4ad5a35014e4))
+
+### Other Changes
+
+- v9.6.1 *(release)* ([`2cb18a2`](https://github.com/MadAppGang/claudish/commit/2cb18a2667a54a0c2e1ccc50b21a4d53fceace1c))
+
+## [9.6.0] - 2026-09-17
+
+### Bug Fixes
+
+- keep the head of a response in stdoutSnippet *(team)* ([`9a96b19`](https://github.com/MadAppGang/claudish/commit/9a96b1974545111d553ba9f3bdc620f67ac728e3))
+- put the pid in log filenames so concurrent children stop clobbering *(logger)* ([`819ed50`](https://github.com/MadAppGang/claudish/commit/819ed5011d16754e52f8e33be554043cfdde5c40))
+- keep Claude Code's unrecognized-model line out of child stderr *(runner)* ([`3ea3dbd`](https://github.com/MadAppGang/claudish/commit/3ea3dbd6025ca76d5ab7e32c71fc6bab078bc627))
+- surface an upstream error carried inside a 200 stream *(sse)* ([`321c2f0`](https://github.com/MadAppGang/claudish/commit/321c2f040da78c37553b6d2ae2458575e80fac69))
+
+### Documentation
+
+- record the gemini in-band 400 investigation *(reports)* ([`c3e95b4`](https://github.com/MadAppGang/claudish/commit/c3e95b47bfc9b645ada199ff5387dbf15596f818))
+- update CHANGELOG.md for v9.5.0([`b7a7868`](https://github.com/MadAppGang/claudish/commit/b7a7868df64e4241839f1658235179693f3d5250))
+
+### New Features
+
+- consume the repaired models-index contract *(catalog)* ([`d50ae6a`](https://github.com/MadAppGang/claudish/commit/d50ae6a24b246eeea46b263dc4a601e30c4cd21a))
+
+### Other Changes
+
+- v9.6.0 *(release)* ([`cbfd9fa`](https://github.com/MadAppGang/claudish/commit/cbfd9fab09cb5bf7e1c6db059d1d53c8e5b75941))
+
+## [9.5.0] - 2026-09-16
+
+### Bug Fixes
+
+- choose the tool_result image marker per RESULT, not per turn *(format)* ([`9f4488d`](https://github.com/MadAppGang/claudish/commit/9f4488d325a2ae152b189c524482064295925478))
+- the block writer refuses to re-open an index it already stopped *(sse)* ([`48f1f90`](https://github.com/MadAppGang/claudish/commit/48f1f90d510804c1cea60f4c5ff76a25bfc0f5ca))
+- ask BOTH adapters to recover from a rejected parameter *(handlers)* ([`9013032`](https://github.com/MadAppGang/claudish/commit/90130322e75eb7bc42e291a7a327b3245176b109))
+- never encode tool names into a wire that cannot decode them *(adapters)* ([`5b15868`](https://github.com/MadAppGang/claudish/commit/5b15868760cca73b178c9dbcd7b06a4b421cd099))
+- a context overflow leads with `prompt is too long` (item 8) *(errors)* ([`e0b4016`](https://github.com/MadAppGang/claudish/commit/e0b401699b11fc8b68b594758317d07f1d12f1a2))
+- split prompt_tokens into the three input counters (item 6) *(tokens)* ([`f9baf2e`](https://github.com/MadAppGang/claudish/commit/f9baf2effbaefd811f18bd6a68d4d3853b96666a))
+- a reversible 64-char tool-name codec on every OpenAI wire (item 7) *(adapters)* ([`2e18042`](https://github.com/MadAppGang/claudish/commit/2e18042c67504f9b6e07de75feed1ded491d7efe))
+- map tool_choice any to required, from one shared mapper (item 10) *(adapters)* ([`d170a3f`](https://github.com/MadAppGang/claudish/commit/d170a3ff3b8063d72d55a22ec1087aec5ec17f79))
+- forward stop_sequences as stop, and top_p (item 11) *(adapters)* ([`912031e`](https://github.com/MadAppGang/claudish/commit/912031e61128becc77727e79bb465040fe5309be))
+- order tool results by their calls and name a missing one (item 14) *(format)* ([`a981d13`](https://github.com/MadAppGang/claudish/commit/a981d13acfe906407567f435d3fa3026617c0d4b))
+- merge adjacent user messages and close an orphan tool round (item 13) *(format)* ([`b9e2163`](https://github.com/MadAppGang/claudish/commit/b9e21638283a3524dbe8bf8dc261fba763b55820))
+- forward a url image source as that url (item 16) *(format)* ([`84578c9`](https://github.com/MadAppGang/claudish/commit/84578c9d42e58a7e270bbba45f3d5a54086368c6))
+- parse the function-tag envelope first, then type its values (item 9) *(tools)* ([`4a0948c`](https://github.com/MadAppGang/claudish/commit/4a0948c45f03cde86feed73aae16f2ac7a3c2a6f))
+- an empty-string required argument is present, not missing (item 1) *(tools)* ([`417ef5c`](https://github.com/MadAppGang/claudish/commit/417ef5c49c3a18aa06bfa79c81e8d3c1721fe446))
+- a successful turn is never contentless (item 12) *(sse)* ([`edd4ce9`](https://github.com/MadAppGang/claudish/commit/edd4ce9407324e72c7ef05f8a342a4758ea60b57))
+- a stream that ends with no finish_reason after producing content is a failure (item 4) *(sse)* ([`c1b907f`](https://github.com/MadAppGang/claudish/commit/c1b907ffb1630bddbb5af02b8ff050ffa46caf0a))
+- <think>…</think> in content becomes a thinking block (item 3) *(sse)* ([`d4cba87`](https://github.com/MadAppGang/claudish/commit/d4cba87ef27e8910fd1351db363ac8ef5355a097))
+- buffer tool-argument fragments that arrive before function.name (item 2) *(sse)* ([`baf19ef`](https://github.com/MadAppGang/claudish/commit/baf19efb210f3c9586df7146926830826a688642))
+- a tool_use content_block_start carries input: {} (item 17) *(sse)* ([`1fb4e31`](https://github.com/MadAppGang/claudish/commit/1fb4e31d290a4fbf34244cd6db6b647970e704ac))
+- exactly one content block open at a time (item 5) *(sse)* ([`ccca029`](https://github.com/MadAppGang/claudish/commit/ccca029c43d04b33fc7c85348c4b941a9c444dd3))
+- log instead of swallowing in the openai-sse chunk-loop catch *(sse)* ([`ea5258c`](https://github.com/MadAppGang/claudish/commit/ea5258c3db15017a1c9f334472dfdb3f6b0c549d))
+
+### Documentation
+
+- stamp the playbook verified at v9.4.0 *(release)* ([`ea19974`](https://github.com/MadAppGang/claudish/commit/ea1997432207759102468237a8eabc081cd410fd))
+- update CHANGELOG.md for v9.4.0([`f1c6f7a`](https://github.com/MadAppGang/claudish/commit/f1c6f7a3adcb5240dede167f8f60adc5d550bf67))
+
+### Other Changes
+
+- v9.5.0 *(release)* ([`a939149`](https://github.com/MadAppGang/claudish/commit/a9391494c7eadffa832ab37c467ee505b6e8da6b))
+
+## [9.4.0] - 2026-09-15
+
+### Documentation
+
+- stamp the playbook verified at v9.3.2 *(release)* ([`488a17f`](https://github.com/MadAppGang/claudish/commit/488a17fdcc609f715cdd8b5374bfe4f76b6c655e))
+- update CHANGELOG.md for v9.3.2([`464637a`](https://github.com/MadAppGang/claudish/commit/464637ae289c2b178e5474b2e6b6a14bc60f82af))
+
+## [9.3.2] - 2026-09-14
+
+### Documentation
+
+- update CHANGELOG.md for v9.3.1([`1561622`](https://github.com/MadAppGang/claudish/commit/1561622a2cd1cf4b92bba15e8b9cc93f5a05090d))
+
+### Other Changes
+
+- v9.3.2 *(release)* ([`22cef36`](https://github.com/MadAppGang/claudish/commit/22cef36aecf8b49977d7fe4bdbbc0f93c1ada4c8))
+
+## [9.3.1] - 2026-09-14
+
+### Bug Fixes
+
+- drop exited slots from team liveness; send x-opencode-session to Zen Go *(team,zen)* ([`d675536`](https://github.com/MadAppGang/claudish/commit/d6755362a51669854cc0ba155d3d5e857c3a738e))
+
+### Documentation
+
+- add the handoff for the four advisor follow-ups([`1397aac`](https://github.com/MadAppGang/claudish/commit/1397aacae91a7e36673df8f52cb2643ff58954d2))
+- archive the advisor build evidence, and park three follow-ups([`fe0bd29`](https://github.com/MadAppGang/claudish/commit/fe0bd29c160e4a9b1f33692708273db781578a55))
+- update CHANGELOG.md for v9.3.0([`301182d`](https://github.com/MadAppGang/claudish/commit/301182dc8bd0b708bf7bea3680214a788a2e22b0))
+
+### Other Changes
+
+- v9.3.1 *(release)* ([`6f6e026`](https://github.com/MadAppGang/claudish/commit/6f6e0261e249858bf7dea4a088fe448270c49154))
+
+## [9.3.0] - 2026-09-10
+
+### Bug Fixes
+
+- stop truncating SSE payloads, and refuse corrupt fixtures *(debug)* ([`333026b`](https://github.com/MadAppGang/claudish/commit/333026bcf9385645aac07a201e4cc07f73d104a5))
+- ask the panel the question, warm the catalog, resolve the collector *(advisor)* ([`5836843`](https://github.com/MadAppGang/claudish/commit/583684355d79949be29ee4ad9f7f6bec62be3e36))
+- send the token parameter and model id each endpoint accepts *(advisor)* ([`6edb729`](https://github.com/MadAppGang/claudish/commit/6edb729d4f63c50f639f026f6ee198f7f56ad7ac))
+- sanitise failure text, resolve prefixed panel specs, stop false S10 *(advisor)* ([`58b44b1`](https://github.com/MadAppGang/claudish/commit/58b44b1b95275c64a12af884cad9709906a56b27))
+- give Claude Code an advisor model, or it offers no tool *(advisor)* ([`6216b79`](https://github.com/MadAppGang/claudish/commit/6216b7938a12ba30f5462deb4cb28da9308f3e68))
+- address the four-model code review *(advisor)* ([`961b858`](https://github.com/MadAppGang/claudish/commit/961b858628a626146d3bfb6658ebfb99e8d7892c))
+- never forward an inherited claudish placeholder to Anthropic *(runner)* ([`4206dea`](https://github.com/MadAppGang/claudish/commit/4206dea5b87d8eaeca580d421cdde0b0a0d380ab))
+- publish live answer bytes so `outputSize: 0` stops reading as "produced nothing" *(team)* ([`6122d48`](https://github.com/MadAppGang/claudish/commit/6122d48a6abbf118a97939627021c7b600f5c0d4))
+
+### Documentation
+
+- restore the section rule the merge resolution dropped *(roadmap)* ([`9a3d9dc`](https://github.com/MadAppGang/claudish/commit/9a3d9dc6ae723eba76c52dc27e13505af2746519))
+- add a release playbook, and rescue the advisor verification evidence([`aa3a51e`](https://github.com/MadAppGang/claudish/commit/aa3a51e613f40b3cde2d7c532b18d1751bce6909))
+- update CHANGELOG.md for v9.2.1([`7f81a14`](https://github.com/MadAppGang/claudish/commit/7f81a1412ba37e99a25c51c6737688dcd6329da3))
+- record the runs that verified the last three fixes *(advisor)* ([`c5cd0cf`](https://github.com/MadAppGang/claudish/commit/c5cd0cfe5ba1aab962972f542ee90a2914d790c7))
+- record what the real runs proved, and what they found *(advisor)* ([`4d46a27`](https://github.com/MadAppGang/claudish/commit/4d46a275556bc10bf9ff2c29485f1d911d789a0f))
+- record why the advisor works the way it does *(advisor)* ([`a09c310`](https://github.com/MadAppGang/claudish/commit/a09c31090c652b762fa2283d783be940d6b243c5))
+- correct the release instructions that would break a release([`ad326c3`](https://github.com/MadAppGang/claudish/commit/ad326c33ed93888541133e0df38bdda1e8a55b79))
+- park the stale bundled claudish-usage copies, note the third team transport *(roadmap)* ([`1a79727`](https://github.com/MadAppGang/claudish/commit/1a7972746402ce9a6e8b25fba8f99833cd5fa675))
+
+### Other Changes
+
+- release v9.3.0([`aa34017`](https://github.com/MadAppGang/claudish/commit/aa34017c207e2b4cbef6fdc0e03996e39ceb0071))
+- release v9.2.0([`9b2cc83`](https://github.com/MadAppGang/claudish/commit/9b2cc83aa7b2cc0b54789f8e0c0f92119f9a696e))
+
+## [9.2.1] - 2026-09-10
+
+### Bug Fixes
+
+- an explicit -y no longer still asks "Enable auto-approve?"([`30b3cbf`](https://github.com/MadAppGang/claudish/commit/30b3cbf4a80de9d5d2b7306dd9c414e274d42198))
+- a stream that dies mid tool-call no longer reports a completed turn([`9560d00`](https://github.com/MadAppGang/claudish/commit/9560d00f0718bfe10adab61912d7150fb4f88ea9))
+- close shell and prompt injection in issue-triage *(ci)* ([`d7d48c3`](https://github.com/MadAppGang/claudish/commit/d7d48c347471ed24a46f16bf45da3b9f32d0c545))
+
+### Documentation
+
+- preserve the truncated-toolcall verification harness([`86330c4`](https://github.com/MadAppGang/claudish/commit/86330c42729b18c32e662a47a6d50f5698219e36))
+- prove Claude Code honours a mid-stream error event([`28c8628`](https://github.com/MadAppGang/claudish/commit/28c8628d1af9466ed6f0547e1ca6d113f2b8eff0))
+- update CHANGELOG.md for v9.2.0([`1e8e83a`](https://github.com/MadAppGang/claudish/commit/1e8e83a5557a2de2c5f6e7352b4d738c45d0ca6b))
+
+### Other Changes
+
+- release v9.2.1([`729bfb3`](https://github.com/MadAppGang/claudish/commit/729bfb36802a9ae579a467900359b28ca5da84f0))
+
+## [9.2.0] - 2026-09-09
+
+### Bug Fixes
+
+- publish live answer bytes so `outputSize: 0` stops reading as "produced nothing" *(team)* ([`6597451`](https://github.com/MadAppGang/claudish/commit/65974511df340989d27485ce8e686b50d863fb14))
+
+### Documentation
+
+- correct the release instructions that would break a release([`2822052`](https://github.com/MadAppGang/claudish/commit/2822052e45ff97f2dc10dc10854f5ffae3f096ed))
+- park the stale bundled claudish-usage copies, note the third team transport *(roadmap)* ([`5f51de7`](https://github.com/MadAppGang/claudish/commit/5f51de7eb38ae484cfaf00c346a90240575bb722))
+- update CHANGELOG.md for v9.1.0([`22b9138`](https://github.com/MadAppGang/claudish/commit/22b91388bbaf0b2cb5f16a9b5007d2bbf22c8744))
+
+### Other Changes
+
+- release v9.2.0([`080ff50`](https://github.com/MadAppGang/claudish/commit/080ff50a919b0f52617f687c17ec56797e2d44e8))
+
+## [9.1.0] - 2026-09-09
+
+### Documentation
+
+- update CHANGELOG.md for v9.0.9([`beea81b`](https://github.com/MadAppGang/claudish/commit/beea81baa52c530c4fcee94cddf7babd6bcfb309))
+
+### New Features
+
+- show the claudish wordmark and offer the update inline *(cli)* ([`a1d392e`](https://github.com/MadAppGang/claudish/commit/a1d392e85826e6abc623ebf3a8e27f2955a8c36d))
+
+### Other Changes
+
+- release v9.1.0([`41b2475`](https://github.com/MadAppGang/claudish/commit/41b2475242ccc7ebb0e5d97a771ae724dd505da5))
+
+## [9.0.9] - 2026-09-09
+
+### Bug Fixes
+
+- stop `security` stderr corrupting the config TUI *(antigravity)* ([`f1f26e1`](https://github.com/MadAppGang/claudish/commit/f1f26e1e69cd209c7656dcca51ff9d40ada17c5a))
+
+### Documentation
+
+- update CHANGELOG.md for v9.0.8([`7b6b9b2`](https://github.com/MadAppGang/claudish/commit/7b6b9b23d517482a843448a1052b37f4947daa3c))
+
+### Other Changes
+
+- release v9.0.9([`a5748da`](https://github.com/MadAppGang/claudish/commit/a5748da2151c437587cc48d5513dba82d0ef0059))
+
+## [9.0.8] - 2026-09-09
+
+### Bug Fixes
+
+- resume the right session from the right directory, and quieten the card *(session)* ([`263d0b4`](https://github.com/MadAppGang/claudish/commit/263d0b47518f863734921c5f65b251dbe040064a))
+- drop tool-schema patterns the provider cannot compile *(openai)* ([`0997da5`](https://github.com/MadAppGang/claudish/commit/0997da55db31436c79e2969a774e48ff842cc4eb))
+
+### Documentation
+
+- update CHANGELOG.md for v9.0.7([`e02d810`](https://github.com/MadAppGang/claudish/commit/e02d8109155352ed4606a8a966372909ea445613))
+
+### Other Changes
+
+- release v9.0.8([`cef2acf`](https://github.com/MadAppGang/claudish/commit/cef2acf1b209b3fed885203bd9310610602927ad))
+
 ## [9.0.7] - 2026-09-09
 
 ### Bug Fixes

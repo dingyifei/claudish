@@ -1,0 +1,8 @@
+: FRAME SHAPE observed 2026-09-16, ~/.claudish/logs/claudish_2026-09-16_12-52-57.log
+: route or@google/gemini-3.8-flash. HTTP was 200; the 400 rides inside the body.
+: The empty "choices" array is the load-bearing part — it is why every
+: choices[0] read returned undefined and the frame was dropped silently.
+: The error MESSAGE text is NOT observed. The log redacts it to "<28 chars>",
+: so the string below is synthetic. Do not quote it as upstream wording.
+: See ai-docs/reports/gemini-openrouter-instream-400-20260917.md
+data: {"id":"gen-1789563247-…","object":"chat.completion.chunk","created":1789563247,"model":"unknown","provider":"Google AI Studio","choices":[],"error":{"code":400,"message":"SYNTHETIC upstream message (real text unknown)","metadata":{"error_type":"invalid_request","provider_code":"400"}}}

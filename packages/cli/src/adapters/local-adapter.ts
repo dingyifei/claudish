@@ -11,7 +11,9 @@
  * - MLX simple format for message conversion
  */
 
+import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { log } from "../logger.js";
+import type { StreamFormat } from "../providers/transport/types.js";
 import { type AdapterResult, BaseAPIFormat } from "./base-api-format.js";
 import { resolveModelDialect } from "./dialect-manager.js";
 
@@ -117,15 +119,19 @@ export class LocalModelAdapter extends BaseAPIFormat {
       stream_options: { include_usage: true },
     };
 
-    // Tool choice mapping from Claude format
-    if (claudeRequest.tool_choice && tools.length > 0) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
+    // The tools.length guard is this adapter's own: a local relay handed a
+    // tool_choice with no tools to choose from rejects the whole request.
+    if (tools.length > 0) {
+      const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+      if (toolChoice !== undefined) {
+        payload.tool_choice = toolChoice;
       }
     }
+
+    // AFTER the literal above, so an explicit caller `top_p` wins over the
+    // family default this adapter picked. The default is a guess about the
+    // model; the request is a statement about this turn.
+    this.applyOpenAISamplingParams(payload, claudeRequest);
 
     return payload;
   }
@@ -133,13 +139,13 @@ export class LocalModelAdapter extends BaseAPIFormat {
   // ─── Request post-processing ────────────────────────────────────────
 
   protected override prepareRequestCommon(request: any, originalRequest: any): any {
-    // Delegate to inner adapter (Qwen tool name truncation, etc.)
+    // Delegate to inner adapter (Qwen tool name encoding, etc.). The inner
+    // adapter's template encodes the names into ITS bindings; this adapter's
+    // template then runs over an already-encoded payload and changes nothing.
+    // `getToolNameMap()` below merges both, so there is no eager copy here —
+    // copying into this instance's bindings would also mean mutating a map the
+    // previous request's parser may still be holding.
     this.innerAdapter.prepareRequest(request, originalRequest);
-
-    // Merge inner adapter's tool name map
-    for (const [k, v] of this.innerAdapter.getToolNameMap()) {
-      this.toolNameMap.set(k, v);
-    }
 
     // Strip cloud-only thinking params that local providers don't understand
     delete request.enable_thinking;
@@ -147,6 +153,16 @@ export class LocalModelAdapter extends BaseAPIFormat {
     delete request.thinking;
 
     return request;
+  }
+
+  override setResponseWireFormat(format: StreamFormat | undefined): void {
+    // The inner adapter runs its own prepareRequest template (above) and
+    // encodes into its own bindings, so it needs the same answer to "can this
+    // response be decoded". Load-bearing here: a local provider can serve this
+    // adapter over `ollama-jsonl`, whose parser takes no decode map, while the
+    // inner dialect's own `getStreamFormat()` still says "openai-sse".
+    super.setResponseWireFormat(format);
+    this.innerAdapter.setResponseWireFormat(format);
   }
 
   override getToolNameMap(): Map<string, string> {

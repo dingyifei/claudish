@@ -21,26 +21,13 @@
  * IMPORTANT: OAuth tokens only work with chatgpt.com/backend-api, NOT api.openai.com.
  */
 
-import { createHash, randomBytes } from "node:crypto";
 import { normalizeCodexModel } from "../../adapters/codex-api-format.js";
 import { lookupModelForProvider } from "../../adapters/model-catalog.js";
 import { credentials } from "../../auth/credentials/authority.js";
 import { recordSignedArm } from "../../auth/credentials/billing-probe.js";
 import type { RequestAuth } from "../../auth/credentials/types.js";
-import { extractSessionId } from "../../behavior/harness.js";
+import { conversationKey } from "./conversation-key.js";
 import { OpenAIProviderTransport } from "./openai.js";
-
-/**
- * Fallback conversation key, minted once per process.
- *
- * Only reached when the inbound request carries no Claude Code session id —
- * an older client, or a direct API consumer. Process-scoped rather than
- * derived from `cwd`, because two claudish processes in the same directory are
- * two different conversations and must not share a key; a single process
- * serving several conversations (the `serve` gateway) is the residual overlap,
- * and the cost there is a routing hint that is merely less precise.
- */
-const FALLBACK_CONVERSATION_KEY = randomBytes(16).toString("hex");
 
 export class OpenAICodexTransport extends OpenAIProviderTransport {
   /**
@@ -49,11 +36,6 @@ export class OpenAICodexTransport extends OpenAIProviderTransport {
    * the transport then falls back to the OpenAI base transport's api-key path.
    */
   private cachedAuth: RequestAuth | null = null;
-
-  /** Memo for resolvePromptCacheKey: the session id the digest was built from. */
-  private cachedCacheKeyFor: string | undefined;
-  /** Memo for resolvePromptCacheKey: the digest itself. */
-  private cachedCacheKey = "";
 
   /**
    * Resolve OAuth (or fall through to api-key) via the credential authority and
@@ -147,33 +129,15 @@ export class OpenAICodexTransport extends OpenAIProviderTransport {
    * granularity still matters, and CONVERSATION is the granularity that matches
    * what actually shares a prefix.
    *
-   * Keyed on Claude Code's own session id (`metadata.user_id` → `session_id`),
-   * which is stable for every turn of a session, survives a claudish restart
-   * mid-conversation, and cannot collide between two concurrent conversations.
-   * Contrast a `cwd`-derived key, which is the same value for two unrelated
-   * sessions in one repo and outlives them both.
-   *
-   * The id is HASHED rather than sent raw. It is not a secret, but it is a
-   * local correlation handle that also appears in transcripts and in the
-   * behavior journal, and a stable one-way digest serves the routing hint
-   * exactly as well. `device_id` and `account_uuid` from that same blob are
-   * never read at all — see `extractSessionId`.
+   * The key itself — why session id, why hashed, the fallback — is
+   * `conversationKey()`, shared with OpenCode Zen's `x-opencode-session`.
    *
    * Matters most against a third-party Codex-compatible backend reached via
    * `OPENAI_CODEX_BASE_URL`, where cache behaviour was measurably worse than
    * talking to Codex directly (#113).
    */
   private resolvePromptCacheKey(claudeRequest?: any): string {
-    const sessionId = extractSessionId(claudeRequest);
-    if (!sessionId) return `claudish_${FALLBACK_CONVERSATION_KEY}`;
-    if (this.cachedCacheKeyFor !== sessionId) {
-      this.cachedCacheKeyFor = sessionId;
-      this.cachedCacheKey = `claudish_${createHash("sha256")
-        .update(sessionId)
-        .digest("hex")
-        .slice(0, 32)}`;
-    }
-    return this.cachedCacheKey;
+    return conversationKey(claudeRequest);
   }
 
   /**

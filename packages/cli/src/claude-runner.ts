@@ -161,28 +161,59 @@ export function shouldHideIncidentalAnthropicKey(
 }
 
 /**
- * The credentials claudish injects in pure-proxy mode. Their only job is to
- * suppress Claude Code's login dialog; the proxy holds the real provider keys.
- * Module constants because two places need to agree on them: the injection site
- * below, and the auth probes, which must never mistake one for a real credential.
+ * The placeholder ANTHROPIC_API_KEY claudish puts in a PROXIED child's env. Its only
+ * job is suppressing Claude Code's login dialog; the proxy handles real auth.
  */
-const PLACEHOLDER_ANTHROPIC_API_KEY =
+export const CLAUDISH_PLACEHOLDER_API_KEY =
   "sk-ant-api03-placeholder-not-used-proxy-handles-auth-with-openrouter-key-xxxxxxxxxxxxxxxxxxxxx";
-const PLACEHOLDER_ANTHROPIC_AUTH_TOKEN = "placeholder-token-not-used-proxy-handles-auth";
+
+/** The placeholder ANTHROPIC_AUTH_TOKEN paired with CLAUDISH_PLACEHOLDER_API_KEY. */
+export const CLAUDISH_PLACEHOLDER_AUTH_TOKEN = "placeholder-token-not-used-proxy-handles-auth";
 
 /**
- * Is this value one of claudish's own placeholders rather than a real credential?
+ * Remove claudish's OWN placeholder credentials that were inherited from a parent
+ * proxied session.
  *
- * Matters because claudish sessions nest: a claudish-launched Claude Code can
- * itself run claudish (subagents, `team`, channel sessions), and the inner
- * process inherits the outer's placeholder env. Reading that as "credentials
- * are available" would make the inner session preserve the placeholder and
- * forward it to api.anthropic.com, where it 401s. Substring-matched rather than
- * compared exactly so a future placeholder edit cannot silently reopen this.
+ * The proxy-auth branch of runClaudeWithProxy puts the placeholders in the child
+ * Claude Code env, and from there they leak into every process that session
+ * starts: tool shells, tmux panes, nested claudish runs, `team` slots. A claudish
+ * launched from such an env with a native Claude model would forward
+ * `Authorization: Bearer <placeholder>` to api.anthropic.com and get 401 on every
+ * request.
+ *
+ * Only an EXACT match is removed. Any other value is the user's own credential and
+ * is left alone. Mutates `env` in place and returns the names it deleted, never
+ * the values.
  */
-function isPlaceholderAnthropicCredential(value: string | undefined): boolean {
-  if (!value) return false;
-  return value.includes("placeholder-not-used") || value.includes("placeholder-token-not-used");
+export function scrubInheritedClaudishPlaceholders(env: NodeJS.ProcessEnv): { removed: string[] } {
+  const removed: string[] = [];
+  for (const name of ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] as const) {
+    if (isClaudishPlaceholderCredential(name, env[name])) {
+      delete env[name];
+      removed.push(name);
+    }
+  }
+  return { removed };
+}
+
+/**
+ * Is `value` claudish's OWN placeholder for the env variable `name`? Only an exact
+ * match counts, and only for the variable that placeholder belongs to. Every other
+ * value, including unset, is not a placeholder.
+ */
+export function isClaudishPlaceholderCredential(name: string, value: string | undefined): boolean {
+  if (name === "ANTHROPIC_API_KEY") return value === CLAUDISH_PLACEHOLDER_API_KEY;
+  if (name === "ANTHROPIC_AUTH_TOKEN") return value === CLAUDISH_PLACEHOLDER_AUTH_TOKEN;
+  return false;
+}
+
+/** Set, non-empty, and not claudish's own placeholder. */
+function isRealAnthropicEnvCredential(
+  env: NodeJS.ProcessEnv,
+  name: "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN"
+): boolean {
+  const value = env[name];
+  return Boolean(value) && !isClaudishPlaceholderCredential(name, value);
 }
 
 /**
@@ -193,6 +224,8 @@ function isPlaceholderAnthropicCredential(value: string | undefined): boolean {
  *
  * ANTHROPIC_AUTH_TOKEN counts because nothing bundles one incidentally, so
  * upstream never strips it — see the native-anthropic branch in runClaudeWithProxy.
+ * claudish's own placeholder, inherited from a parent proxied session,
+ * authenticates nothing and does not count.
  *
  * TODO: Windows/Linux may also keep the OAuth in an OS credential store
  * (Credential Manager / libsecret) rather than the file; only macOS is covered.
@@ -209,7 +242,7 @@ export function hasAnthropicOAuth(
   const env = deps.env ?? process.env;
   const fileExists = deps.fileExists ?? existsSync;
   const keychainProbe = deps.keychainProbe ?? defaultKeychainAnthropicProbe;
-  if (env.ANTHROPIC_AUTH_TOKEN && !isPlaceholderAnthropicCredential(env.ANTHROPIC_AUTH_TOKEN)) {
+  if (isRealAnthropicEnvCredential(env, "ANTHROPIC_AUTH_TOKEN")) {
     return true;
   }
   if (fileExists(join(homedir(), ".claude", ".credentials.json"))) return true;
@@ -219,7 +252,7 @@ export function hasAnthropicOAuth(
 /** Is a REAL (non-placeholder) `ANTHROPIC_API_KEY` present in the environment? */
 export function hasAnthropicApiKey(deps: { env?: NodeJS.ProcessEnv } = {}): boolean {
   const env = deps.env ?? process.env;
-  return !!env.ANTHROPIC_API_KEY && !isPlaceholderAnthropicCredential(env.ANTHROPIC_API_KEY);
+  return isRealAnthropicEnvCredential(env, "ANTHROPIC_API_KEY");
 }
 
 /**
@@ -283,17 +316,36 @@ function shouldPreserveNativeAuth(config: ClaudishConfig): boolean {
 }
 
 /**
+ * `--advisor` with NO main model named: the session's main loop is still a plain
+ * native Claude session, and it must LAUNCH like one.
+ *
+ * `--advisor` used to set `config.monitor`, and four monitor-gated launch sites
+ * were the only reason such a session could start at all: the interactive picker,
+ * the "model required" abort, `ANTHROPIC_MODEL`, and native auth. Decoupling the
+ * advisor from monitor without this predicate would break exactly that
+ * configuration — `claudish --advisor "X" -p "task"` would exit(1) before
+ * starting. Everything else about monitor (notably forcing all traffic to
+ * NativeHandler, proxy-server.ts:564) is deliberately NOT inherited.
+ *
+ * A named `--model` or `--model "a,b"` chain means the main loop belongs to that
+ * provider, so none of the four bits apply.
+ */
+export function isAdvisorNativeSession(config: ClaudishConfig): boolean {
+  return Boolean(config.advisor) && !config.model && !config.modelChain;
+}
+
+/**
  * "Proxy mode" = claudish points Claude Code at its local proxy with a placeholder
  * API key (see the auth block in runClaudeWithProxy). In this mode the session
  * authenticates via ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, so a user/project/local
  * setting of `forceLoginMethod: "claudeai"` would block it at startup.
  *
  * The inverse — native-Anthropic models, classifier passthrough (with resolvable
- * creds), or --monitor — uses the user's REAL claude.ai subscription credentials,
- * so we must NOT touch their login method there.
+ * creds), --monitor, or a no-model `--advisor` session — uses the user's REAL
+ * claude.ai subscription credentials, so we must NOT touch their login method there.
  */
 export function isProxyAuthMode(config: ClaudishConfig): boolean {
-  return !config.monitor && !shouldPreserveNativeAuth(config);
+  return !config.monitor && !isAdvisorNativeSession(config) && !shouldPreserveNativeAuth(config);
 }
 
 /**
@@ -1226,6 +1278,253 @@ export function resolveContextWindowEnv(
   };
 }
 
+/**
+ * Claude Code's gate for the experimental advisor tool. Kept local rather than in
+ * `ENV` because it is a CHILD-only var: claudish never reads it for itself, it
+ * only decides whether to hand one to the spawned session.
+ */
+export const ADVISOR_TOOL_ENV_VAR = "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL";
+
+/** Where the child's advisor-tool env var came from. */
+export interface AdvisorToolEnv {
+  /** Variables to merge into the child environment. Empty unless claudish set one. */
+  vars: Record<string, string>;
+  /**
+   * `claudish` — we set it; `inherited` — the parent environment already had a
+   * value and it reaches the child untouched; `off` — `--advisor` was not given.
+   * The startup notice (advisor-startup.ts, printed by index.ts) reports which;
+   * nothing prints it here.
+   */
+  source: "claudish" | "inherited" | "off";
+}
+
+/**
+ * Decide the advisor-tool env var for the spawned Claude Code.
+ *
+ * The literal MUST be `"1"`. Claude Code parses this with a strict boolean reader
+ * that accepts only `1`/`true`/`yes`/`on` after trim+lowercase — `"2"` is FALSE —
+ * so a wrong value is a silent no-op, not an error.
+ *
+ * A value the user already exported is never clobbered: the child env spreads
+ * `process.env` unfiltered, so leaving it out of `vars` is what forwards theirs
+ * unchanged. "Already exported" means PRESENT, including an explicitly empty
+ * value — that is the user's business, and the notice will say "inherited" so it
+ * is discoverable rather than mysterious.
+ */
+export function resolveAdvisorToolEnv(
+  config: ClaudishConfig,
+  processEnv: NodeJS.ProcessEnv = process.env
+): AdvisorToolEnv {
+  if (!config.advisor) return { vars: {}, source: "off" };
+  if (processEnv[ADVISOR_TOOL_ENV_VAR] !== undefined) return { vars: {}, source: "inherited" };
+  return { vars: { [ADVISOR_TOOL_ENV_VAR]: "1" }, source: "claudish" };
+}
+
+/**
+ * The advisor model claudish names for the SPAWNED Claude Code.
+ *
+ * It exists for one reason: to get past Claude Code's own gate. The function that
+ * builds the advisor tool spec opens `if(!eA()||!e)return;` where `e` is the
+ * advisor MODEL, and there is no default anywhere — with no `--advisor <model>`,
+ * no `advisorModel` setting and no `/advisor` command, `e` is `undefined`, so no
+ * tool entry and no advisor system prompt are emitted at all (research:
+ * `claude-code-gate-v2.md` §0, §4). That is why every real run reported
+ * "request offers N tool(s) but no advisor".
+ *
+ * **This model is never actually consulted.** claudish intercepts the advisor
+ * call and answers it with its own multi-model panel, so the name only has to be
+ * one Claude Code ACCEPTS, not one anybody wants an answer from.
+ *
+ * `sonnet` is verified acceptable against that document: it is one of the three
+ * public aliases in the `/advisor` picker's own list (`Cmo=["fable","opus",
+ * "sonnet"]`, §2) and one of the three Claude Code's own warning text tells users
+ * to switch to (§7). It clears the advisor-model checks: `Tr()` (account
+ * entitlement) passes for a public alias; the fable/credits refusal
+ * (`Wg && dve()`) applies only to `claude-fable-*`; and rank >= 2 (`Gcn`) plus the
+ * base/advisor rank pairing (`ofe`) are short-circuited outright by
+ * `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL`, which `resolveAdvisorToolEnv`
+ * has already set (§8).
+ */
+export const CLAUDISH_CHILD_ADVISOR_MODEL = "sonnet";
+
+/** Where the child's advisor MODEL came from. Mirrors `AdvisorToolEnv.source`. */
+export interface AdvisorModelArg {
+  /** Argv to append for the child. Empty unless claudish is the one naming a model. */
+  args: string[];
+  /** The model that will be in effect, whoever chose it. Undefined only when `off`. */
+  model?: string;
+  /**
+   * `claudish` — we named {@link CLAUDISH_CHILD_ADVISOR_MODEL}; `inherited` — the
+   * user's own Claude Code settings already define `advisorModel` and we passed
+   * nothing, so theirs stands; `off` — `--advisor` was not given on this launch.
+   * The startup notice (advisor-startup.ts) reports which; nothing prints it here.
+   */
+  source: "claudish" | "inherited" | "off";
+}
+
+/**
+ * The `advisorModel` the user's own Claude Code settings resolve to, or undefined.
+ *
+ * Reuses the same source list and the same tolerant parser as
+ * `discoverUserStatusLineCommand`, plus the managed-settings file that
+ * `managedSettingsForcesClaudeAi` reads — one settings reader, not two.
+ *
+ * Precedence is Claude Code's, LAST WINS, with the OS *managed* tier last because
+ * it is the one tier nothing can override. A tier that sets the key to a
+ * non-string or an empty string CLEARS it rather than being skipped, because
+ * that is what Claude Code's own reader does:
+ * `typeof e.advisorModel==="string" && e.advisorModel!=="" ? … : undefined`.
+ *
+ * Never throws: this runs on the launch path, and a malformed settings file must
+ * not be able to stop a session from starting.
+ */
+export function discoverUserAdvisorModel(
+  claudeArgs: string[] = [],
+  cwd: string = process.cwd()
+): string | undefined {
+  const sources = userSettingsFileCandidates(cwd).filter((file) => existsSync(file));
+
+  // An explicit --settings value outranks the files but not the managed tier. It is
+  // pushed unfiltered because it may be inline JSON rather than a path.
+  const idx = claudeArgs.indexOf("--settings");
+  const settingsArg = idx === -1 ? undefined : claudeArgs[idx + 1];
+  if (settingsArg) sources.push(settingsArg);
+
+  const managed = managedSettingsPath();
+  if (existsSync(managed)) sources.push(managed);
+
+  let effective: string | undefined;
+  for (const source of sources) {
+    const layer = parseSettingsArgSafe(source);
+    if (!layer || !("advisorModel" in layer)) continue;
+    const value = layer.advisorModel;
+    effective = typeof value === "string" && value !== "" ? value : undefined;
+  }
+  return effective;
+}
+
+/**
+ * Decide the advisor-MODEL argv for the spawned Claude Code.
+ *
+ * The `--advisor <model>` FLAG is used rather than writing `advisorModel` into the
+ * temp `--settings` overlay, because the child reads the flag first and falls back
+ * to the settings key only when the flag is absent (research §4: `bi=Oe??MWt()`),
+ * and the research found no print-mode exclusion for it — `-p` drives the same
+ * engine, and the flag is on Claude Code's recognised-flag lists, so it cannot be
+ * mistaken for the positional prompt. It also takes exactly one value, so it does
+ * not swallow anything that follows.
+ *
+ * The user's own choice is never overridden: when their settings already define
+ * `advisorModel`, claudish adds NO flag, so their value is what the child resolves.
+ * With `--advisor` absent nothing is added at all — no flag, no settings key.
+ */
+export function resolveAdvisorModelArg(
+  config: ClaudishConfig,
+  cwd: string = process.cwd()
+): AdvisorModelArg {
+  if (!config.advisor) return { args: [], source: "off" };
+
+  const userChoice = discoverUserAdvisorModel(config.claudeArgs, cwd);
+  if (userChoice) return { args: [], model: userChoice, source: "inherited" };
+
+  return {
+    args: ["--advisor", CLAUDISH_CHILD_ADVISOR_MODEL],
+    model: CLAUDISH_CHILD_ADVISOR_MODEL,
+    source: "claudish",
+  };
+}
+
+/**
+ * Child stderr lines claudish answers for, and therefore does not pass on.
+ *
+ * ONE entry, and the bar for a second is high: claudish must be able to say
+ * both that the line is certainly wrong-headed and that nothing downstream
+ * needs it. Swallowing a child's stderr is how a real failure goes missing.
+ *
+ * `[claude-code:unrecognized_model]` is Claude Code reporting that a model id
+ * is absent from its own table. Running a model that is absent from that table
+ * is claudish's entire purpose, so the line is guaranteed noise on every
+ * foreign route — and it is error-shaped, so it lands directly above the real
+ * failure in `team`'s `errors/NN.log` and in the `stderrSnippet` a diagnosing
+ * reader opens first.
+ *
+ * It cannot be fixed at the source. Measured 2026-09-17:
+ *   - a bare catalog name does not help; ANY id outside Claude Code's table
+ *     warns, and every foreign model claudish routes is outside it;
+ *   - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` only moves it, from
+ *     `query_source: generate_session_title` to `query_source: sdk`;
+ *   - `DISABLE_TELEMETRY=1` and `DISABLE_ERROR_REPORTING=1` do not touch it.
+ */
+const CHILD_STDERR_NOISE = [/^\[claude-code:unrecognized_model\]/];
+
+/** Whether claudish answers for this child stderr line instead of relaying it. */
+export function isSuppressibleChildStderrLine(line: string): boolean {
+  return CHILD_STDERR_NOISE.some((re) => re.test(line));
+}
+
+/**
+ * Relay a child's stderr verbatim, minus the lines in {@link CHILD_STDERR_NOISE}.
+ *
+ * PRINT MODE ONLY. In an interactive session the child owns the terminal and its
+ * stderr is the TTY it is painting; putting a pipe in that path risks the output
+ * corruption `terminal-output-isolation` documents, to remove one cosmetic line.
+ * Not a trade worth making, so the interactive path keeps `inherit` untouched.
+ *
+ * Line-buffered because a filter that reads raw chunks would match a prefix
+ * split across a chunk boundary as two unmatched fragments and pass the noise
+ * through anyway. The tail is flushed on `end` so a child that dies mid-line
+ * still gets its last, unterminated bytes out — that fragment is often the
+ * crash.
+ *
+ * Suppressed lines are written to the session log, so the record is moved out of
+ * the way rather than destroyed.
+ */
+export function relayChildStderr(stream: NodeJS.ReadableStream): void {
+  let buffered = "";
+
+  const emit = (line: string): void => {
+    if (isSuppressibleChildStderrLine(line)) {
+      // `debugLog`, NOT `logStderr`. In print mode there is no diag sink, so
+      // `logStderr` falls through to `process.stderr` and re-emits the very line
+      // being suppressed, one prefix heavier. `debugLog` writes only to the session
+      // logs, and the `[Suppressed]` prefix is what carries it into the
+      // always-on log (logger's `isStructuralLogWorthy` matches it).
+      debugLog(`[Suppressed] claude-code-stderr: ${line.trimEnd()}`);
+      return;
+    }
+    process.stderr.write(`${line}\n`);
+  };
+
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk: string) => {
+    buffered += chunk;
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) emit(line);
+  });
+  const flush = (): void => {
+    if (buffered.length === 0) return;
+    const tail = buffered;
+    buffered = "";
+    // No trailing newline: reproduce what the child actually wrote.
+    if (isSuppressibleChildStderrLine(tail)) {
+      debugLog(`[Suppressed] claude-code-stderr: ${tail}`);
+    } else {
+      process.stderr.write(tail);
+    }
+  };
+  stream.on("end", flush);
+  stream.on("close", flush);
+  // A read error must not take the session down, and must not be silent either.
+  // This one DOES go to stderr: it means the diagnostic channel itself broke,
+  // which the user has to know, and it is claudish speaking rather than a
+  // relayed child line. `logStderr` supplies the `[claudish]` prefix.
+  stream.on("error", (err) => {
+    flush();
+    logStderr(`child stderr relay ended: ${err}`);
+  });
+}
+
 export async function runClaudeWithProxy(
   config: ClaudishConfig,
   proxyUrl: string,
@@ -1237,7 +1536,13 @@ export async function runClaudeWithProxy(
   // so the proxy can match tier names (opus/sonnet/haiku) and apply profile mappings
   const hasProfileMappings =
     config.modelOpus || config.modelSonnet || config.modelHaiku || config.modelSubagent;
-  const modelId = config.model || (hasProfileMappings || config.monitor ? undefined : "unknown");
+  // `--advisor` with no main model is a native session: Claude Code must pick its
+  // own model exactly as under --monitor. The "unknown" placeholder would become
+  // ANTHROPIC_MODEL=unknown and Anthropic 400s the very first request.
+  const advisorNativeSession = isAdvisorNativeSession(config);
+  const modelId =
+    config.model ||
+    (hasProfileMappings || config.monitor || advisorNativeSession ? undefined : "unknown");
 
   // Extract port from proxy URL for token file path
   const portMatch = proxyUrl.match(/:(\d+)/);
@@ -1251,7 +1556,10 @@ export async function runClaudeWithProxy(
   // If it forces claude.ai login while we're in proxy mode, Claude Code will refuse
   // to start with an API key — fail fast with a clear reason instead of a confusing
   // downstream error. (Native-Anthropic/--monitor sessions use the real subscription,
-  // so a claude.ai policy is fine there and we don't check.)
+  // so a claude.ai policy is fine there and we don't check. A no-model --advisor
+  // session is one of those — isProxyAuthMode excludes it — because it survives
+  // this policy today under monitor and must not start aborting on it. A FOREIGN
+  // main model with --advisor IS proxy auth, so it gains the clear abort.)
   if (proxyAuthMode && managedSettingsForcesClaudeAi()) {
     console.error(
       "[claudish] Error: your organization's managed Claude Code settings force the " +
@@ -1270,6 +1578,10 @@ export async function runClaudeWithProxy(
   // mergeUserSettingsIfPresent, which splices --settings out of claudeArgs.
   const userStatusLineCommand = discoverUserStatusLineCommand(config.claudeArgs);
 
+  // Same timing constraint as the status line: this reads the user's --settings
+  // value, which mergeUserSettingsIfPresent splices out of claudeArgs below.
+  const advisorModelArg = resolveAdvisorModelArg(config);
+
   // Create temporary settings file with custom status line for this instance
   const {
     path: tempSettingsPath,
@@ -1285,6 +1597,12 @@ export async function runClaudeWithProxy(
 
   // Add settings file flag (our merged temp file, applies to this instance only)
   claudeArgs.push("--settings", tempSettingsPath);
+
+  // Name an advisor model so Claude Code actually BUILDS the advisor tool. Empty
+  // unless `--advisor` was given and the user's own settings name no advisorModel
+  // (see resolveAdvisorModelArg). Pushed here, ahead of -p and the passthrough
+  // args, so its single value can never be confused with the positional prompt.
+  claudeArgs.push(...advisorModelArg.args);
 
   // Interactive mode - no automatic arguments
   if (config.interactive) {
@@ -1336,6 +1654,10 @@ export async function runClaudeWithProxy(
   // Environment variables for Claude Code
   // For display: show profile name before first request; token file model_name takes over after
   const modelDisplayName = modelId || config.profile || "default";
+  // Resolved BEFORE the env literal so the "set by claudish" / "inherited from
+  // your environment" distinction is recorded rather than lost in a spread. The
+  // startup notice that reports it is printed by index.ts before this runs.
+  const advisorToolEnv = resolveAdvisorToolEnv(config);
   const env: Record<string, string> = {
     ...process.env,
     // Point Claude Code to our local proxy
@@ -1349,6 +1671,11 @@ export async function runClaudeWithProxy(
     // of guessing a path, and can tell that the session is proxied (and therefore
     // that Anthropic plan/rate-limit numbers describe the wrong account).
     [ENV.CLAUDISH_TOKEN_FILE]: tokenFilePath,
+    // Turn on Claude Code's experimental advisor tool under --advisor. The value
+    // is `"1"` and nothing else (see resolveAdvisorToolEnv), and this spread is
+    // empty when the parent environment already carries one — the `...process.env`
+    // above then forwards the user's value untouched.
+    ...advisorToolEnv.vars,
   };
 
   // Provider display name, best-effort and FREE. Only an explicit `provider@model`
@@ -1366,6 +1693,20 @@ export async function runClaudeWithProxy(
     }
   }
 
+  if (advisorToolEnv.source !== "off") {
+    debugLog(
+      `[claude-runner] ${ADVISOR_TOOL_ENV_VAR}=${env[ADVISOR_TOOL_ENV_VAR]} (${advisorToolEnv.source})`
+    );
+  }
+
+  // The model name only — never a credential, and the flag carries none.
+  if (advisorModelArg.source !== "off") {
+    debugLog(
+      `[claude-runner] child advisor model=${advisorModelArg.model} (${advisorModelArg.source}` +
+        `${advisorModelArg.source === "inherited" ? "; user setting kept, no --advisor passed" : " via --advisor"})`
+    );
+  }
+
   // Set when a real ANTHROPIC_API_KEY was hidden so native Claude models bill the
   // claude.ai subscription instead of the API. Reported via log() further down —
   // the user MUST be able to discover why their key stopped taking effect.
@@ -1377,10 +1718,43 @@ export async function runClaudeWithProxy(
   // independent API calls through a proxy (not nesting sessions), this is safe.
   delete env.CLAUDECODE;
 
+  // Print mode only: switch off Claude Code's background side-calls.
+  //
+  // A one-shot run generates a session title it will never display and a resume
+  // summary nothing will ever resume. Both are billed on the ROUTED model, so a
+  // three-slot `team` run pays for three of them.
+  //
+  // Measured 2026-09-17, same prompt and model (`qc@qwen3.8-max`), counting
+  // upstream responses in the session log:
+  //
+  //   suppressed : 1 upstream request
+  //   baseline   : 2 upstream requests
+  //
+  // WHAT THIS DOES NOT DO — and the reason is worth keeping, because the
+  // opposite is the obvious assumption. It does NOT remove the
+  // `[claude-code:unrecognized_model]` line from stderr. That warning fires for
+  // any model id outside Claude Code's own table, which is every foreign model
+  // claudish routes. Suppressing the title call only moves which call reports
+  // it: `query_source` changes from `generate_session_title` to `sdk`, and the
+  // line count stays at one. Both were measured. Renaming the model would not
+  // help either, and cannot be done anyway without breaking routing.
+  //
+  // INTERACTIVE SESSIONS ARE LEFT ALONE. There the title is shown in the UI and
+  // the resume summary is used, so the traffic is not "non-essential" to the
+  // person watching. A user who wants it off in print mode too, or on, can set
+  // the variable themselves — an explicit value is never overridden.
+  if (!config.interactive && env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC === undefined) {
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  }
+
   // Handle API key and model based on mode
-  if (config.monitor) {
-    // Monitor mode: Don't set ANTHROPIC_API_KEY at all
-    // This allows Claude Code to use its native authentication
+  if (config.monitor || advisorNativeSession) {
+    // Monitor mode, or `--advisor` with no main model: Don't set ANTHROPIC_API_KEY
+    // at all. This allows Claude Code to use its native authentication — the
+    // placeholder key the proxy branch below installs is what NativeHandler would
+    // forward to api.anthropic.com, which 401s. The no-model advisor session takes
+    // this branch (rather than the shouldPreserveNativeAuth one) so its env stays
+    // byte-identical to what --advisor produced while it implied --monitor.
     // Delete any placeholder keys from environment
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
@@ -1411,12 +1785,26 @@ export async function runClaudeWithProxy(
       // needs. Reading its mere presence as "bill me per token" is an expensive
       // misread, and the failure is silent — you find out on the invoice. So
       // hide it by default and SAY so; opt back in explicitly when API billing
-      // is what you want. ANTHROPIC_AUTH_TOKEN is left alone — nothing bundles
-      // one incidentally, so setting it is always a deliberate act.
+      // is what you want. A user's own ANTHROPIC_AUTH_TOKEN is left alone, because
+      // nothing bundles one by accident, so setting it is a deliberate act.
+      //
+      // The one exception is claudish's OWN placeholder pair. The proxy-auth
+      // branch below puts it in every proxied child, and from there it leaks
+      // into every process that session starts (tool shells, tmux panes,
+      // nested claudish runs, `team` slots). If it is inherited here, Claude
+      // Code sends `Bearer <placeholder>` and Anthropic returns 401 on every
+      // request. Scrub it FIRST, and only on an exact match, so a scrubbed
+      // placeholder key is not later reported as a hidden real key.
       //
       // See shouldHideIncidentalAnthropicKey for why this is narrower than the
       // shouldPreserveNativeAuth condition guarding this branch.
-      if (shouldHideIncidentalAnthropicKey(config)) {
+      const scrubbed = scrubInheritedClaudishPlaceholders(env);
+      if (scrubbed.removed.length > 0) {
+        debugLog(
+          `[claude-runner] Removed inherited claudish placeholder credentials: ${scrubbed.removed.join(", ")}`
+        );
+      }
+      if (shouldHideIncidentalAnthropicKey(config, env)) {
         delete env.ANTHROPIC_API_KEY;
         hidAnthropicApiKey = true;
       }
@@ -1440,8 +1828,8 @@ export async function runClaudeWithProxy(
       // not work as expected". So overwrite unconditionally with placeholders —
       // their only job is suppressing the login dialog (#13: a placeholder API
       // key alone still redirected to the payment page, hence the token too).
-      env.ANTHROPIC_API_KEY = PLACEHOLDER_ANTHROPIC_API_KEY;
-      env.ANTHROPIC_AUTH_TOKEN = PLACEHOLDER_ANTHROPIC_AUTH_TOKEN;
+      env.ANTHROPIC_API_KEY = CLAUDISH_PLACEHOLDER_API_KEY;
+      env.ANTHROPIC_AUTH_TOKEN = CLAUDISH_PLACEHOLDER_AUTH_TOKEN;
     }
 
     // Context-window clamp and telemetry denominator. Gated on whether the MAIN
@@ -1601,14 +1989,27 @@ export async function runClaudeWithProxy(
     );
   }
 
+  // Pipe the child's stderr ONLY in print mode, and only when we are not handing
+  // it a tty. stdin and stdout stay inherited either way, so the answer itself
+  // never travels through claudish — only the diagnostic channel does.
+  const filterChildStderr = !config.interactive && ttyFd === undefined;
+
   const stdio: Parameters<typeof spawn>[2]["stdio"] =
-    ttyFd !== undefined ? [0, ttyFd, ttyFd] : "inherit";
+    ttyFd !== undefined
+      ? [0, ttyFd, ttyFd]
+      : filterChildStderr
+        ? ["inherit", "inherit", "pipe"]
+        : "inherit";
 
   const proc = spawn(spawnCommand, claudeArgs, {
     env,
     stdio,
     shell: needsShell,
   });
+
+  if (filterChildStderr && proc.stderr) {
+    relayChildStderr(proc.stderr);
+  }
 
   // From this line until the child exits, Claude Code owns the terminal. Close
   // claudish's write channel to it so a stray console.error — ours, a

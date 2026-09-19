@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   ACTIVE_WINDOW_MS,
   type SessionRow,
@@ -6,6 +9,41 @@ import {
   sessionLabel,
   slugForPath,
 } from "./session-discovery.js";
+
+const fixtureHome = mkdtempSync(join(tmpdir(), "claudish-session-discovery-"));
+
+afterAll(() => {
+  rmSync(fixtureHome, { recursive: true, force: true });
+});
+
+function sessionFixture(cwd: string, id: string, mtimeMs: number): void {
+  const record = `${JSON.stringify({
+    type: "user",
+    cwd,
+    sessionId: id,
+    message: { role: "user", content: "fixture" },
+  })}\n`;
+  const projectDir = join(fixtureHome, ".claude", "projects", slugForPath(cwd));
+  mkdirSync(projectDir, { recursive: true });
+  const file = join(projectDir, `${id}.jsonl`);
+  writeFileSync(file, record);
+  utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+}
+
+function findLatestInFixture(cwd: string, sinceMs: number): string | null {
+  const script = `import { findLatestSessionId } from "./src/session/session-discovery.ts";
+process.stdout.write(findLatestSessionId(${JSON.stringify(cwd)}, ${sinceMs}) ?? "");`;
+  const result = Bun.spawnSync([process.execPath, "-e", script], {
+    cwd: join(import.meta.dir, "../.."),
+    env: {
+      ...process.env,
+      HOME: fixtureHome,
+    },
+  });
+  expect(result.exitCode).toBe(0);
+  const id = result.stdout.toString().trim();
+  return id || null;
+}
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -38,5 +76,33 @@ describe("session discovery pure helpers", () => {
       "Opening prompt"
     );
     expect(sessionLabel(row({ id: "fallback" }))).toBe("fallback");
+  });
+});
+
+describe("findLatestSessionId", () => {
+  test("prefers a transcript born during the window over an older fresher transcript", async () => {
+    const cwd = "/tmp/project-with-competing-sessions";
+    const outerId = "11111111-1111-4111-8111-111111111111";
+    const childId = "22222222-2222-4222-8222-222222222222";
+    const beforeWindow = Date.now();
+    sessionFixture(cwd, outerId, beforeWindow + 3_000);
+    await Bun.sleep(10);
+    const sinceMs = Date.now();
+    await Bun.sleep(10);
+    sessionFixture(cwd, childId, beforeWindow + 2_000);
+
+    expect(findLatestInFixture(cwd, sinceMs)).toBe(childId);
+  });
+
+  test("falls back to newest-by-mtime when no transcript was born during the window", () => {
+    const cwd = "/tmp/project-with-resumed-sessions";
+    const olderId = "33333333-3333-4333-8333-333333333333";
+    const newerId = "44444444-4444-4444-8444-444444444444";
+    const createdAt = Date.now();
+    sessionFixture(cwd, olderId, createdAt + 1_000);
+    sessionFixture(cwd, newerId, createdAt + 2_000);
+    const sinceMs = createdAt + 500;
+
+    expect(findLatestInFixture(cwd, sinceMs)).toBe(newerId);
   });
 });

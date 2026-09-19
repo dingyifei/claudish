@@ -189,6 +189,34 @@ function redactLogLine(message: string, timestamp: string): string {
 }
 
 /**
+ * The per-session part of a log filename: a UTC timestamp plus this process id.
+ *
+ * The PID is load-bearing, not decoration. The timestamp has one-second
+ * resolution and the file is opened with `writeFileSync`, which TRUNCATES. Any
+ * two claudish processes that start in the same second therefore compute the
+ * same path and each wipes what the other wrote.
+ *
+ * That is not a rare race: `team` and channel `create_session` spawn their
+ * children together, so a three-model run reliably lands three processes inside
+ * one second. Measured 2026-09-16 on exactly such a run, the surviving file held
+ * three interleaved `[Proxy] Server started` lines on three different ports and
+ * was missing the handler-creation lines for one of the children entirely —
+ * during an investigation into why that child produced no output.
+ *
+ * A concurrent run is precisely when the logs matter most, and it was the case
+ * that destroyed them.
+ */
+function logFileStamp(): string {
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")
+    .split("T")
+    .join("_")
+    .slice(0, -5);
+  return `${timestamp}_${process.pid}`;
+}
+
+/**
  * Initialize file logging for this session
  */
 export function initLogger(
@@ -202,13 +230,7 @@ export function initLogger(
     if (!existsSync(logsDir)) {
       mkdirSync(logsDir, { recursive: true });
     }
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[:.]/g, "-")
-      .split("T")
-      .join("_")
-      .slice(0, -5);
-    alwaysOnLogPath = join(logsDir, `claudish_${timestamp}.log`);
+    alwaysOnLogPath = join(logsDir, `claudish_${logFileStamp()}.log`);
     writeFileSync(
       alwaysOnLogPath,
       `Claudish Session Log - ${new Date().toISOString()}\nMode: structural (content redacted)\n${"=".repeat(60)}\n\n`
@@ -225,13 +247,7 @@ export function initLogger(
     if (!existsSync(logsDir)) {
       mkdirSync(logsDir, { recursive: true });
     }
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[:.]/g, "-")
-      .split("T")
-      .join("_")
-      .slice(0, -5);
-    logFilePath = join(logsDir, `claudish_${timestamp}.log`);
+    logFilePath = join(logsDir, `claudish_${logFileStamp()}.log`);
     writeFileSync(
       logFilePath,
       `Claudish Debug Log - ${new Date().toISOString()}\nLog Level: ${level}\n${"=".repeat(80)}\n\n`

@@ -19,7 +19,13 @@
  */
 
 import { log } from "../logger.js";
-import { type AdapterResult, BaseAPIFormat, matchesModelFamily } from "./base-api-format.js";
+import {
+  type AdapterResult,
+  BaseAPIFormat,
+  clampThinkingBudget,
+  matchesModelFamily,
+  outputCeilingOf,
+} from "./base-api-format.js";
 
 // Qwen special tokens that should be stripped from output
 const QWEN_SPECIAL_TOKENS = [
@@ -80,13 +86,42 @@ export class QwenModelDialect extends BaseAPIFormat {
       log(`[QwenModelDialect] effort ${effort} -> enable_thinking: false for ${this.modelId}`);
     } else {
       request.enable_thinking = true;
-      const budget = this.effortToThinkingTokenBudget(effort);
-      if (budget !== undefined) {
-        request.thinking_budget = budget;
+      const requested = this.effortToThinkingTokenBudget(effort);
+
+      // DashScope validates the budget against the output ceiling in the SAME
+      // request and rejects the pair outright:
+      //
+      //   400 [invalid_parameter_error] max_completion_tokens [32000] must be
+      //       greater than thinking_budget [38912]
+      //
+      // The ladder's `xhigh` rung is 38912 while Claude Code's `max_tokens` is
+      // routinely 32000 (and 4096 by default), so the two collide without any
+      // user being able to reach either number. Clamping here rather than
+      // lowering the ladder keeps the requested depth wherever the ceiling
+      // affords it.
+      const ceiling = outputCeilingOf(originalRequest, request);
+      const budget = clampThinkingBudget(requested, ceiling);
+
+      if (budget === "no-room") {
+        // No legal budget fits and still leaves room to answer. Reasoning stays
+        // ON — the effort asked for it — with the depth left to the model,
+        // which is the only remaining payload this endpoint accepts.
+        delete request.thinking_budget;
+        log(
+          `[QwenModelDialect] effort ${effort} -> enable_thinking: true, no thinking_budget (${requested} does not fit under ceiling ${ceiling}) for ${this.modelId}`
+        );
+      } else {
+        if (budget !== undefined) {
+          request.thinking_budget = budget;
+        }
+        log(
+          `[QwenModelDialect] effort ${effort} -> enable_thinking: true, thinking_budget: ${budget ?? "(model max)"}${
+            budget !== undefined && budget !== requested
+              ? ` (clamped from ${requested} under ceiling ${ceiling})`
+              : ""
+          } for ${this.modelId}`
+        );
       }
-      log(
-        `[QwenModelDialect] effort ${effort} -> enable_thinking: true, thinking_budget: ${budget ?? "(model max)"} for ${this.modelId}`
-      );
     }
 
     // Cleanup: remove raw thinking object so it doesn't double-send.

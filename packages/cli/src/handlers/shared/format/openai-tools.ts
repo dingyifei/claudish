@@ -4,7 +4,137 @@
  * Converts Claude/Anthropic tool definitions to OpenAI function format.
  */
 
+import { log } from "../../../logger.js";
 import { removeUriFormat } from "../../../transform.js";
+
+/**
+ * The escape letters a `pattern` may use and still compile everywhere.
+ *
+ * OpenAI validates each tool's `pattern` as JSON Schema `format: "regex"`, and
+ * the validator compiles the value in Python. Claude Code 2.1.266 ships an
+ * `Artifact` tool whose `field` property carries
+ * `^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$`, and Codex answers
+ * the FIRST request of the session with HTTP 400:
+ *
+ *   invalid_function_parameters, param tools[1].parameters
+ *   "Invalid schema for function 'Artifact': '...' is not a 'regex'."
+ *
+ * Measured against python3 `re`: the negative lookahead in that same pattern
+ * compiles, and `\p{Cc}` raises "bad escape \p". The Unicode property escape is
+ * the whole cause, so this list is the letters Python's `re` knows —
+ * `\A \b \B \d \D \s \S \w \W \Z`, the character escapes, and `\x \u \U \N`.
+ * Every non-letter escape (`\.`, `\\`, `\[`) and every digit backreference is
+ * portable and is not listed.
+ */
+const PORTABLE_ESCAPE_LETTERS = new Set([
+  "A",
+  "b",
+  "B",
+  "d",
+  "D",
+  "s",
+  "S",
+  "w",
+  "W",
+  "Z",
+  "a",
+  "f",
+  "n",
+  "r",
+  "t",
+  "v",
+  "x",
+  "u",
+  "U",
+  "N",
+]);
+
+/**
+ * Report whether a `pattern` compiles under the strictest validator measured.
+ *
+ * A pattern is advisory: it steers the model, and the harness validates the
+ * tool call again on arrival. An unportable one is not advisory — it fails the
+ * whole request before any model runs. So drop what cannot be proven portable.
+ */
+export function isPortablePattern(pattern: string): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+
+    if (char === "\\") {
+      const escaped = pattern[i + 1];
+      // Consume the escaped character, or `\\p` reads as an opener for `p`.
+      i++;
+      if (escaped && /[A-Za-z]/.test(escaped) && !PORTABLE_ESCAPE_LETTERS.has(escaped)) {
+        return false;
+      }
+      continue;
+    }
+
+    // Python spells a named group `(?P<name>)`. A bare `(?<name>)` does not
+    // compile there. Lookbehind, `(?<=` and `(?<!`, does.
+    if (char === "(" && pattern[i + 1] === "?" && pattern[i + 2] === "<") {
+      const after = pattern[i + 3];
+      if (after !== "=" && after !== "!") return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * The keywords whose keys are author-chosen names rather than schema keywords.
+ *
+ * A property called `pattern` lives under `properties`, so the walk must not
+ * read that key as the `pattern` keyword and delete the property itself.
+ */
+const NAMED_SCHEMA_MAPS = new Set(["properties", "$defs", "definitions"]);
+
+function isNamedSchemaMap(key: string, value: any): boolean {
+  return (
+    NAMED_SCHEMA_MAPS.has(key) && !!value && typeof value === "object" && !Array.isArray(value)
+  );
+}
+
+function stripInNamedSchemaMap(map: any, path: string): any {
+  const result: any = {};
+  for (const name in map) {
+    result[name] = stripUnportablePatterns(map[name], `${path}.${name}`);
+  }
+  return result;
+}
+
+/**
+ * Remove every `pattern` that `isPortablePattern` rejects, at any depth.
+ */
+function stripUnportablePatterns(schema: any, path = "parameters"): any {
+  if (Array.isArray(schema)) {
+    return schema.map((item, index) => stripUnportablePatterns(item, `${path}[${index}]`));
+  }
+  if (!schema || typeof schema !== "object") return schema;
+
+  const result: any = {};
+  for (const key in schema) {
+    const value = schema[key];
+
+    if (key === "pattern" && typeof value === "string") {
+      if (isPortablePattern(value)) {
+        result[key] = value;
+      } else {
+        log(`[OpenAITools] Dropped unportable pattern at ${path}: ${value}`);
+      }
+      continue;
+    }
+
+    if (isNamedSchemaMap(key, value)) {
+      result[key] = stripInNamedSchemaMap(value, path);
+      continue;
+    }
+
+    result[key] = stripUnportablePatterns(value, `${path}.${key}`);
+  }
+
+  return result;
+}
 
 /**
  * Sanitize a JSON Schema for OpenAI function calling compatibility.
@@ -69,7 +199,7 @@ export function sanitizeSchemaForOpenAI(schema: any): any {
   root.type = "object";
   if (!root.properties) root.properties = {};
 
-  return removeUriFormat(root);
+  return stripUnportablePatterns(removeUriFormat(root));
 }
 
 /**
@@ -147,4 +277,121 @@ function summarizeToolParameters(schema: any): any {
   }
 
   return summarized;
+}
+
+// ─── tool_choice ────────────────────────────────────────────────────────────
+
+/**
+ * Claude's `tool_choice`, as Claude Code sends it.
+ *
+ * `any` is the one that used to fall through every OpenAI-shaped builder in
+ * this tree: four verbatim copies of a three-branch mapping each handled
+ * `tool`, `auto` and `none`, and silently omitted `any`. Omitting it inverts the
+ * caller's instruction — "you MUST call a tool" became "call one if you feel
+ * like it" — and there is no error anywhere, only a model that answers in prose
+ * when the harness was waiting for a call.
+ */
+export interface ClaudeToolChoice {
+  type?: string;
+  name?: string;
+}
+
+/** An OpenAI Chat Completions `tool_choice` value. */
+export type OpenAIToolChoice = string | { type: "function"; function: { name: string } };
+
+/** An OpenAI Responses API `tool_choice` value (the function form is flat). */
+export type ResponsesToolChoice = string | { type: "function"; name: string };
+
+/**
+ * Map Claude's `tool_choice` onto the OpenAI Chat Completions spelling.
+ *
+ * THE single definition for every OpenAI-shaped adapter — openai, openrouter,
+ * litellm and local each carried their own copy, and `adapters.md:476-482`
+ * records that class of duplication for these exact files. A fifth copy is how
+ * the next `any` gets forgotten.
+ *
+ * Returns `undefined` for "send no tool_choice at all", which is the right
+ * answer for an absent choice, an unrecognised type, and a `tool` choice that
+ * names no tool.
+ *
+ * @param choice - the inbound `tool_choice`, if any
+ * @param encodeName - applied to the named tool, so a wire that renames tools
+ *   names the SAME tool here as in `tools[]`. Identity when omitted.
+ *
+ * NOTE on `encodeName`: production does not pass it. Tool-name encoding runs as
+ * a post-pass over the BUILT payload (`BaseAPIFormat.encodeToolNames`), because
+ * the name also lives in the message history, which no `tool_choice` mapper can
+ * reach — and because the codec's map is minted there. The hook stays for a
+ * builder that ever has the bindings in hand before it builds.
+ */
+export function mapToolChoiceToOpenAI(
+  choice: ClaudeToolChoice | null | undefined,
+  encodeName?: (name: string) => string
+): OpenAIToolChoice | undefined {
+  if (!choice) return undefined;
+  const { type, name } = choice;
+
+  if (type === "tool" && name) {
+    return { type: "function", function: { name: encodeName ? encodeName(name) : name } };
+  }
+  // Claude's "any" means "you must call one of the tools"; OpenAI spells that
+  // "required".
+  if (type === "any") return "required";
+  if (type === "auto" || type === "none") return type;
+  return undefined;
+}
+
+/**
+ * The same mapping in the Responses API spelling, where the function form is
+ * `{type:"function", name}` rather than nesting it under `function`.
+ */
+export function mapToolChoiceToResponsesAPI(
+  choice: ClaudeToolChoice | null | undefined,
+  encodeName?: (name: string) => string
+): ResponsesToolChoice | undefined {
+  const mapped = mapToolChoiceToOpenAI(choice, encodeName);
+  if (mapped === undefined || typeof mapped === "string") return mapped;
+  return { type: "function", name: mapped.function.name };
+}
+
+/** Gemini's `toolConfig` — the same instruction in the protobuf spelling. */
+export interface GeminiToolConfig {
+  functionCallingConfig: {
+    mode: "AUTO" | "ANY" | "NONE";
+    allowedFunctionNames?: string[];
+  };
+}
+
+/**
+ * Map Claude's `tool_choice` onto Gemini's `toolConfig`.
+ *
+ * Gemini had NO tool_choice handling at all: `buildPayload` wrote `contents`,
+ * `generationConfig`, `systemInstruction`, `tools` and `thinkingConfig` and
+ * nothing else, so every forced-tool turn on `g@`/`go@`/`ag@` ran as if the
+ * caller had said `auto`.
+ *
+ * `mode` is a protobuf ENUM: `AUTO`, `ANY` and `NONE` are the spellings the
+ * server accepts, and a misspelling is a 400 on the first tool-using request of
+ * a session, not a degraded response. `tool` maps to `ANY` restricted by
+ * `allowedFunctionNames` — Gemini has no single-function mode.
+ */
+export function mapToolChoiceToGemini(
+  choice: ClaudeToolChoice | null | undefined,
+  encodeName?: (name: string) => string
+): GeminiToolConfig | undefined {
+  if (!choice) return undefined;
+  const { type, name } = choice;
+
+  if (type === "tool" && name) {
+    return {
+      functionCallingConfig: {
+        mode: "ANY",
+        allowedFunctionNames: [encodeName ? encodeName(name) : name],
+      },
+    };
+  }
+  if (type === "any") return { functionCallingConfig: { mode: "ANY" } };
+  if (type === "auto") return { functionCallingConfig: { mode: "AUTO" } };
+  if (type === "none") return { functionCallingConfig: { mode: "NONE" } };
+  return undefined;
 }

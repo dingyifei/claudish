@@ -22,7 +22,7 @@
 
 import type { Context } from "hono";
 import type { BaseAPIFormat, EffortLevel } from "../adapters/base-api-format.js";
-import type { ProviderTransport } from "../providers/transport/types.js";
+import type { ProviderTransport, StreamFormat } from "../providers/transport/types.js";
 import type { ModelHandler } from "./types.js";
 // Alias for readability within this file
 type BaseModelAdapter = BaseAPIFormat;
@@ -60,7 +60,11 @@ import { sniffDevinStreamHead } from "./shared/devin-stream-head-sniffer.js";
 import { hasActionableLink, hasModelUnsupportedWording } from "./shared/model-unsupported.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { hasPlanLimitWording, isQuotaExhaustionError } from "./shared/quota-exhaustion.js";
-import { isRequestShapeError } from "./shared/request-shape.js";
+import {
+  CONTEXT_OVERFLOW_PHRASE,
+  isContextOverflowError,
+  isRequestShapeError,
+} from "./shared/request-shape.js";
 import { sniffResponsesStreamHead } from "./shared/stream-head-sniffer.js";
 import { createAnthropicPassthroughStream } from "./shared/stream-parsers/anthropic-sse.js";
 import { createDevinConnectStream } from "./shared/stream-parsers/devin-connect.js";
@@ -68,7 +72,7 @@ import { createGeminiSseStream } from "./shared/stream-parsers/gemini-sse.js";
 import { createOllamaJsonlStream } from "./shared/stream-parsers/ollama-jsonl.js";
 import { createResponsesStreamHandler } from "./shared/stream-parsers/openai-responses-sse.js";
 import { createStreamingResponseHandler } from "./shared/stream-parsers/openai-sse.js";
-import { TokenTracker } from "./shared/token-tracker.js";
+import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
 import { captureUpstreamError } from "./shared/upstream-error-capture.js";
 
 /**
@@ -219,6 +223,28 @@ export class ComposedHandler implements ModelHandler {
     if (resolvedModelAdapter.getName() !== "DefaultAPIFormat") {
       this.modelAdapter = resolvedModelAdapter;
     }
+
+    // Tell every adapter which PARSER will read the response.
+    //
+    // This is the only place that knows: `resolveStreamFormat()` consults
+    // `provider.overrideStreamFormat()` FIRST, and no adapter can see that. The
+    // pairing it exists for is `{transport:"openai", streamFormat:"anthropic-sse"}`
+    // — an OpenAI-shaped REQUEST answered in Anthropic SSE. The request shape
+    // armed the 64-char tool-name encoder while the Anthropic passthrough parser
+    // takes no decode map, so Claude Code received a tool name it never
+    // advertised and its allowlist dropped the call with no error anywhere.
+    // `getToolNameLimit()` now returns null for any wire whose parser cannot
+    // decode. See `wireDecodesToolNames`.
+    //
+    // Set once, here, because it is a property of the COMPOSITION:
+    // `resolveStreamFormat()` never looks at the request, so this carries none
+    // of the per-request race that made the tool-name bindings per-request.
+    // `resolvedDialect`, not `modelAdapter`: an unrecognized model leaves
+    // `modelAdapter` unset and `getAdapter()` then returns the dialect, which is
+    // the instance that would do the encoding.
+    const responseWire = this.resolveStreamFormat() as StreamFormat;
+    this.resolvedDialect.setResponseWireFormat(responseWire);
+    this.explicitAdapter?.setResponseWireFormat(responseWire);
 
     // Initialize middleware (only register model-specific middleware when applicable).
     // Use bareModelName for the middleware gate — .includes() works identically for
@@ -589,7 +615,9 @@ export class ComposedHandler implements ModelHandler {
     // note there for why it cannot run at this point.)
 
     const endpoint = this.provider.getEndpoint(this.targetModel);
-    const headers = await this.provider.getHeaders();
+    // The ORIGINAL inbound body, not the normalized `claudeRequest` clone: a
+    // header carrying conversation identity must see what Claude Code sent.
+    const headers = await this.provider.getHeaders(payload);
 
     // 6a. The body is NOT necessarily JSON. A transport may serialize the
     // payload itself (Devin encodes Connect-protobuf, credential and all).
@@ -709,20 +737,41 @@ export class ComposedHandler implements ModelHandler {
       //
       // Bounded to a single attempt on purpose: the dialect records the verdict,
       // so a second failure means the error was never about that parameter.
-      if (
-        response.status >= 400 &&
-        response.status < 500 &&
-        this.modelAdapter?.recoverFromRejection
-      ) {
-        const errorText = await response.clone().text();
-        const recovery = this.modelAdapter.recoverFromRejection(requestPayload, errorText);
+      //
+      // BOTH ADAPTERS ARE ASKED, in Layer order. This used to call
+      // `this.modelAdapter` alone, which silently excluded every model that
+      // resolves to `DefaultAPIFormat`: `resolveModelDialect` returns it for any
+      // model no dialect recognises, and the constructor above deliberately
+      // leaves `modelAdapter` unset for exactly that value. So an unrecognized
+      // model on a custom OpenAI-compatible endpoint — a brand-new
+      // `vendor/new-model`, which is the population most likely to meet a strict
+      // relay — reached a 400 `Unknown parameter: 'stop'` with no recovery at
+      // all, even though `BaseAPIFormat.recoverFromRejection` is written to
+      // repair precisely that. The Layer 1 converter is also the adapter that
+      // BUILT the payload (`getAdapter()` is `explicitAdapter || resolvedDialect`),
+      // so it is the one that added the optional parameter in the first place.
+      //
+      // Deduped by identity, first non-null wins. Every implementation is
+      // stateless with respect to the payload — it returns a NEW object and
+      // mutates nothing — so asking a second one after the first declines costs
+      // nothing and cannot corrupt the retry.
+      if (response.status >= 400 && response.status < 500) {
+        const candidates = [this.modelAdapter, this.getAdapter()].filter(
+          (a, i, all): a is BaseModelAdapter => !!a?.recoverFromRejection && all.indexOf(a) === i
+        );
+        const errorText = candidates.length > 0 ? await response.clone().text() : "";
+        let recovery: { payload: any; note: string } | null = null;
+        for (const candidate of candidates) {
+          recovery = candidate.recoverFromRejection(requestPayload, errorText);
+          if (recovery) break;
+        }
         if (recovery) {
           log(`[${this.provider.displayName}] Parameter rejected — retrying: ${recovery.note}`);
           requestPayload = recovery.payload;
           // Re-serialize: a transport that owns its own encoding (Devin) must
           // re-encode the changed payload rather than resend the stale bytes.
           const retrySerialized = this.provider.serializeBody?.(requestPayload);
-          const retryHeaders = await this.provider.getHeaders();
+          const retryHeaders = await this.provider.getHeaders(payload);
           retryHeaders["Content-Type"] = retrySerialized?.contentType ?? "application/json";
           const retryResp = await fetch(endpoint, {
             method: "POST",
@@ -751,7 +800,7 @@ export class ComposedHandler implements ModelHandler {
         log(`[${this.provider.displayName}] Got 401, forcing auth refresh and retrying`);
         try {
           await this.provider.forceRefreshAuth();
-          const retryHeaders = await this.provider.getHeaders();
+          const retryHeaders = await this.provider.getHeaders(payload);
           // Same serialization as the primary request — this is a separate call
           // site and the easy one to forget, which is why both are pinned by
           // the same assertion.
@@ -966,6 +1015,12 @@ export class ComposedHandler implements ModelHandler {
             status: response.status,
             hint,
             providerMessage: providerMsg,
+            // The one phrase an Anthropic client recognises for an oversized
+            // prompt. Providers state the same fact in their own words, which
+            // no client matches — see CONTEXT_OVERFLOW_PHRASE.
+            leadPhrase: isContextOverflowError(response.status, errorText)
+              ? CONTEXT_OVERFLOW_PHRASE
+              : undefined,
           });
           // Carry the ORIGINAL upstream status as a structured field so
           // machine consumers (probe classification) can tell a remapped
@@ -1402,20 +1457,25 @@ export class ComposedHandler implements ModelHandler {
     // Local mutable copy so we can null it out after firing (prevents double-firing)
     // without reassigning the function parameter.
     let pendingOnComplete = onComplete;
-    const onTokenUpdate = (input: number, output: number) => {
+    // `input` is the FULL context size, always — never the cache-reduced figure
+    // that rides on the wire. `detail` is the optional cached breakdown of that
+    // same number and is used for COST ONLY; see UsageCacheDetail and
+    // `context-window.md`, which records what happens when a reduced count
+    // reaches the context accounting (auto-compaction silently disarms).
+    const onTokenUpdate = (input: number, output: number, detail?: UsageCacheDetail) => {
       const strategy = this.options.tokenStrategy || "standard";
       switch (strategy) {
         case "accumulate-both":
-          this.tokenTracker.accumulateBoth(input, output);
+          this.tokenTracker.accumulateBoth(input, output, detail);
           break;
         case "delta-aware":
-          this.tokenTracker.updateWithDelta(input, output);
+          this.tokenTracker.updateWithDelta(input, output, detail);
           break;
         case "local":
-          this.tokenTracker.updateLocal(input, output);
+          this.tokenTracker.updateLocal(input, output, detail);
           break;
         default:
-          this.tokenTracker.update(input, output);
+          this.tokenTracker.update(input, output, detail);
           break;
       }
       // Fire onComplete after token update so recordStats() sees the final token counts.
@@ -1486,7 +1546,11 @@ export class ComposedHandler implements ModelHandler {
         return createResponsesStreamHandler(c, response, {
           modelName: this.bareModelName,
           onTokenUpdate,
-          toolNameMap: adapter.getToolNameMap(),
+          // The map THIS request captured right after prepareRequest — not a
+          // fresh read. This runs after an awaited fetch, and on a handler
+          // shared by two conversations the adapter's own map may already
+          // belong to the next request by now.
+          toolNameMap,
           contextWindow: lookupModelForProvider(this.bareModelName, this.provider.name),
           onApiError,
           priorInputTokens,
@@ -1771,6 +1835,13 @@ export function getRecoveryHint(
       return "Input too large. Reduce message history or use a larger-context model.";
     }
     return "Request format may be incompatible with provider.";
+  }
+  // 413 is "Payload Too Large" by definition, and until now fell through to
+  // "Unexpected HTTP 413 from <provider>" — a status name where the actionable
+  // advice already exists three lines above. Gated on the narrow predicate, so a
+  // 413 about something other than the prompt keeps the generic line.
+  if (isContextOverflowError(status, errorText)) {
+    return "Input too large. Reduce message history or use a larger-context model.";
   }
   if (status >= 500) {
     return "Server error — retry after a brief wait.";

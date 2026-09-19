@@ -241,6 +241,13 @@ interface LiveTeamRun {
   processes: Map<string, ChildProcess>;
   idleMsFor: (slotId: string) => number | null;
   activityFor: (slotId: string) => string | null;
+  liveBytesFor: (slotId: string) => number | null;
+  /**
+   * Whether the slot is still RUNNING. The run stays registered until its LAST
+   * slot settles, so without this an exited slot kept reporting its frozen
+   * activity and an idle clock that grew for as long as its siblings worked.
+   */
+  isRunning: (slotId: string) => boolean;
   /** Marked before the signal, so the exit handler can tell stopped from crashed. */
   cancelledSlots: Set<string>;
 }
@@ -272,6 +279,7 @@ export function teamSlotIdleSeconds(teamSessionId: string): Record<string, numbe
   if (!run) return null;
   const out: Record<string, number> = {};
   for (const slotId of run.processes.keys()) {
+    if (!run.isRunning(slotId)) continue;
     const idle = run.idleMsFor(slotId);
     if (idle !== null) out[slotId] = Math.round(idle / 1000);
   }
@@ -280,9 +288,9 @@ export function teamSlotIdleSeconds(teamSessionId: string): Record<string, numbe
 
 /**
  * What each still-running slot is doing, from the stream-json reducer:
- * `running`, `tool_executing`, `waiting_for_input`, or a terminal state. Null
- * for a run that is not live; a slot is absent under `"print"` capture, which
- * emits no frames to read.
+ * `running`, `tool_executing` or `waiting_for_input`. Null for a run that is not
+ * live; a slot is absent once it has exited (its outcome is `state` in
+ * `status.json`), and under `"print"` capture, which emits no frames to read.
  *
  * The companion to `teamSlotIdleSeconds`, and the reason that number is safe to
  * publish without a verdict attached. Ninety seconds of silence in
@@ -295,8 +303,38 @@ export function teamSlotActivity(teamSessionId: string): Record<string, string> 
   if (!run) return null;
   const out: Record<string, string> = {};
   for (const slotId of run.processes.keys()) {
+    if (!run.isRunning(slotId)) continue;
     const activity = run.activityFor(slotId);
     if (activity !== null) out[slotId] = activity;
+  }
+  return out;
+}
+
+/**
+ * Bytes of ANSWER each still-running slot has produced so far, or null for a run
+ * that is not live here.
+ *
+ * The field `outputSize` is not this. `outputSize` is written once, in `finish()`,
+ * so it reads 0 for the whole life of a RUNNING slot however much that slot has
+ * written — and a caller that reads it as progress concludes a working slot
+ * produced nothing. That misreading is the reason this exists.
+ *
+ * Same unit as `outputSize`, deliberately: both count recovered answer prose, so
+ * this number grows into the one the slot finishes with. It lags by at most one
+ * unterminated line, which the stream-json reducer holds back until its newline
+ * arrives (see `ModelRuntime.flushPartial`).
+ *
+ * Volume, not liveness. Read it with `teamSlotIdleSeconds` and `teamSlotActivity`:
+ * a slot can legitimately sit at 0 B for minutes while a build runs.
+ */
+export function teamSlotLiveBytes(teamSessionId: string): Record<string, number> | null {
+  const run = liveTeamRuns.get(teamSessionId);
+  if (!run) return null;
+  const out: Record<string, number> = {};
+  for (const slotId of run.processes.keys()) {
+    if (!run.isRunning(slotId)) continue;
+    const bytes = run.liveBytesFor(slotId);
+    if (bytes !== null) out[slotId] = bytes;
   }
   return out;
 }
@@ -390,6 +428,33 @@ export interface TeamVerdict {
  * knows when the tail it was handed is the complete output.
  */
 export const STDOUT_TAIL_LIMIT = 4000;
+
+/** Budget for the stdout snippet recorded in `status.json`. */
+const SNIPPET_LIMIT = 2000;
+
+/** Bytes of the snippet budget spent on the START of the text. */
+const SNIPPET_HEAD = 600;
+
+/**
+ * Keep the snippet within budget WITHOUT discarding the beginning.
+ *
+ * A plain `.slice(-2000)` threw away the first half of a 4000-byte tail that was
+ * already in hand, and the beginning is where a shape mismatch is usually
+ * legible: a `require_pattern` near-miss like `**Verdict**: **FAIL**` against
+ * `/\*\*Verdict\*\*: (PASS|CONDITIONAL|FAIL)/` is diagnosed the moment the
+ * reader sees the model's actual wording. Ending a report at the tail can show
+ * the reader the last 2000 bytes of prose and none of the line that explains it.
+ *
+ * Short text is returned whole, so the elision marker only ever appears when
+ * something really was dropped.
+ */
+export function snippetHeadAndTail(text: string): string {
+  if (text.length <= SNIPPET_LIMIT) return text;
+  const head = text.slice(0, SNIPPET_HEAD);
+  const tail = text.slice(-(SNIPPET_LIMIT - SNIPPET_HEAD));
+  const omitted = text.length - head.length - tail.length;
+  return `${head}\n\n… [${omitted} bytes omitted] …\n\n${tail}`;
+}
 
 /** Claude Code prints API failures into its stdout and still exits 0. */
 const API_ERROR_RE = /\[API Error:\s*([^\]]{0,300})\]/i;
@@ -1192,9 +1257,9 @@ export async function startModels(
         if (captureFinalized) return;
         captureFinalized = true;
         absorb(slotReducer.end());
-        // Releases the reducer's internal state. Nothing else disposes it, and
-        // a team run holds one per slot for the life of the run.
-        slotReducer.dispose();
+        // NOT disposed here: `finish()` decides the slot's outcome later, off
+        // outputStream "close", and a disposed reducer ignores `settle()`. It
+        // settles and disposes the reducer there, once.
         outputStream.end();
       };
       proc.stdout?.on("end", finalizeCapture);
@@ -1240,6 +1305,31 @@ export async function startModels(
       let exitCode: number | null = null;
       let resolved = false;
 
+      /**
+       * Settle the reducer to the outcome just recorded, then release it.
+       *
+       * Without the settle the reducer stays wherever the stream left it — a
+       * `result` frame parks it in `waiting_for_input` — so an exited slot read
+       * as idle rather than done. Runs only once `state` is final, which is why
+       * the dispose lives here and not in `finalizeCapture`. No-op under
+       * `"print"`, which has no reducer.
+       */
+      const settleReducer = (): void => {
+        if (!reducer) return;
+        const state = statusCache.models[anonId]?.state;
+        const failed = state === "FAILED" || state === "EMPTY";
+        reducer.settle(
+          failed && cancelledSlots.has(anonId)
+            ? "cancelled"
+            : state === "COMPLETED"
+              ? "completed"
+              : state === "TIMEOUT"
+                ? "timeout"
+                : "failed"
+        );
+        reducer.dispose();
+      };
+
       const finish = () => {
         if (resolved) return;
         // The timeout handler may have fired between proc "exit" and
@@ -1255,6 +1345,8 @@ export async function startModels(
         if (statusCache.models[anonId].state === "TIMEOUT") {
           resolved = true;
           reconcileTimedOutOutput(anonId, byteCount, stdoutTail, stderr);
+          // After the reconcile, which can upgrade TIMEOUT to COMPLETED.
+          settleReducer();
           resolve();
           return;
         }
@@ -1320,7 +1412,7 @@ export async function startModels(
               // Redacted: these land in status.json on disk and are read back
               // by anything inspecting the run.
               stderrSnippet: stderr ? redactSecrets(stderr).slice(-2000) : undefined,
-              stdoutSnippet: stdoutTail ? redactSecrets(stdoutTail).slice(-2000) : undefined,
+              stdoutSnippet: stdoutTail ? snippetHeadAndTail(redactSecrets(stdoutTail)) : undefined,
               errorLogPath,
               // Only when the child actually wrote one. Naming a file that does
               // not exist sends a reader after evidence that was never captured.
@@ -1340,6 +1432,9 @@ export async function startModels(
           });
         }
 
+        // Before the caller's callback, so a throwing consumer cannot skip the
+        // dispose and leak the reducer's tool-batch timer.
+        settleReducer();
         opts.onStatusChange?.(anonId, statusCache.models[anonId]);
         resolve();
       };
@@ -1463,6 +1558,8 @@ export async function startModels(
     processes,
     idleMsFor: (slotId) => runtimes.get(slotId)?.getIdleMs() ?? null,
     activityFor: (slotId) => runtimes.get(slotId)?.getActivity() ?? null,
+    liveBytesFor: (slotId) => runtimes.get(slotId)?.getByteCount() ?? null,
+    isRunning: (slotId) => statusCache.models[slotId]?.state === "RUNNING",
     cancelledSlots,
   });
 

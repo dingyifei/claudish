@@ -64,6 +64,7 @@ import {
   startModels,
   teamSlotActivity,
   teamSlotIdleSeconds,
+  teamSlotLiveBytes,
   validateSessionPath,
 } from "./team-orchestrator.js";
 import type { ProxyServer } from "./types.js";
@@ -453,6 +454,78 @@ export function buildChildClaudeFlags(agent: unknown, claudeFlags: unknown): str
 
   const flags = [...(named ? ["--agent", named] : []), ...cleaned];
   return flags.length > 0 ? flags : undefined;
+}
+
+/**
+ * The prose that stops a caller reading `outputSize` as progress.
+ *
+ * A slot's `outputSize` is written once, when it finishes, so a RUNNING slot
+ * always reports 0. Real orchestrators have read that 0 next to a 20-minute-old
+ * `startedAt` and concluded the slot produced nothing; one then had to reason its
+ * way back out in front of the user. The note leads with that, because a caller
+ * skimming a JSON blob reads the first clause and stops.
+ *
+ * Returned only while something is still RUNNING — on a settled run the states
+ * are final, `outputSize` means exactly what it says, and this would be noise.
+ */
+export function teamStatusNote(opts: { anyRunning: boolean; live: boolean }): string | undefined {
+  if (!opts.anyRunning) return undefined;
+  const trap =
+    "outputSize is the size of the FINAL answer and is written once, when a slot " +
+    "finishes. Every RUNNING slot therefore reports 0 however much work it has done: " +
+    "it is NOT a progress signal, and 0 there does not mean the slot produced nothing.";
+  // No live handles means this server did not spawn the run, or was restarted
+  // under it. Promising fields that are null would send the reader after
+  // evidence that is not there.
+  if (!opts.live) {
+    return (
+      `${trap} This run is not live in this process — it was started elsewhere, or this ` +
+      "server restarted — so there are no liveness fields for it and the states above are " +
+      "whatever was last written to status.json."
+    );
+  }
+  return (
+    `${trap} Judge a running slot on three fields read TOGETHER: ` +
+    "live_output_bytes_by_slot (answer bytes so far, the number outputSize will become), " +
+    "idle_seconds_by_slot (seconds of silence) and activity_by_slot (what it is doing). " +
+    "Silence in tool_executing is a build or test suite running, and is not a failure " +
+    'signal. Nothing cancels on your behalf — use mode:"cancel" if you decide to.'
+  );
+}
+
+/**
+ * Assemble the `status` response. Pure and exported so the contract above can be
+ * tested without spawning a run: every liveness input is a parameter.
+ */
+export function buildTeamStatusPayload(opts: {
+  status: import("./team-orchestrator.js").TeamStatus;
+  sessionPath: string;
+  idle: Record<string, number> | null;
+  activity: Record<string, string> | null;
+  liveBytes: Record<string, number> | null;
+}): Record<string, unknown> {
+  const { status, sessionPath, idle, activity, liveBytes } = opts;
+  const anyRunning = Object.values(status.models).some((m) => m.state === "RUNNING");
+  // Keyed on RUNNING, not on liveness. A run this server never spawned can still
+  // show RUNNING slots from a stale status.json, and that is precisely a reader
+  // who is about to misjudge an `outputSize` of 0.
+  const note = teamStatusNote({ anyRunning, live: idle !== null });
+  return {
+    ...status,
+    // Bytes of answer produced SO FAR, per still-running slot. `outputSize` cannot
+    // answer this — see teamSlotLiveBytes.
+    live_output_bytes_by_slot: liveBytes,
+    idle_seconds_by_slot: idle,
+    // What each slot is DOING, which is what makes the idle number readable.
+    // Silence in `tool_executing` is a build; the same silence in `running` is a
+    // stalled answer.
+    activity_by_slot: activity,
+    ...(note ? { note } : {}),
+    // The rendered result card, once there is a result to render. This is the
+    // summary `run` used to return before it stopped waiting; a settled `status`
+    // is now where it belongs, since that is the call that knows the outcome.
+    ...(anyRunning ? {} : { summary: formatTeamResult(status, sessionPath) }),
+  };
 }
 
 export function formatTeamResult(
@@ -1136,13 +1209,18 @@ function defineTools(
     description:
       "Run AI models on a task with anonymized outputs and optional blind judging. " +
       "Modes: 'run' (START the models and return a slot map immediately — it does NOT " +
-      "wait), 'status' (per-slot state, plus how long each slot has been silent), " +
+      "wait), 'status' (per-slot state, plus live answer bytes, seconds of silence and " +
+      "current activity per slot), " +
       "'cancel' (stop one slot or the whole run), 'judge' (blind-vote on existing " +
       "outputs), 'run-and-judge' (the blocking pipeline). " +
       "NO SLOT IS EVER KILLED ON A TIMER. A team slot is a full Claude Code session and " +
       "may work for a long time; a slot inside a build or test suite emits nothing for " +
       "minutes and is working, not stuck. Poll 'status', judge the silence against the " +
-      "task you set, and use 'cancel' if you decide a slot is wedged.",
+      "task you set, and use 'cancel' if you decide a slot is wedged. " +
+      "JUDGING A RUNNING SLOT: read live_output_bytes_by_slot, idle_seconds_by_slot and " +
+      "activity_by_slot. Do NOT use 'outputSize' — it is the size of the final answer, " +
+      "written only when a slot finishes, so it is 0 for every running slot no matter how " +
+      "much that slot has produced.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1151,9 +1229,11 @@ function defineTools(
           enum: ["run", "judge", "run-and-judge", "status", "cancel"],
           description:
             "Operation mode. 'run' STARTS the models and returns immediately with a " +
-            "slot map — it does not wait. Poll 'status' for progress, then 'judge' once " +
-            "the slots have finished. 'run-and-judge' is the blocking pipeline and holds " +
-            "the call open for the whole run. 'cancel' stops one slot or the whole run.",
+            "slot map — it does not wait. Poll 'status' for progress (read it from " +
+            "live_output_bytes_by_slot and activity_by_slot, never from outputSize, " +
+            "which stays 0 until a slot finishes), then 'judge' once the slots have " +
+            "finished. 'run-and-judge' is the blocking pipeline and holds the call open " +
+            "for the whole run. 'cancel' stops one slot or the whole run.",
         },
         slot: {
           type: "string",
@@ -1398,39 +1478,21 @@ function defineTools(
           case "status": {
             const status = getStatus(resolved);
             const teamSessionId = resolved.split("/").filter(Boolean).pop() ?? "team";
-            // Seconds of silence per slot, for RUNNING slots of a live run.
-            // Null once the run has settled — the states in `status` are final
-            // then, and there is no child left to be quiet.
-            const idle = teamSlotIdleSeconds(teamSessionId);
-            const settled = !Object.values(status.models).some((m) => m.state === "RUNNING");
+            // All three liveness reads are null once the run has settled or if it
+            // was never spawned here — the states in `status` are then whatever
+            // status.json last recorded, and there is no child left to ask.
             return {
               content: [
                 {
                   type: "text" as const,
                   text: JSON.stringify(
-                    {
-                      ...status,
-                      idle_seconds_by_slot: idle,
-                      // What each slot is DOING, which is what makes the idle
-                      // number readable. Silence in `tool_executing` is a build;
-                      // the same silence in `running` is a stalled answer.
-                      activity_by_slot: teamSlotActivity(teamSessionId),
-                      ...(idle
-                        ? {
-                            note:
-                              "idle_seconds_by_slot is how long each slot has been silent; " +
-                              "read it against activity_by_slot. Silence in tool_executing " +
-                              "is a build or test suite running, and is not a failure " +
-                              'signal. Nothing cancels on your behalf — use mode:"cancel" ' +
-                              "if you decide to.",
-                          }
-                        : {}),
-                      // The rendered result card, once there is a result to
-                      // render. This is the summary `run` used to return before
-                      // it stopped waiting; a settled `status` is now where it
-                      // belongs, since that is the call that knows the outcome.
-                      ...(settled ? { summary: formatTeamResult(status, resolved) } : {}),
-                    },
+                    buildTeamStatusPayload({
+                      status,
+                      sessionPath: resolved,
+                      idle: teamSlotIdleSeconds(teamSessionId),
+                      activity: teamSlotActivity(teamSessionId),
+                      liveBytes: teamSlotLiveBytes(teamSessionId),
+                    }),
                     null,
                     2
                   ),

@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type DiskCacheV2, writeAllModelsCache } from "../providers/all-models-cache.js";
 import { GLMModelDialect } from "./glm-model-dialect.js";
-import { type ReasoningCapability, lookupModelReasoning } from "./model-catalog.js";
+import {
+  type ReasoningCapability,
+  lookupModelReasoning,
+  lookupModelReasoningStatus,
+} from "./model-catalog.js";
 
 const MODEL_ID = "glm-effort-override-test";
 
@@ -18,6 +22,17 @@ class CatalogBackedGLMFormat extends GLMModelDialect {
 
   protected override lookupReasoningCapability(): ReasoningCapability | undefined {
     return lookupModelReasoning(this.getModelId(), this.cachePath);
+  }
+
+  /**
+   * Redirected alongside the capability, and for the same reason: the dispatch
+   * now reads the status first and emits nothing when the control is unknown.
+   * Leaving this one pointed at the default would read the REAL cache on disk
+   * while the capability came from this test's temp file — green on a machine
+   * with a warm catalog, red on a clean one.
+   */
+  protected override lookupReasoningStatus(): "known" | "unknown" | undefined {
+    return lookupModelReasoningStatus(this.getModelId(), this.cachePath);
   }
 }
 

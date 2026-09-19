@@ -24,6 +24,56 @@ Handles auth, endpoints, headers, rate limiting. Optionally overrides stream for
 - **Interface**: `providers/transport/types.ts`
 - **Stream format override**: LiteLLM and OpenRouter implement `overrideStreamFormat()` → `"openai-sse"`
 
+### A header that names the conversation is derived per call, never stored
+
+`getHeaders(claudeRequest?)` receives the ORIGINAL inbound body Claude Code sent
+(`handle()`'s `payload`, not the normalized `claudeRequest` clone, which adds
+`tools: []`). ComposedHandler passes it at all three call sites: the main request,
+the parameter-rejection retry and the 401 refresh retry. A header computed only on
+the main path goes missing on the retry.
+
+The value must be derived from the argument on every call. Handlers, and so
+transports, are cached one per model, and `claudish serve` hosts several
+conversations in one process. A value stored on the transport in
+`transformPayload` and read back in `getHeaders` would let a retry, which runs
+after an awaited fetch, carry another conversation's id.
+
+The one derivation is `conversationKey()` (`providers/transport/conversation-key.ts`):
+`claudish_` + sha256 of Claude Code's `session_id` from `metadata.user_id`, 32 hex.
+Codex sends it as `prompt_cache_key`; OpenCode Zen sends it as `x-opencode-session`.
+
+OpenCode Zen Go began answering every request without that header with
+`400 {"type":"MissingSessionID"}` (measured 2026-09-12; claudish's routing chain
+then stepped silently to the next provider). `OpenCodeZenTransport` adds it on
+both Zen tiers. The metered `opencode-zen` tier sends it too, on OpenCode's docs
+sentence alone: it is NOT verified live, because no `OPENCODE_API_KEY` was
+available.
+
+The fallback key costs Zen more than it costs Codex. With no session id, the key is
+one random value per process. For Codex that shares a cache hint; for Zen it is the
+upstream's routing identity, so under `serve` every sessionless conversation shares
+one `x-opencode-session`. OpenCode's error text calls a missing header a routing
+inefficiency, so a shared value is not expected to fail, but it is less precise.
+
+### Zen also needs a User-Agent, and its two routes proved it separately
+
+`OpenCodeZenTransport` sends `User-Agent: claudish/<version>` beside the session
+id. OpenCode's docs ask a client to identify itself "rather than a generic SDK or
+HTTP-library name", and this relay enforces it: `providers/model-discovery.ts`
+records that a UA-less roster request to Zen Go answers `403 error code: 1010`,
+Cloudflare's browser-integrity block, while the identical request carrying one
+returns 200 with 26 models (measured 2026-08-18). The chat path sits behind the
+same edge and went without a UA until 2026-09-15.
+
+Read the two together, because the failure modes are unalike and each is mistaken
+for a credential problem. A missing UA is a Cloudflare 403 at the edge, before the
+relay sees the request. A missing session id is a 400 from the relay itself. Both
+send a user to check a key that is fine.
+
+Precedence is the same on both routes: the generated headers are written FIRST and
+the provider definition's own `headers` merge over them, so an endpoint that pins
+either value keeps it. Auth is applied last and nothing can displace it.
+
 ## Composition in ComposedHandler
 ```
 ComposedHandler = FormatConverter (explicit adapter) + ModelTranslator (auto-selected) + ProviderTransport
@@ -207,6 +257,27 @@ This is the one place the 400-not-503 doctrine (`composed-handler.ts` ~line 461)
 
 `latency_ms` for a retried turn includes the backoff waits by design: the honest figure is time-to-usable-response.
 
+## A stream that dies mid tool-call (`openai-responses-sse.ts`)
+
+`content_block_start` for a tool goes out the moment `response.output_item.added` arrives — before a single argument byte exists. From that point the block is committed and claudish cannot un-send it. So when the socket dies while `function_call_arguments.delta` is still streaming, the only lever left is **how the message ends**.
+
+It used to end `end_turn`. That is the one ending which means "the turn finished, run the tool", so Claude Code ran it on truncated JSON:
+
+```
+InputValidationError: Write was called with input that could not be parsed as JSON.
+You sent (first 200 of 9437 bytes): {"file_path":".../catalog-generation.test.ts","content":"import { describe, expect, it } from \"bun:test\";\nimport typ
+```
+
+models-index subagent `acd91c47262e06a7a`, `gpt-5.6-sol` via `openai-codex`, 2026-09-09 15:48:27Z, followed by `[Stream error: TypeError: The socket connection was closed unexpectedly]`. It recurred at 15:56:32Z in the same run. Across the local Claude Code transcripts, 10 of 20 `__unparsedToolInput` failures are this path; the other 10 are the model emitting genuinely invalid JSON (`{"file_path": "...", "offset": 55, , "limit": 135}`), which is not claudish's to fix — the harness error prompts a retry that works.
+
+**The head sniffer cannot cover this.** `stream-head-sniffer.ts` decides while the status code is still ours, which is the first seconds of the stream. This failure landed 93 s in, deep in the body. Once content bytes are flowing there is no retry claudish can perform on the client's behalf.
+
+**`max_tokens` does not rescue it.** v7.12.7 reports `stop_reason: "max_tokens"` for a turn cut off by `response.incomplete`, on the stated contract that the client then discards the partial block. It does not. Claude Code **2.1.217** executed a `max_tokens`-terminated `Write` and returned the same `InputValidationError` (passflow session, 2026-07-22 13:27:31Z — six days after that fix shipped). The `max_output_tokens` path keeps the label anyway: it is the honest one, and that truncation is *deterministic*, so an `error` event there would only make the client retry a request that truncates again at the same place.
+
+**VERIFIED against a real client (2026-09-10).** Claude Code does honour a mid-stream `error` event: it discards the partial `tool_use` and retries the turn. Measured before/after against one mock upstream — released v9.0.8 executed the truncated `Write` and returned `InputValidationError`, the fixed build executed no tool at all. This was measured rather than argued precisely because the `max_tokens` assumption above turned out to be false. Method, traps and raw logs: [`../reports/truncated-toolcall-live-verification.md`](../reports/truncated-toolcall-live-verification.md).
+
+**The fix:** when `openToolBlocks` is non-empty in the parser's catch block, end the turn with an SSE `error` event instead of `end_turn`. No completed `tool_use` reaches the client, and a dead socket is transient, so the client's own retry is the right remedy. `devin-connect.ts` ends a mid-stream fault the same way. With no tool call in flight the inline `[Stream error: ...]` text block is kept — partial prose is harmless and visible.
+
 ## The remap has a downstream reader: `upstream_status` (v7.62.0, #148)
 
 The 400-not-503 remap is right for the CLIENT and wrong for anything downstream that
@@ -363,3 +434,53 @@ providers that give you nothing else.
 Note the status here is safe to branch on: `getRecoveryHint` is called with the
 raw `response.status` at the upstream error site, upstream of the remap
 described above.
+
+## A tool `pattern` is validated by the provider, in Python (v9.0.8, `format/openai-tools.ts`)
+
+OpenAI checks every tool schema's `pattern` as JSON Schema `format: "regex"`, and
+the checker compiles the value in Python. Claude Code 2.1.266 added the `Artifact`
+tool, whose `field` property carries:
+
+```
+^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$
+```
+
+Every `cx@` session then died on its FIRST request, before any model ran:
+
+```
+HTTP 400 invalid_request_error, code invalid_function_parameters, param tools[1].parameters
+"Invalid schema for function 'Artifact': '...' is not a 'regex'."
+```
+
+Measured against `python3 -c "import re"`, one construct at a time:
+
+| pattern | Python `re` |
+|---|---|
+| the full Artifact one | `bad escape \p` |
+| its `(?!__.*__$)` lookahead alone | compiles |
+| `^[^\p{Cc}]{1,200}$` alone | `bad escape \p` |
+
+So the Unicode property escape is the whole cause, and the lookahead is innocent.
+That matters for the shape of the fix: "strip every `pattern`" throws away working
+constraints, and "strip lookarounds" fixes nothing. `isPortablePattern` instead
+allows only the escape letters Python's `re` knows (`\A \b \B \d \D \s \S \w \W \Z`,
+the character escapes, `\x \u \U \N`), plus every non-letter escape and every digit
+backreference. It also rejects a bare `(?<name>)`, which Python spells `(?P<name>)`,
+while allowing the `(?<=` and `(?<!` lookbehinds.
+
+Dropping is right because a `pattern` is ADVISORY — it steers the model, and the
+harness re-validates the tool call on arrival. An unportable one is not advisory: it
+fails the whole request. The costs are asymmetric, so a pattern that cannot be
+proven portable is not sent.
+
+Two things this uncovered:
+
+1. `openrouter-api-format.ts` had its own `convertTools` calling `removeUriFormat`
+   directly, so it skipped the top-level `oneOf` collapse, the never-undefined
+   `parameters` guard, and this strip. It now calls the shared
+   `convertToolsToOpenAI`. OpenRouter forwards to OpenAI models and inherits the
+   same validator, so the divergent copy was a latent second instance of this bug.
+2. The strip's log line is invisible in the default session log. `log()` writes to
+   the always-on structural log only through `isStructuralLogWorthy`, a whitelist.
+   Use `-d` / `--debug-claudish` (which writes `./logs/`), not `--debug` — the
+   latter is passed through to Claude Code and tells you nothing about the proxy.

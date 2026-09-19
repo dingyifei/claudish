@@ -195,10 +195,67 @@ export async function fetchLatestVersion(
 }
 
 /**
+ * Resolve the newest published version, preferring the 24-hour cache.
+ *
+ * The single place that decides "does this run hit npm?", shared by the startup
+ * notification, the interactive update prompt, and `--version`. A failed fetch
+ * is cached as `null` too, so an offline machine does not retry the registry on
+ * every invocation.
+ *
+ * @param options - Fetch timeout/retries. Used only on a cache miss.
+ */
+export async function getLatestVersionCached(
+  options: FetchVersionOptions = {}
+): Promise<string | null> {
+  const cache = readCache();
+  if (cache && isCacheValid(cache)) {
+    return cache.latestVersion;
+  }
+
+  const latestVersion = await fetchLatestVersion(options);
+  // Cache even a null result, so a failed check does not repeat on every run.
+  writeCache(latestVersion);
+  return latestVersion;
+}
+
+/**
+ * Is `latestVersion` a real upgrade over `currentVersion`? Null-safe, so a
+ * caller can pass the result of a check that did not complete.
+ */
+export function isUpgrade(latestVersion: string | null, currentVersion: string): boolean {
+  if (!latestVersion) return false;
+  return compareVersions(latestVersion, currentVersion) > 0;
+}
+
+/**
+ * The one-line "Update available" notice, as a string.
+ *
+ * Returned rather than printed so `--version` can put it on stdout beside the
+ * version it describes, while startup keeps it on stderr with the rest of the
+ * launcher chatter.
+ */
+export function formatUpdateNotice(
+  currentVersion: string,
+  latestVersion: string,
+  options: { hint?: boolean } = {}
+): string {
+  const { hint = true } = options;
+  // Resolved here, not at module load: theme detection runs at CLI startup,
+  // after this module is imported.
+  const { RESET, BOLD, GREEN, CYAN, DIM } = cliAnsi();
+  // Suppressed when the caller is about to ask "Update now?" \u2014 telling the user
+  // to run a command we are one keystroke from running is noise.
+  const runHint = hint ? `   ${DIM}Run:${RESET} ${BOLD}${CYAN}claudish update${RESET}` : "";
+  return `  ${CYAN}\u250c${RESET} ${BOLD}Update available:${RESET} ${currentVersion} ${DIM}\u2192${RESET} ${GREEN}${latestVersion}${RESET}${runHint}`;
+}
+
+/**
  * Check for updates and show notification
  *
  * Uses a cache to avoid checking npm on every run (once per 24 hours).
- * This is notification-only — does not auto-update or prompt.
+ * This is notification-only — it does not auto-update or prompt. The interactive
+ * launcher calls `checkForUpdatesInteractive` (update-prompt.ts) instead, which
+ * offers to run the update; this stays for non-prompting callers.
  *
  * @param currentVersion - Current installed version
  * @param options - Configuration options
@@ -211,40 +268,16 @@ export async function checkForUpdates(
 ): Promise<void> {
   const { quiet = false } = options;
 
-  let latestVersion: string | null = null;
-
-  // Check cache first
-  const cache = readCache();
-  if (cache && isCacheValid(cache)) {
-    // Use cached version
-    latestVersion = cache.latestVersion;
-  } else {
-    // Cache is stale or doesn't exist - fetch from npm
-    latestVersion = await fetchLatestVersion();
-    // Update cache (even if null - to avoid repeated failed requests)
-    writeCache(latestVersion);
-  }
-
-  if (!latestVersion) {
-    // Couldn't fetch - silently continue
-    return;
-  }
-
-  // Compare versions
-  if (compareVersions(latestVersion, currentVersion) <= 0) {
-    // Already up to date
+  const latestVersion = await getLatestVersionCached();
+  if (!latestVersion || !isUpgrade(latestVersion, currentVersion)) {
+    // Up to date, or the check could not complete — either way, stay silent.
     return;
   }
 
   // New version available — show single-line notification
   if (!quiet) {
-    // Resolved here, not at module load: theme detection runs at CLI startup,
-    // after this module is imported.
-    const { RESET, BOLD, GREEN, CYAN, DIM } = cliAnsi();
     console.error("");
-    console.error(
-      `  ${CYAN}\u250c${RESET} ${BOLD}Update available:${RESET} ${currentVersion} ${DIM}\u2192${RESET} ${GREEN}${latestVersion}${RESET}   ${DIM}Run:${RESET} ${BOLD}${CYAN}claudish update${RESET}`
-    );
+    console.error(formatUpdateNotice(currentVersion, latestVersion));
     console.error("");
   }
 }

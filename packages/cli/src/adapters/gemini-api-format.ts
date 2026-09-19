@@ -13,6 +13,7 @@
  * Used with GeminiProviderTransport (direct API) and AntigravityProviderTransport (OAuth).
  */
 
+import { mapToolChoiceToGemini } from "../handlers/shared/format/openai-tools.js";
 import { convertToolsToGemini } from "../handlers/shared/gemini-schema.js";
 import { filterIdentity } from "../handlers/shared/openai-compat.js";
 import { log } from "../logger.js";
@@ -213,6 +214,18 @@ export class GeminiAPIFormat extends BaseAPIFormat {
     // Tools — convertTools returns Gemini format [{functionDeclarations: [...]}] or []
     if (tools && tools.length > 0) {
       payload.tools = tools;
+
+      // `toolConfig` is Gemini's `tool_choice`, and this format had none at all
+      // — every forced-tool turn ran as if the caller had said `auto`. Gated on
+      // there being tools: a functionCallingConfig with nothing to call is a
+      // request-level 400.
+      const toolConfig = mapToolChoiceToGemini(claudeRequest.tool_choice);
+      if (toolConfig) {
+        payload.toolConfig = toolConfig;
+        log(
+          `[GeminiAPIFormat] toolConfig.mode -> ${toolConfig.functionCallingConfig.mode} for ${this.modelId}`
+        );
+      }
     }
 
     // Thinking/reasoning configuration.

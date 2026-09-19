@@ -6,6 +6,7 @@
  * - OpenAI-compatible payload with stream_options and tool_choice
  */
 
+import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { log } from "../logger.js";
 import { DefaultAPIFormat } from "./base-api-format.js";
 
@@ -109,15 +110,12 @@ export class LiteLLMAPIFormat extends DefaultAPIFormat {
       payload.tools = tools;
     }
 
-    // Handle tool choice
-    if (claudeRequest.tool_choice) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
-      }
+    const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+    if (toolChoice !== undefined) {
+      payload.tool_choice = toolChoice;
     }
+
+    this.applyOpenAISamplingParams(payload, claudeRequest);
 
     return payload;
   }

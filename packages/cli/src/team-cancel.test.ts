@@ -10,6 +10,7 @@ import {
   setupSession,
   startModels,
   teamSlotIdleSeconds,
+  teamSlotLiveBytes,
 } from "./team-orchestrator.js";
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -94,6 +95,24 @@ afterEach(async () => {
 });
 
 describe("team run cancellation", () => {
+  it("reports live bytes for a zero-output slot and removes them on settle", async () => {
+    const sessionPath = makeSession("live-bytes-", ["slow-model"]);
+    const handle = await startSlowTeam(sessionPath);
+    const slotId = handle.slots["slow-model"];
+
+    const liveBytes = teamSlotLiveBytes(handle.teamSessionId);
+    expect(liveBytes).not.toBeNull();
+    expect(liveBytes).toHaveProperty(slotId, 0);
+    expect(typeof liveBytes?.[slotId]).toBe("number");
+    expect(Object.keys(liveBytes ?? {})).toEqual(
+      Object.keys(teamSlotIdleSeconds(handle.teamSessionId) ?? {})
+    );
+
+    await cancelTeamRun(handle.teamSessionId);
+    await handle.done;
+    expect(teamSlotLiveBytes(handle.teamSessionId)).toBeNull();
+  });
+
   it("returns a live handle before children finish and removes liveness on settle", async () => {
     const sessionPath = makeSession("live-", ["slow-model"]);
     const handle = await startSlowTeam(sessionPath);

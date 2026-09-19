@@ -29,6 +29,22 @@ export interface ModelPricing {
   inputCostPer1M: number;
   /** Cost per 1M output tokens in USD */
   outputCostPer1M: number;
+  /**
+   * Cost per 1M tokens READ from the provider's prompt cache, in USD.
+   *
+   * OPTIONAL, and its absence is a RULE, not a missing number: absent means
+   * "this provider bills a cache read as ordinary input", which is the only
+   * reading that cannot understate spend. It is deliberately NOT defaulted to
+   * the industry-typical 0.1x of `inputCostPer1M` — that would be a hardcoded
+   * price, and CLAUDE.md's "a default is a rule, never a pinned id" forbids it.
+   *
+   * NOTHING SUPPLIES THIS TODAY. `getModelPricing` never sets it and the
+   * pricing cache has no repopulator for it, so every cache discount computed
+   * from it is exactly zero and no existing session's cost changes by a cent.
+   * It exists so that the arithmetic in `token-tracker.ts` is already correct
+   * on the day a pricing source starts publishing the rate.
+   */
+  cacheReadCostPer1M?: number;
   /** Whether this pricing is an estimate (not from official sources) */
   isEstimate?: boolean;
   /**

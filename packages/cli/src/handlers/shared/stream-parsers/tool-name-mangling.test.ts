@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
+import { encodeToolName, newToolNameBindings } from "../../../adapters/tool-name-utils.js";
 import { createStreamingResponseHandler } from "./openai-sse.js";
 
 const ctx: any = {
@@ -152,5 +153,164 @@ describe("openai-sse tool-name recovery", () => {
     ]);
     expect(unadvertised.toolUses).toEqual([]);
     expect(unadvertised.observed).toEqual([]);
+  });
+});
+
+// ─── Item 7: decoding the encoded name back ─────────────────────────────────
+//
+// These frames are CONSTRUCTED, as every frame in this file always has been:
+// the decode paths below cannot be reached from any capture in the tree (no
+// capture carries a >64-char tool name, and none splits `function.name` across
+// chunks). Nothing here is a `.sse` fixture, and no capture was invented.
+
+/** A real 65-char MCP name, and what the codec sends in its place. */
+const ORIGINAL = "mcp__plugin_browser-use_browser-use__retry_with_browser_use_agent";
+const ENCODED = encodeToolName(ORIGINAL, 64, newToolNameBindings());
+
+const longNameAdapter = {
+  getToolNameMap: () => new Map([[ENCODED, ORIGINAL]]),
+  processTextContent: (text: string) => ({
+    cleanedText: text,
+    extractedToolCalls: [],
+    wasTransformed: false,
+  }),
+};
+
+const longNameSchemas = [
+  {
+    name: ORIGINAL,
+    input_schema: {
+      type: "object",
+      properties: { task: { type: "string" } },
+      required: ["task"],
+    },
+  },
+];
+
+async function parseWithLongName(frames: string[]) {
+  const observed: string[] = [];
+  const response = createStreamingResponseHandler(
+    ctx,
+    sseResponse(frames),
+    longNameAdapter,
+    "test-model",
+    null,
+    undefined,
+    longNameSchemas,
+    longNameAdapter.getToolNameMap(),
+    undefined,
+    { onToolCallObserved: (name) => observed.push(name) }
+  );
+  const wire = await response.text();
+  return { observed, toolUses: toolUseStarts(wire), argumentJson: inputJson(wire) };
+}
+
+/** The `input_json_delta` payload, concatenated — where a tool's arguments land. */
+function inputJson(wire: string): string {
+  let json = "";
+  for (const frame of wire.split("\n\n")) {
+    const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+    if (!dataLine || dataLine === "data: [DONE]") continue;
+    try {
+      const data = JSON.parse(dataLine.slice(6));
+      if (data.type === "content_block_delta" && data.delta?.type === "input_json_delta") {
+        json += data.delta.partial_json ?? "";
+      }
+    } catch {}
+  }
+  return json;
+}
+
+describe("openai-sse: the 64-char tool-name codec, decoded", () => {
+  it("decodes a name the model returned whole", async () => {
+    const result = await parseWithLongName([
+      dataFrame({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_0",
+                  type: "function",
+                  function: { name: ENCODED, arguments: '{"task":"x"}' },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+      finishFrame("tool_calls"),
+      "data: [DONE]\n\n",
+    ]);
+
+    expect(result.toolUses).toHaveLength(1);
+    expect(result.toolUses[0].name).toBe(ORIGINAL);
+    expect(result.observed).toEqual([ORIGINAL]);
+  });
+
+  it("decodes a name that arrived in FRAGMENTS across chunks", async () => {
+    // The defect: the tool is created from the first fragment, and a prefix of
+    // an encoded name decodes to nothing — so the call is dropped with no error
+    // anywhere. Decoding must happen against the ACCUMULATED name, and the tool
+    // created early must be revised when the rest arrives.
+    const head = ENCODED.slice(0, 7);
+    const mid = ENCODED.slice(7, 40);
+    const tail = ENCODED.slice(40);
+
+    const result = await parseWithLongName([
+      dataFrame({
+        choices: [
+          {
+            delta: {
+              tool_calls: [{ index: 0, id: "call_0", type: "function", function: { name: head } }],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+      dataFrame({
+        choices: [
+          { delta: { tool_calls: [{ index: 0, function: { name: mid } }] }, finish_reason: null },
+        ],
+      }),
+      dataFrame({
+        choices: [
+          { delta: { tool_calls: [{ index: 0, function: { name: tail } }] }, finish_reason: null },
+        ],
+      }),
+      dataFrame({
+        choices: [
+          {
+            delta: { tool_calls: [{ index: 0, function: { arguments: '{"task":"x"}' } }] },
+            finish_reason: null,
+          },
+        ],
+      }),
+      finishFrame("tool_calls"),
+      "data: [DONE]\n\n",
+    ]);
+
+    expect(result.toolUses).toHaveLength(1);
+    expect(result.toolUses[0].name).toBe(ORIGINAL);
+    // The arguments that arrived after the name survived the revision.
+    expect(result.argumentJson).toBe('{"task":"x"}');
+    expect(result.observed).toEqual([ORIGINAL]);
+  });
+
+  it("decodes a call RECOVERED from prose", async () => {
+    // The model writes the name it was given — the encoded one — while the
+    // recovery allowlist is built from the client's originals. Undecoded, the
+    // allowlist drops it and nothing says so.
+    const result = await parseWithLongName([
+      textFrame(`<function=${ENCODED}><parameter=task>x`),
+      finishFrame("stop"),
+      "data: [DONE]\n\n",
+    ]);
+
+    expect(result.toolUses).toHaveLength(1);
+    expect(result.toolUses[0].name).toBe(ORIGINAL);
+    expect(result.observed).toEqual([ORIGINAL]);
   });
 });

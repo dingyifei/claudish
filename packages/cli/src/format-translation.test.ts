@@ -194,6 +194,58 @@ function createMockContext(): any {
 
 // ─── OpenAI SSE Parser Tests ────────────────────────────────────────────────
 
+describe("describeInStreamError", () => {
+  async function getFormatter() {
+    const mod = await import("./handlers/shared/stream-parsers/openai-sse.js");
+    return mod.describeInStreamError;
+  }
+
+  test("describes the production OpenRouter refusal with provider, code, type, and message", async () => {
+    const describeInStreamError = await getFormatter();
+    const productionFrame = {
+      id: "gen-1789563247-…",
+      object: "chat.completion.chunk",
+      created: 1789563247,
+      model: "unknown",
+      provider: "Google AI Studio",
+      choices: [],
+      error: {
+        code: 400,
+        message: "SYNTHETIC upstream message (real text unknown)",
+        metadata: {
+          error_type: "invalid_request",
+          provider_code: "400",
+        },
+      },
+    };
+
+    expect(describeInStreamError(productionFrame)).toBe(
+      "[Google AI Studio] 400 invalid_request SYNTHETIC upstream message (real text unknown)"
+    );
+  });
+
+  test("returns undefined for a normal content frame", async () => {
+    const describeInStreamError = await getFormatter();
+
+    expect(
+      describeInStreamError({
+        choices: [{ index: 0, delta: { content: "healthy content" }, finish_reason: null }],
+      })
+    ).toBeUndefined();
+  });
+
+  test("handles bare-string and message-only errors", async () => {
+    const describeInStreamError = await getFormatter();
+
+    expect(describeInStreamError({ error: "gateway refused the request" })).toBe(
+      "gateway refused the request"
+    );
+    expect(describeInStreamError({ error: { message: "signature missing" } })).toBe(
+      "signature missing"
+    );
+  });
+});
+
 describe("OpenAI SSE → Claude SSE (createStreamingResponseHandler)", () => {
   // Dynamic import to avoid circular dependency issues at module level
   async function getParser() {
@@ -270,6 +322,83 @@ describe("OpenAI SSE → Claude SSE (createStreamingResponseHandler)", () => {
 
     // Should end with tool_use
     expect(extractStopReason(events)).toBe("tool_use");
+  });
+
+  test("REGRESSION: an OpenRouter error frame with empty choices emits error and no message_stop", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const fixture = fixtureToResponse(
+      join(FIXTURES_DIR, "regression-openrouter-google-ai-studio-empty-choices-error.sse")
+    );
+
+    const response = createStreamingResponseHandler(
+      createMockContext(),
+      fixture,
+      adapter,
+      "test-model",
+      null,
+      undefined,
+      undefined
+    );
+    const events = await parseClaudeSseStream(response);
+    const errorEvent = events.find((event) => event.event === "error");
+
+    expect(errorEvent?.data?.type).toBe("error");
+    expect(errorEvent?.data?.error?.type).toBe("api_error");
+    expect(errorEvent?.data?.error?.message).toBe(
+      "[Google AI Studio] 400 invalid_request SYNTHETIC upstream message (real text unknown)"
+    );
+    expect(events.some((event) => event.data?.type === "message_stop")).toBe(false);
+  });
+
+  test("REGRESSION: content before an in-stream error is preserved and followed by error", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const fixture = fixtureToResponse(
+      join(FIXTURES_DIR, "regression-openrouter-google-ai-studio-content-then-error.sse")
+    );
+
+    const response = createStreamingResponseHandler(
+      createMockContext(),
+      fixture,
+      adapter,
+      "test-model",
+      null,
+      undefined,
+      undefined
+    );
+    const events = await parseClaudeSseStream(response);
+    const textEventIndex = events.findIndex(
+      (event) =>
+        event.data?.type === "content_block_delta" && event.data?.delta?.type === "text_delta"
+    );
+    const errorEventIndex = events.findIndex((event) => event.event === "error");
+
+    expect(extractText(events)).toBe("Earlier content survives.");
+    expect(textEventIndex).toBeGreaterThan(-1);
+    expect(errorEventIndex).toBeGreaterThan(textEventIndex);
+    expect(events.some((event) => event.data?.type === "message_stop")).toBe(false);
+  });
+
+  test("CONTROL: a healthy stream still emits message_delta and message_stop without error", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "SEED-openai-text-only.sse"));
+
+    const response = createStreamingResponseHandler(
+      createMockContext(),
+      fixture,
+      adapter,
+      "test-model",
+      null,
+      undefined,
+      undefined
+    );
+    const events = await parseClaudeSseStream(response);
+
+    expect(events.some((event) => event.event === "error")).toBe(false);
+    expect(events.some((event) => event.data?.type === "message_delta")).toBe(true);
+    expect(events.some((event) => event.data?.type === "message_stop")).toBe(true);
   });
 });
 
@@ -601,6 +730,15 @@ describe("Adapter: convertMessagesToOpenAI", () => {
     const convert = await getConverter();
     const req = {
       messages: [
+        // The assistant turn that made the call. It was absent when this test
+        // was written; item 13 made the sequence matter, because a `tool`
+        // message that answers no open round is a 400 on the real wire.
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "call_123", name: "Read", input: { file_path: "/tmp/a" } },
+          ],
+        },
         {
           role: "user",
           content: [
@@ -611,10 +749,10 @@ describe("Adapter: convertMessagesToOpenAI", () => {
     };
 
     const messages = convert(req, "test-model");
-    expect(messages).toHaveLength(1);
-    expect(messages[0].role).toBe("tool");
-    expect(messages[0].tool_call_id).toBe("call_123");
-    expect(messages[0].content).toBe("file contents here");
+    expect(messages).toHaveLength(2);
+    expect(messages[1].role).toBe("tool");
+    expect(messages[1].tool_call_id).toBe("call_123");
+    expect(messages[1].content).toBe("file contents here");
   });
 
   test("Kimi K2.5: empty thinking block still produces reasoning_content field", async () => {
@@ -696,6 +834,263 @@ describe("Adapter: convertMessagesToOpenAI", () => {
     const messages = convert(req, "test-model");
     expect(messages).toHaveLength(1);
     expect(Object.prototype.hasOwnProperty.call(messages[0], "reasoning_content")).toBe(false);
+  });
+});
+
+// ─── Item 13: message-sequence normalization ────────────────────────────────
+//
+// These inputs are CONSTRUCTED Anthropic request bodies, not captures. No real
+// inbound body exists anywhere under test-fixtures/ (the one file under
+// transcripts/ is a tool-id ledger, and .sse captures are response-side), so
+// there is nothing to replay here. They are written in the same inline style as
+// the sibling `convertMessagesToOpenAI` tests above, and they assert only the
+// conversion contract — never a provider's wire behaviour.
+describe("Adapter: normalizeMessageSequence (item 13)", () => {
+  async function getConverter() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.convertMessagesToOpenAI;
+  }
+
+  test("adjacent user messages merge into one", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "user", content: "first" },
+          { role: "user", content: "second" },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].role).toBe("user");
+    expect(messages[0].content).toBe("first\n\nsecond");
+  });
+
+  test("a string user turn and a block-array user turn merge into content parts", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "user", content: "first" },
+          { role: "user", content: [{ type: "text", text: "second" }] },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toEqual([
+      { type: "text", text: "first" },
+      { type: "text", text: "second" },
+    ]);
+  });
+
+  test("a user turn after a tool round is NOT merged across the tool message", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "user", content: "read it" },
+          { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "Read", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "ok" }] },
+          { role: "user", content: "now what?" },
+        ],
+      },
+      "test-model"
+    );
+
+    // user, assistant(tool_calls), tool, user — and no synthetic assistant turn
+    // between the tool output and the following user turn (design ruling; FCC
+    // inserts `assistant: " "` there).
+    expect(messages.map((m: any) => m.role)).toEqual(["user", "assistant", "tool", "user"]);
+    expect(messages[3].content).toBe("now what?");
+  });
+
+  test("a tool result answering no open round degrades to a user message", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "c9", content: "ok" }] },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].role).toBe("user");
+    expect(messages[0].content).toBe("[Tool Result]: ok");
+  });
+
+  test("a degraded tool result merges into the user turn before it", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "c9", content: "ok" }] },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].role).toBe("user");
+    expect(messages[0].content).toBe("hello\n\n[Tool Result]: ok");
+  });
+});
+
+// ─── Item 14: tool-round alignment ──────────────────────────────────────────
+//
+// Same provenance note as item 13 above: constructed request bodies, no capture
+// exists, none invented.
+describe("Adapter: tool round alignment (item 14)", () => {
+  async function getConverter() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.convertMessagesToOpenAI;
+  }
+
+  const parallelCalls = {
+    role: "assistant",
+    content: [
+      { type: "tool_use", id: "c1", name: "Read", input: {} },
+      { type: "tool_use", id: "c2", name: "Grep", input: {} },
+      { type: "tool_use", id: "c3", name: "Glob", input: {} },
+    ],
+  };
+
+  test("results are emitted in the order their calls were made", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          parallelCalls,
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "c3", content: "third" },
+              { type: "tool_result", tool_use_id: "c1", content: "first" },
+              { type: "tool_result", tool_use_id: "c2", content: "second" },
+            ],
+          },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages.map((m: any) => m.tool_call_id)).toEqual([undefined, "c1", "c2", "c3"]);
+    expect(messages.map((m: any) => m.content)).toEqual([null, "first", "second", "third"]);
+  });
+
+  test("a call with no result gets a tool message naming the omission", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          parallelCalls,
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "c1", content: "first" },
+              { type: "tool_result", tool_use_id: "c3", content: "third" },
+            ],
+          },
+        ],
+      },
+      "test-model"
+    );
+
+    // Every call is answered — OpenAI rejects an assistant tool_calls message
+    // that is not, and the answer for c2 says so rather than inventing output.
+    expect(messages.map((m: any) => m.tool_call_id)).toEqual([undefined, "c1", "c2", "c3"]);
+    expect(messages[2].role).toBe("tool");
+    expect(messages[2].content).toContain("No tool result was provided");
+    expect(messages[2].content).toContain("Grep");
+  });
+
+  test("a round with no results at all is fully answered", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [parallelCalls, { role: "user", content: "stop, do something else" }],
+      },
+      "test-model"
+    );
+
+    expect(messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "tool", "tool", "user"]);
+    expect(messages.map((m: any) => m.tool_call_id)).toEqual([
+      undefined,
+      "c1",
+      "c2",
+      "c3",
+      undefined,
+    ]);
+    expect(messages[4].content).toBe("stop, do something else");
+  });
+
+  test("a trailing round with no results is left alone, not answered synthetically", async () => {
+    const convert = await getConverter();
+    const messages = convert({ messages: [parallelCalls] }, "test-model");
+
+    // The request stops on the assistant's own tool calls — a continuation, not
+    // a history gap. Synthetic "no result" messages here would tell the model
+    // its calls had failed.
+    expect(messages).toHaveLength(1);
+    expect(messages[0].tool_calls).toHaveLength(3);
+  });
+
+  test("a result matching no call in this round is dropped", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "Read", input: {} }] },
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "c1", content: "first" },
+              { type: "tool_result", tool_use_id: "stale_from_an_earlier_turn", content: "x" },
+            ],
+          },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages.map((m: any) => m.tool_call_id)).toEqual([undefined, "c1"]);
+  });
+
+  test("images lifted out of a tool result still follow the tool message", async () => {
+    const convert = await getConverter();
+    const messages = convert(
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "Bash", input: {} }] },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "c1",
+                content: [
+                  { type: "text", text: "screenshot taken" },
+                  {
+                    type: "image",
+                    source: { type: "base64", media_type: "image/png", data: "QUJD" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      "test-model"
+    );
+
+    expect(messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "user"]);
+    expect(messages[2].content[0].type).toBe("image_url");
   });
 });
 
@@ -1436,6 +1831,98 @@ describe("Regression: OpenAI/Codex images in tool_result", () => {
           m.content.some((p: any) => p.type === "image_url")
       )
     ).toBe(false);
+  });
+
+  // ─── The marker is decided per RESULT ─────────────────────────────────────
+  //
+  // Constructed Anthropic request bodies, in the same style as the tests above.
+  // These are request-side, and `test-fixtures/sse-responses/` holds response
+  // streams, so no capture can reach this converter. No fixture was invented.
+
+  /** Two tool_results in ONE Claude user turn — the shape the bug needs. */
+  function twoResults(secondImageSource: any) {
+    return {
+      model: "gpt-5.6-sol",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_a", name: "Read", input: {} },
+            { type: "tool_use", id: "toolu_b", name: "Read", input: {} },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_a",
+              content: [
+                {
+                  type: "image",
+                  source: { type: "base64", media_type: "image/png", data: TINY_PNG_B64 },
+                },
+              ],
+            },
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_b",
+              content: [{ type: "image", source: secondImageSource }],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  test("a result whose image could NOT be forwarded names the omission, not tool A's image", async () => {
+    // `toolResultImages` accumulates across the whole turn, because every lifted
+    // image leaves in one following user message. Testing its length to choose
+    // THIS result's marker answered a question about an EARLIER result: result B
+    // said "see following message" and pointed at result A's screenshot, and the
+    // model read the wrong image as B's output with no error anywhere.
+    const convertMessagesToOpenAI = await getConverter();
+    const messages = convertMessagesToOpenAI(
+      // A url source carrying no url: unusable, so `imageBlockToUrlPart`
+      // returns null and nothing is forwarded for B.
+      twoResults({ type: "url" }),
+      "gpt-5.6-sol"
+    );
+
+    const toolMsgs = messages.filter((m: any) => m.role === "tool");
+    expect(toolMsgs.map((m: any) => m.tool_call_id)).toEqual(["toolu_a", "toolu_b"]);
+    expect(toolMsgs[0].content).toBe("[image returned; see following message]");
+    expect(toolMsgs[1].content).toBe("[image returned, but its source could not be forwarded]");
+
+    // Exactly ONE image really is forwarded — A's.
+    const imageParts = messages
+      .filter((m: any) => m.role === "user" && Array.isArray(m.content))
+      .flatMap((m: any) => m.content.filter((p: any) => p.type === "image_url"));
+    expect(imageParts.length).toBe(1);
+    expect(imageParts[0].image_url.url).toBe(`data:image/png;base64,${TINY_PNG_B64}`);
+  });
+
+  test("when BOTH images are forwardable, both results point at the following message", async () => {
+    // The non-regression half: the per-result counter must not withhold the
+    // pointer from a result whose own image did travel.
+    const convertMessagesToOpenAI = await getConverter();
+    const messages = convertMessagesToOpenAI(
+      twoResults({ type: "url", url: "https://example.invalid/b.png" }),
+      "gpt-5.6-sol"
+    );
+
+    const toolMsgs = messages.filter((m: any) => m.role === "tool");
+    expect(toolMsgs[0].content).toBe("[image returned; see following message]");
+    expect(toolMsgs[1].content).toBe("[image returned; see following message]");
+
+    const urls = messages
+      .filter((m: any) => m.role === "user" && Array.isArray(m.content))
+      .flatMap((m: any) => m.content.filter((p: any) => p.type === "image_url"))
+      .map((p: any) => p.image_url.url);
+    expect(urls).toEqual([
+      `data:image/png;base64,${TINY_PNG_B64}`,
+      "https://example.invalid/b.png",
+    ]);
   });
 });
 
@@ -2707,5 +3194,134 @@ describe("Regression: finalize teardown survives callback failures", () => {
     expect(result.intervalsStillActive).toBe(0);
     expect(callbackCalls).toBe(1);
     expect(result.events?.filter((event) => event.data?.type === "message_stop")).toHaveLength(1);
+  });
+});
+
+// ─── Item 1 — an empty-string required argument is PRESENT ──────────────────
+
+/**
+ * Regression from a LIVE `gk@grok-4.6` run, captured 2026-09-16.
+ *
+ * The model was asked to delete a line and emitted exactly the right call:
+ *
+ *   Edit{"file_path":"…/sample.ts","old_string":"const dead = 1;\n","new_string":""}
+ *
+ * `finish_reason: "tool_calls"`, nothing truncated, the JSON complete. An empty
+ * `new_string` IS the deletion — it is the whole point of the call. claudish's
+ * presence filter tested `parsedArgs[param] === ""`, declared `new_string`
+ * missing, suppressed the tool call and emitted
+ * `⚠️ Tool call "Edit" failed: missing required parameters: new_string`
+ * instead. The file was left unchanged and the model was told its own correct
+ * call was malformed.
+ *
+ * The fixture is that response, verbatim. The capture logged two concurrent
+ * upstream requests into one file, so its events were separated by response id;
+ * nothing else was changed.
+ */
+describe("OpenAI SSE: a required argument whose value is an empty string is present", () => {
+  async function getParser() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.createStreamingResponseHandler;
+  }
+
+  async function getDefaultAdapter() {
+    const mod = await import("./adapters/base-api-format.js");
+    return new mod.DefaultAPIFormat("test-model");
+  }
+
+  /** Claude Code's own Edit schema: all three of these are required. */
+  const EDIT_SCHEMA = [
+    {
+      name: "Edit",
+      input_schema: {
+        type: "object",
+        properties: {
+          file_path: { type: "string" },
+          old_string: { type: "string" },
+          new_string: { type: "string" },
+          replace_all: { type: "boolean" },
+        },
+        required: ["file_path", "old_string", "new_string"],
+      },
+    },
+  ];
+
+  const CAPTURE = "grok-4.6-openai-edit-empty-new-string.sse";
+
+  async function replayEditCapture(toolSchemas: any[] = EDIT_SCHEMA): Promise<ClaudeEvent[]> {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const response = createStreamingResponseHandler(
+      createMockContext(),
+      fixtureToResponse(join(FIXTURES_DIR, CAPTURE)),
+      adapter,
+      "grok-4.6",
+      null,
+      undefined,
+      toolSchemas
+    );
+    return parseClaudeSseStream(response);
+  }
+
+  /** The complete input JSON of the first tool_use block, as the client sees it. */
+  function toolInput(events: ClaudeEvent[]): Record<string, unknown> {
+    const start = events.find(
+      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "tool_use"
+    );
+    expect(start).toBeDefined();
+    const index = start?.data.index;
+    const json = events
+      .filter(
+        (e) =>
+          e.data?.type === "content_block_delta" &&
+          e.data?.index === index &&
+          e.data?.delta?.type === "input_json_delta"
+      )
+      .map((e) => e.data.delta.partial_json)
+      .join("");
+    return JSON.parse(json);
+  }
+
+  test('the Edit call reaches the client with new_string preserved as ""', async () => {
+    const events = await replayEditCapture();
+
+    expect(extractToolNames(events)).toContain("Edit");
+
+    const input = toolInput(events);
+    expect(Object.hasOwn(input, "new_string")).toBe(true);
+    expect(input.new_string).toBe("");
+    expect(input.old_string).toBe("const dead = 1;\n");
+    expect(input.file_path).toMatch(/sample\.ts$/);
+  });
+
+  test("no missing-parameter warning is emitted for it", async () => {
+    const text = extractText(await replayEditCapture());
+    expect(text).not.toContain("missing required parameters");
+    expect(text).not.toContain('Tool call "Edit" failed');
+  });
+
+  test("the turn still ends as a tool call", async () => {
+    expect(extractStopReason(await replayEditCapture())).toBe("tool_use");
+  });
+
+  test("a genuinely absent required argument still fails visibly", async () => {
+    // The same capture, validated against a schema declaring a parameter the
+    // model never sent. The warning block is NOT weakened by item 1 — absence
+    // and emptiness are now different things, and this is the absence half.
+    const events = await replayEditCapture([
+      {
+        name: "Edit",
+        input_schema: {
+          type: "object",
+          properties: EDIT_SCHEMA[0].input_schema.properties,
+          required: [...EDIT_SCHEMA[0].input_schema.required, "never_sent"],
+        },
+      },
+    ]);
+
+    expect(extractText(events)).toContain(
+      'Tool call "Edit" failed: missing required parameters: never_sent'
+    );
+    expect(extractToolNames(events)).not.toContain("Edit");
   });
 });

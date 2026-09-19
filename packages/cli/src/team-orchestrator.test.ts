@@ -105,6 +105,36 @@ afterEach(() => {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe("team-orchestrator", () => {
+  describe("snippetHeadAndTail", () => {
+    it("returns short text unchanged without an elision marker", async () => {
+      const { snippetHeadAndTail } = await getOrchestrator();
+      const text = "Short diagnostic output\nwith its original line breaks.";
+
+      expect(snippetHeadAndTail(text)).toBe(text);
+      expect(snippetHeadAndTail(text)).not.toContain("bytes omitted");
+    });
+
+    it("keeps the first 600 and last 1400 bytes and reports the omitted count", async () => {
+      const { snippetHeadAndTail } = await getOrchestrator();
+      const head = "H".repeat(600);
+      const omitted = "M".repeat(37);
+      const tail = "T".repeat(1400);
+
+      expect(snippetHeadAndTail(`${head}${omitted}${tail}`)).toBe(
+        `${head}\n\n… [37 bytes omitted] …\n\n${tail}`
+      );
+    });
+
+    it("preserves a bolded FAIL verdict near-miss from the head of a long response", async () => {
+      const { snippetHeadAndTail } = await getOrchestrator();
+      const verdict = "**Verdict**: **FAIL**";
+      const response = `${verdict}\n${"Detailed analysis without a matching verdict. ".repeat(80)}Unrelated tail prose.`;
+
+      expect(response.match(/\*\*Verdict\*\*: (PASS|CONDITIONAL|FAIL)/)).toBeNull();
+      expect(snippetHeadAndTail(response)).toContain(verdict);
+      expect(snippetHeadAndTail(response)).toContain("Unrelated tail prose.");
+    });
+  });
   // ── FR3 / FR5: Directory structure ────────────────────────────────────────
 
   describe("setupSession — directory structure", () => {

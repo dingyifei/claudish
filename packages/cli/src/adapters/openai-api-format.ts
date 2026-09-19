@@ -11,6 +11,7 @@
  * Also serves as Layer 2 ModelDialect for OpenAI-native models (o1/o3 reasoning params).
  */
 
+import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { log } from "../logger.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 import { type AdapterResult, BaseAPIFormat, type EffortLevel } from "./base-api-format.js";
@@ -39,15 +40,9 @@ export class OpenAIAPIFormat extends BaseAPIFormat {
     return 128;
   }
 
-  /** Tool name truncation — a wire-agnostic API constraint. */
-  protected override prepareRequestCommon(request: any, _originalRequest: any): any {
-    this.truncateToolNames(request);
-    if (request.messages) {
-      this.truncateToolNamesInMessages(request.messages);
-    }
-
-    return request;
-  }
+  // Tool-name encoding used to live here, and here ONLY, which is why no other
+  // OpenAI-shaped adapter did it. It is now in `prepareRequest`'s template, so
+  // this hook has nothing left to do.
 
   /**
    * OpenAI's own reasoning knob. Not called on the Anthropic wire.
@@ -329,13 +324,9 @@ export class OpenAIAPIFormat extends BaseAPIFormat {
       payload.tools = tools;
     }
 
-    if (claudeRequest.tool_choice) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
-      }
+    const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+    if (toolChoice !== undefined) {
+      payload.tool_choice = toolChoice;
     }
 
     // Map Claude Code's effort (output_config.effort, or legacy
@@ -348,6 +339,8 @@ export class OpenAIAPIFormat extends BaseAPIFormat {
         log(`[OpenAIAPIFormat] reasoning_effort -> ${effort} for ${this.modelId}`);
       }
     }
+
+    this.applyOpenAISamplingParams(payload, claudeRequest);
 
     return payload;
   }

@@ -3,6 +3,8 @@
  * All proxy error responses MUST use this format.
  */
 
+import { isContextOverflowError } from "./request-shape.js";
+
 export type AnthropicErrorType =
   | "invalid_request_error"
   | "authentication_error"
@@ -217,6 +219,16 @@ export function isTerminalError(status: number, bodyText: string, terminal429: b
   if (status === 426) return true;
   // Billing/quota exhaustion surfaced as a 429 (provider-specific signals).
   if (status === 429 && terminal429) return true;
+  // A prompt larger than the model's context window is terminal BY ARITHMETIC:
+  // re-sending the identical request can only produce the identical rejection.
+  // Terminal here means the envelope is remapped to 400 and carries the rich
+  // surfaced message, which is the only path on which the client ever sees the
+  // `prompt is too long` phrase it pattern-matches — the plain pass-through
+  // forwards the provider's own wording, which no client recognises.
+  //
+  // It does NOT change the fallback chain: `fallback-handler` only widens on a
+  // recovered upstream 401/402/403/429, and an overflow is none of those.
+  if (isContextOverflowError(status, bodyText)) return true;
 
   const lower = (bodyText || "").toLowerCase();
 
@@ -272,11 +284,25 @@ export function buildSurfacedErrorMessage(opts: {
   status: number;
   hint: string;
   providerMessage: string;
+  /**
+   * A phrase the CLIENT pattern-matches, placed at the very front of the line.
+   *
+   * It LEADS for two independent reasons, and either alone would be enough.
+   * `sanitizeErrorMessage` caps the message at 600 characters, so a phrase
+   * appended after provider prose can be cut off — and a client matching a
+   * truncated phrase misses silently. And Claude Code's own message classifier
+   * tests `startsWith("prompt is too long")`, not a substring, so the position
+   * is itself load-bearing.
+   *
+   * Only `CONTEXT_OVERFLOW_PHRASE` uses this today. See `request-shape.ts`.
+   */
+  leadPhrase?: string;
 }): string {
-  const { providerDisplayName, status, hint, providerMessage } = opts;
+  const { providerDisplayName, status, hint, providerMessage, leadPhrase } = opts;
   const head = `${providerDisplayName} error (HTTP ${status})`;
   const parts: string[] = [head];
   if (hint) parts[0] = `${head}: ${hint}`;
+  if (leadPhrase && !parts[0].startsWith(leadPhrase)) parts[0] = `${leadPhrase} — ${parts[0]}`;
   const detail = (providerMessage || "").trim();
   if (detail && !parts[0].includes(detail)) {
     // Keep the surfaced line bounded — providers occasionally echo huge bodies.

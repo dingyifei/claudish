@@ -19,6 +19,7 @@ import {
 import { getLogLevel, log } from "../../../logger.js";
 import { wrapAnthropicError } from "../anthropic-error.js";
 import { messageStartUsage } from "./message-start-usage.js";
+import { formatRawSseLogPayload } from "./openai-sse.js";
 
 export function createResponsesStreamHandler(
   c: Context,
@@ -137,6 +138,15 @@ export function createResponsesStreamHandler(
   const openToolBlocks = new Set<FnCall>();
 
   const stream = new ReadableStream({
+    /*
+     * The SSE event dispatch below has been far over the complexity limit since
+     * this parser was written. The rule only started REPORTING a score once this
+     * fix removed enough nesting for biome to compute one — before that it bailed
+     * with "too complex to score", which downgrades to a warning. Splitting the
+     * dispatch means threading ~20 closure variables through a new function: a
+     * refactor in its own right, not a rider on a stream-truncation fix.
+     */
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing, see above
     start: async (controller) => {
       const send = (event: string, data: any) => {
         if (!isClosed) {
@@ -175,7 +185,9 @@ export function createResponsesStreamHandler(
           // failed stream) still has to emit what it accumulated. Withholding it
           // would turn "partial arguments" into "no arguments", which is strictly
           // worse — the non-buffered path would already have streamed the same
-          // fragments, and the stop_reason logic below handles malformed JSON.
+          // fragments. What the client then DOES with malformed JSON is decided
+          // by how the turn ends, not here: only an `error` event reliably stops
+          // Claude Code executing the fragment (see the catch block below).
           if (fnCall.buffered && fnCall.arguments) {
             send("content_block_delta", {
               type: "content_block_delta",
@@ -186,6 +198,32 @@ export function createResponsesStreamHandler(
           send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
         }
         openToolBlocks.clear();
+      };
+
+      /**
+       * The five-event tail both in-band error paths emit: a text block carrying
+       * the message, then a normal `end_turn`. Shared so the two callers cannot
+       * drift, and so `start` keeps a computable complexity score.
+       */
+      const endTurnWithText = (text: string) => {
+        const idx = curIdx++;
+        send("content_block_start", {
+          type: "content_block_start",
+          index: idx,
+          content_block: { type: "text", text: "" },
+        });
+        send("content_block_delta", {
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "text_delta", text },
+        });
+        send("content_block_stop", { type: "content_block_stop", index: idx });
+        send("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+        });
+        send("message_stop", { type: "message_stop" });
       };
 
       send("message_start", {
@@ -228,7 +266,7 @@ export function createResponsesStreamHandler(
             // Raw capture, greppable into test fixtures — same contract as
             // [SSE:openai] / [SSE:anthropic] in the sibling parsers.
             if (getLogLevel() === "debug") {
-              log(`[SSE:responses] ${data.substring(0, 300)}`);
+              log(`[SSE:responses] ${formatRawSseLogPayload(data)}`);
             }
 
             try {
@@ -446,25 +484,7 @@ export function createResponsesStreamHandler(
                     `or route the model via \`oai@${opts.modelName}\` to use the full-size window.`;
                 }
 
-                const errorIdx = curIdx++;
-                send("content_block_start", {
-                  type: "content_block_start",
-                  index: errorIdx,
-                  content_block: { type: "text", text: "" },
-                });
-                send("content_block_delta", {
-                  type: "content_block_delta",
-                  index: errorIdx,
-                  delta: { type: "text_delta", text: errorText },
-                });
-                send("content_block_stop", { type: "content_block_stop", index: errorIdx });
-
-                send("message_delta", {
-                  type: "message_delta",
-                  delta: { stop_reason: "end_turn", stop_sequence: null },
-                  usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-                });
-                send("message_stop", { type: "message_stop" });
+                endTurnWithText(errorText);
                 isClosed = true;
                 if (pingInterval) {
                   clearInterval(pingInterval);
@@ -493,7 +513,18 @@ export function createResponsesStreamHandler(
         // emits the partial function_call arguments it managed to produce, so
         // "tool_use" makes the client execute a tool with malformed JSON
         // (InputValidationError). Anthropic's contract for a cut-off turn is
-        // stop_reason "max_tokens" — the client then discards the partial block.
+        // stop_reason "max_tokens", which is the honest label here.
+        //
+        // KNOWN GAP: "max_tokens" does not actually stop Claude Code executing
+        // the partial block. Verified against 2.1.217 (passflow session,
+        // 2026-07-22, six days after v7.12.7 shipped this): the client ran the
+        // truncated Write and reported InputValidationError anyway. The catch
+        // block below uses an `error` event, which does stop it — but that is
+        // only safe there because a dead socket is transient. max_output_tokens
+        // is deterministic, so an error event would make the client retry a
+        // request that truncates again. Capping the budget is the real fix and
+        // the codex backend rejects max_output_tokens ("Unsupported parameter"),
+        // so the label stays honest and the execution stays unprevented.
         const stopReason = incompleteReason
           ? incompleteReason === "content_filter"
             ? "refusal"
@@ -531,27 +562,32 @@ export function createResponsesStreamHandler(
           try {
             closeReasoning();
             closeText();
+            // A tool block still open here had its argument JSON cut mid-object:
+            // the socket died between `output_item.added` and `output_item.done`.
+            // closeTools() still has to emit it, because its content_block_start
+            // is already on the wire — so how the turn ENDS decides what the
+            // client does with the fragment, and `end_turn` makes Claude Code run
+            // the tool on truncated JSON:
+            //   InputValidationError: Write was called with input that could not
+            //   be parsed as JSON. You sent (first 200 of 9437 bytes): {"file_pa…
+            // `max_tokens` does not rescue it either: Claude Code 2.1.217 ran a
+            // max_tokens-terminated tool call anyway (passflow session,
+            // 2026-07-22, six days after v7.12.7 shipped that mitigation). Only
+            // an `error` event ends the message with no completed tool_use, and
+            // it is the honest report — the turn did fail. devin-connect ends a
+            // mid-stream fault the same way, for the same reason.
+            const toolCallCutOff = openToolBlocks.size > 0;
             closeTools();
 
-            const errorIdx = curIdx++;
-            send("content_block_start", {
-              type: "content_block_start",
-              index: errorIdx,
-              content_block: { type: "text", text: "" },
-            });
-            send("content_block_delta", {
-              type: "content_block_delta",
-              index: errorIdx,
-              delta: { type: "text_delta", text: `\n\n[Stream error: ${error}]` },
-            });
-            send("content_block_stop", { type: "content_block_stop", index: errorIdx });
-
-            send("message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: "end_turn", stop_sequence: null },
-              usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-            });
-            send("message_stop", { type: "message_stop" });
+            if (toolCallCutOff) {
+              log("[ResponsesSSE] tool arguments cut off mid-stream → error event");
+              send("error", {
+                type: "error",
+                error: { type: "api_error", message: `Stream error: ${error}` },
+              });
+            } else {
+              endTurnWithText(`\n\n[Stream error: ${error}]`);
+            }
           } catch {}
 
           isClosed = true;

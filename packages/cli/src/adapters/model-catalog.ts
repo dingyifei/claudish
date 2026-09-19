@@ -18,6 +18,7 @@ import {
   type RouteVariant,
   type SlimModelEntry,
   readAllModelsCache,
+  reasoningStatusOf,
 } from "../providers/all-models-cache.js";
 import { compareByReleaseDateDesc } from "../providers/model-ordering.js";
 
@@ -89,6 +90,53 @@ export function lookupModelReasoning(
   cachePath?: string
 ): ReasoningCapability | undefined {
   return findCacheEntry(modelId, cachePath)?.reasoning;
+}
+
+/**
+ * Whether the catalog KNOWS this model's reasoning control.
+ *
+ * Three answers, and they are three different instructions:
+ *
+ * - `"known"` — {@link lookupModelReasoning} describes the real wire control.
+ *   Use it.
+ * - `"unknown"` — the catalog has the model but never learned its control.
+ *   Send NO reasoning knob. Do not fall back to a budget, a toggle, or
+ *   `supportsThinking`; the catalog publishes that flag even when the status is
+ *   unknown, so it is present exactly when it proves nothing.
+ * - `undefined` — no row at all (cold cache, or a model the catalog does not
+ *   carry). Same instruction as `"unknown"`, reported separately so a caller
+ *   can tell "the catalog is silent about everything" from "the catalog knows
+ *   this model and is explicit that the control was never described".
+ *
+ * None of the three is a reason to drop a route. A model claudish cannot
+ * describe is still a model the provider will serve.
+ */
+export function lookupModelReasoningStatus(
+  modelId: string,
+  cachePath?: string
+): "known" | "unknown" | undefined {
+  const entry = findCacheEntry(modelId, cachePath);
+  return entry ? reasoningStatusOf(entry) : undefined;
+}
+
+/**
+ * The model's published output ceiling, or undefined when the catalog has none.
+ *
+ * Undefined means UNKNOWN, never zero and never "unlimited". The slim
+ * projection omits the field rather than sending a null, and it does not carry
+ * the `maxOutputTokensNotApplicable` flag the richer projections use, so a
+ * missing value cannot be distinguished from "not applicable to this model".
+ *
+ * This is reporting data. Request shaping clamps against the REQUEST's own
+ * ceiling, because that is the number the provider validates a reasoning budget
+ * against.
+ */
+export function lookupModelMaxOutputTokens(
+  modelId: string,
+  cachePath?: string
+): number | undefined {
+  const value = findCacheEntry(modelId, cachePath)?.maxOutputTokens;
+  return typeof value === "number" && value > 0 ? value : undefined;
 }
 
 /**
@@ -267,14 +315,21 @@ export function lookupModelForProvider(
 /**
  * Whether a subscription endpoint can serve a model, and under which wire id.
  *
- * - `serves`     — the plan includes this model; send `externalId` (the wire id
- *                  the endpoint accepts, e.g. `k3` for catalog `kimi-k3`).
+ * - `serves`     — EVERY plan behind this route includes the model; send
+ *                  `externalId` (the wire id the endpoint accepts, e.g. `k3` for
+ *                  catalog `kimi-k3`).
  * - `not-served` — the provider IS a subscription plan, but this model isn't in
  *                  it. Routing should DROP the candidate: sending the model
  *                  anyway is a guaranteed rejection, and silently substituting a
  *                  different model gives the user something they didn't ask for.
- * - `unknown`    — not a subscription plan, or the model isn't in the catalog.
- *                  Caller keeps its existing behaviour.
+ * - `unknown`    — not a subscription plan, the model isn't in the catalog, or
+ *                  the catalog cannot answer for THIS user: the route's sibling
+ *                  plans disagree about the model, or their membership lists are
+ *                  not authoritative. Caller keeps its existing behaviour.
+ *
+ * Only `not-served` acts destructively, so every doubt resolves to `unknown`.
+ * A wrong `not-served` drops a subscription provider and bills a flat-rate user
+ * per token; a wrong `unknown` costs one upstream rejection.
  */
 export type SubscriptionRouting =
   | { kind: "serves"; externalId: string }
@@ -317,8 +372,38 @@ export function resolveSubscriptionRouting(
   if (providerPlans.length === 0) return { kind: "unknown" };
 
   const providerPlanIds = new Set(providerPlans.map((plan) => plan.id));
-  const hasMembership = entry.subscriptionPlans?.some((planId) => providerPlanIds.has(planId));
-  if (hasMembership) {
+  const memberships = entry.subscriptionPlans ?? [];
+  const includingPlans = providerPlans.filter((plan) => memberships.includes(plan.id));
+
+  // A ROUTE is not a PLAN. `routing.providerUid` names the endpoint the CLI
+  // talks to, and one endpoint sells several plans; `providerPlans` is therefore
+  // a set, not a row. Testing membership against the UNION of that set — the
+  // `.some()` this used to be — answers "does ANY plan behind this route include
+  // the model?", while the caller reads the answer as "the credential in hand
+  // can call it". Those are different questions whenever the route sells more
+  // than one plan.
+  //
+  // Measured on the live cache: `alibaba-token-plan-individual` and
+  // `alibaba-token-plan-team-edition` both carry
+  // `routing.providerUid: "qwen-cloud"`. A model included only in Team Edition
+  // answered `serves` to a holder of Individual, so routing pinned that plan's
+  // wire id and the request went out against a plan the user does not own.
+  //
+  // Neither the cache nor the credential says WHICH sibling plan the user holds,
+  // and claudish cannot find out, so unanimity is the only membership claim this
+  // data supports:
+  //   in every plan for the route -> serves
+  //   in some but not all         -> unknown (ambiguous plan membership)
+  //   in none                     -> fall through to the absence tests below
+  // With one plan behind the route — z-ai's `z-ai-glm-coding-plan`, Kimi Code —
+  // "every" and "some" are the same set, so single-plan vendors keep exactly
+  // today's verdicts.
+  //
+  // The ambiguous case costs the user nothing: `unknown` keeps the candidate in
+  // the chain and the caller still resolves a wire id through the generic
+  // `aggregators[]` lookup. All it withholds is the plan-pinned id and the drop.
+  if (includingPlans.length > 0) {
+    if (includingPlans.length < providerPlans.length) return { kind: "unknown" };
     const agg = entry.aggregators?.find((a) => a.provider === provider);
     // A plan membership without an aggregator entry has no wire id to send;
     // keep the candidate as unknown rather than inventing one. The normal
@@ -326,23 +411,40 @@ export function resolveSubscriptionRouting(
     return agg?.externalId ? { kind: "serves", externalId: agg.externalId } : { kind: "unknown" };
   }
 
-  // queryModels and queryPlans are separate requests, so a client can briefly
-  // pair a new plan contract with an older slim snapshot. Static absence only
-  // becomes authoritative after this cache demonstrates that it contains at
-  // least one membership row for the provider's plans. Otherwise treating
-  // zero coverage as a complete empty roster would drop every candidate during
-  // a backend rollout (the exact OpenAI/Anthropic gap that motivated the join).
-  const hasPublishedProviderRoster = cache.entries.some((candidate) =>
+  // Everything from here down decides whether SILENCE is a verdict. Three
+  // separate holes can put the model in this branch without the plan actually
+  // excluding it, so each is tested on its own and any one of them withholds
+  // `not-served`.
+  //
+  // Hole 1 — snapshot skew. queryModels and queryPlans are separate requests, so
+  // a client can briefly pair a new plan contract with an older slim snapshot.
+  // Requiring at least one membership row somewhere in the cache stops a
+  // mid-rollout snapshot, which carries zero rows, from reading as a complete
+  // empty roster and dropping every candidate (the OpenAI/Anthropic gap that
+  // motivated the join).
+  //
+  // This is an EXISTENCE test and nothing more, which its old name —
+  // `hasPublishedProviderRoster` — flatly misstated. `.some()` over the whole
+  // cache means ONE membership row anywhere licenses the reading that this
+  // route publishes rosters at all; it never checks that the roster is
+  // COMPLETE. Read as a completeness proof it was the whole permission slip for
+  // `not-served`, and a route that had published a single row could drop every
+  // other model it serves. Completeness is not observable from row counts —
+  // only the plan can state it, which is `modelDiscovery` below. Keep this
+  // check, but keep it in its place: it can only withhold a verdict, never
+  // license one.
+  const hasAnyMembershipRow = cache.entries.some((candidate) =>
     candidate.subscriptionPlans?.some((planId) => providerPlanIds.has(planId))
   );
-  if (!hasPublishedProviderRoster) return { kind: "unknown" };
+  if (!hasAnyMembershipRow) return { kind: "unknown" };
 
-  // Absence of evidence is evidence of absence only when the view is whole, and
-  // this one has a hole in it by construction: `providerPlans` above keeps only
-  // plans carrying a `routing.providerUid`, so a plan with no routing block is
-  // never consulted. A SIBLING plan for the same vendor can still publish a
-  // roster, which makes `hasPublishedProviderRoster` true and turns this
-  // provider's silence into a verdict about a plan nobody looked at.
+  // Hole 2 — a plan the filter cannot see. Absence of evidence is evidence of
+  // absence only when the view is whole, and this one has a hole in it by
+  // construction: `providerPlans` above keeps only plans carrying a
+  // `routing.providerUid`, so a plan with no routing block is never consulted.
+  // A SIBLING plan for the same vendor can still publish a roster, which makes
+  // `hasAnyMembershipRow` true and turns this provider's silence into a verdict
+  // about a plan nobody looked at.
   //
   // Measured on the live cache: `alibaba-ai-coding-plan` covers
   // `qwen3-coder-plus` and carries NO routing block, while
@@ -369,11 +471,25 @@ export function resolveSubscriptionRouting(
   );
   if (hasUnroutableSiblingPlan) return { kind: "unknown" };
 
-  // Static absence is conclusive only for catalog-authoritative plans. Client
-  // and hybrid plans may expose additional account-specific models after auth.
-  return providerPlans.every(isCatalogDiscoveredPlan)
-    ? { kind: "not-served" }
-    : { kind: "unknown" };
+  // Hole 3 — a roster the catalog never claimed to hold. This is the only
+  // completeness signal that exists, and it comes from the backend, per plan:
+  // `modelDiscovery: "catalog"` is the plan stating that its membership list is
+  // the whole callable roster. `client` and `hybrid` say the opposite — the
+  // roster is discovered after auth, so the catalog's list is a subset by
+  // design and a missing row means nothing. An absent value is not a quiet
+  // "catalog" either; it is a plan contract this build predates.
+  //
+  // EVERY plan behind the route must say `catalog`, for the same reason
+  // unanimity governs membership above: claudish does not know which sibling
+  // plan the credential belongs to, so one `client` plan on the route is enough
+  // to make the model reachable in a way this data cannot see.
+  const hasCompleteMembershipView = providerPlans.every(isCatalogDiscoveredPlan);
+  if (!hasCompleteMembershipView) return { kind: "unknown" };
+
+  // All three holes closed: every plan on the route publishes an authoritative
+  // roster, the cache proves it holds those rows, no sibling plan is invisible,
+  // and none of the plans lists this model. Only now is silence a verdict.
+  return { kind: "not-served" };
 }
 
 function isCatalogDiscoveredPlan(plan: CachedSubscriptionPlan): boolean {
@@ -431,6 +547,50 @@ function findCacheEntry(modelId: string, cachePath?: string): SlimModelEntry | u
     }
   }
 
+  // Last step: the id may be a subscription plan's WIRE id, which is not
+  // required to exist as a catalog id or alias. `modelDescriptions` is the
+  // catalog's own exact map from such an id to the canonical row that describes
+  // it — `claude-opus-4-5-20251101` is the dated id Claude Code sends, while
+  // the row is stored undated.
+  //
+  // Metadata only. The canonical id is never returned to a caller that builds a
+  // request: every consumer of this function reads capability fields, and the
+  // id sent upstream stays the one the caller was given.
+  const canonical = resolvePlanDescribedModelId(modelId, cache.plans);
+  if (!canonical) return undefined;
+
+  const canonicalLower = canonical.toLowerCase();
+  for (const entry of cache.entries) {
+    if (entry.modelId.toLowerCase() === canonicalLower) return entry;
+    if (entry.aliases?.some((a) => a.toLowerCase() === canonicalLower)) return entry;
+  }
+
+  return undefined;
+}
+
+/**
+ * The canonical catalog id a plan's exact roster id resolves to, or undefined.
+ *
+ * Only a `described` resolution answers. `missing` and `ambiguous` are the
+ * catalog stating that IT could not resolve the id, and inventing a lookup on
+ * top of that verdict is precisely the guessing this map exists to end — so
+ * they return undefined and the caller degrades to "no information".
+ *
+ * The scan is across plans because one wire id can appear in several (three
+ * plans list `qwen3.8-max`). They agree by construction: each generation builds
+ * the map against one model snapshot. Taking the first `described` hit is
+ * therefore deterministic, and a disagreement would be a backend defect rather
+ * than something to arbitrate here.
+ */
+export function resolvePlanDescribedModelId(
+  wireId: string,
+  plans: CachedSubscriptionPlan[] | undefined
+): string | undefined {
+  if (!plans) return undefined;
+  for (const plan of plans) {
+    const described = plan.modelDescriptions?.[wireId];
+    if (described?.status === "described" && described.modelId) return described.modelId;
+  }
   return undefined;
 }
 

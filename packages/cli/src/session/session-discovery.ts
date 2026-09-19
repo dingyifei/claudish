@@ -79,6 +79,14 @@ export interface SessionRow {
   id: string;
   file: string;
   mtimeMs: number;
+  /**
+   * When the transcript was CREATED. Free from the same `stat` as `mtimeMs`.
+   *
+   * Optional because a row can be built without one (tests, and any future source that
+   * is not a `stat`), and every reader must treat an absent value as "unknown" rather
+   * than as "old" — see `findLatestSessionId`, which falls back instead of excluding.
+   */
+  birthtimeMs?: number;
   sizeBytes: number;
   /** Claude Code's own generated title, the single best label for a session. */
   title?: string;
@@ -248,6 +256,7 @@ function sessionsIn(dirName: string): SessionRow[] {
         id: basename(n, ".jsonl"),
         file,
         mtimeMs: st.mtimeMs,
+        birthtimeMs: st.birthtimeMs,
         sizeBytes: st.size,
       };
       // Classify here, in the list pass, because `entrypoint` decides whether the row is
@@ -921,7 +930,22 @@ export function findLatestSessionId(cwd: string = process.cwd(), sinceMs = 0): s
   // proxy's start time cannot make the guess right, but it does make it fail closed:
   // when nothing in this directory was written during the session, the answer is null
   // and the card prints no resume line at all.
-  const rows = sessionsIn(slugForPath(cwd)).filter((r) => r.mtimeMs >= sinceMs);
-  if (rows.length === 0) return null;
-  return rows.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a)).id;
+  const touched = sessionsIn(slugForPath(cwd)).filter((r) => r.mtimeMs >= sinceMs);
+  if (touched.length === 0) return null;
+
+  // Prefer a transcript that was CREATED during this run, before falling back to the
+  // newest one merely touched during it.
+  //
+  // Newest-by-mtime alone loses to any conversation that is still being written in the
+  // same directory, and the loudest such writer is a Claude Code session that launched
+  // claudish in the first place: it appends on every turn, so it is always the freshest
+  // file at the moment claudish exits. MEASURED — a run inside this worktree printed
+  // `--resume 35188908-…`, the id of the OUTER session, while the child printed
+  // `49ca22f8-…` for itself. The child's transcript is the one born during the window;
+  // the outer session's predates it. A resumed session keeps its original file and so
+  // would be missed here, but that path never reaches this function: `resumedSessionId`
+  // is already known and takes precedence at the call site.
+  const born = touched.filter((r) => r.birthtimeMs !== undefined && r.birthtimeMs >= sinceMs);
+  const pool = born.length > 0 ? born : touched;
+  return pool.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a)).id;
 }

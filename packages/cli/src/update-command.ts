@@ -350,6 +350,44 @@ async function resolveLatestVersion(): Promise<{ version: string } | { error: st
   return { error: fetchError };
 }
 
+/** What `performUpdate` did. `unsupported` means the install method is unknown. */
+export type UpdateOutcome =
+  | { status: "updated"; method: InstallationInfo["method"] }
+  | { status: "failed"; method: InstallationInfo["method"] }
+  | { status: "unsupported" };
+
+/**
+ * Run the upgrade for however claudish was installed, and report what happened.
+ *
+ * Split out of `updateCommand` so the interactive launcher's "Update now?"
+ * prompt reuses the same install detection, the same command table, and the
+ * same cache invalidation — without inheriting `updateCommand`'s `process.exit`
+ * calls, which a mid-startup prompt must not make on the user's behalf.
+ *
+ * Prints its own progress and failure text; the caller reports the result.
+ */
+export async function performUpdate(): Promise<UpdateOutcome> {
+  refreshAnsi();
+  const installInfo = detectInstallationMethod();
+
+  if (installInfo.method === "unknown") {
+    printManualInstructions();
+    return { status: "unsupported" };
+  }
+
+  const command = getUpdateCommand(installInfo.method);
+  console.log(`\n${DIM}Updating...${RESET}\n`);
+
+  const success = await executeUpdate(command);
+  if (success) {
+    // Clear update cache so the next run checks fresh instead of re-offering
+    // the version we just installed.
+    clearCache();
+    return { status: "updated", method: installInfo.method };
+  }
+  return { status: "failed", method: installInfo.method };
+}
+
 /**
  * Main update command entry point
  */
@@ -394,23 +432,14 @@ export async function updateCommand(): Promise<void> {
     `  ${BOLD}claudish${RESET} ${YELLOW}v${currentVersion}${RESET} ${DIM}\u2192${RESET} ${GREEN}v${latestVersion}${RESET}   ${DIM}(${installInfo.method})${RESET}`
   );
 
-  if (installInfo.method === "unknown") {
-    printManualInstructions();
+  const outcome = await performUpdate();
+
+  if (outcome.status === "unsupported") {
     process.exit(1);
   }
 
-  // Get update command and execute directly
-  const command = getUpdateCommand(installInfo.method);
-
-  console.log(`\n${DIM}Updating...${RESET}\n`);
-
-  const success = await executeUpdate(command);
-
-  if (success) {
+  if (outcome.status === "updated") {
     console.log(`\n  ${GREEN}\u2713${RESET} ${BOLD}Updated successfully${RESET}`);
-
-    // Clear update cache so next run checks fresh
-    clearCache();
 
     // Fetch and display changelog
     const changelog = await fetchChangelog(currentVersion, latestVersion);

@@ -46,6 +46,7 @@ function render(
     modelSpec?: string;
     resumeModelSpec?: string | null;
     resumeId?: string | null;
+    resumeCwd?: string | null;
     exitCode?: number;
   } = {}
 ): string[] {
@@ -55,6 +56,7 @@ function render(
     resumeModelSpec:
       overrides.resumeModelSpec === undefined ? "provider@test-model" : overrides.resumeModelSpec,
     resumeId: overrides.resumeId === undefined ? "session-123" : overrides.resumeId,
+    resumeCwd: overrides.resumeCwd,
     exitCode: overrides.exitCode ?? 0,
   });
 }
@@ -108,6 +110,28 @@ describe("renderSessionSummary resume command", () => {
     expect(command).not.toContain("--model");
   });
 
+  test("prepends the worktree directory without styling or unnecessary quotes", () => {
+    const ordinary = render({ resumeCwd: "/tmp/claudish-worktree" }).at(-1)!;
+    const spaced = render({ resumeCwd: "/tmp/claudish worktree" }).at(-1)!;
+
+    expect(ordinary).toBe(
+      "cd /tmp/claudish-worktree && claudish --model provider@test-model --resume session-123"
+    );
+    expect(spaced).toBe(
+      "cd '/tmp/claudish worktree' && claudish --model provider@test-model --resume session-123"
+    );
+    expect(ordinary).not.toContain("\x1b");
+    expect(spaced).not.toContain("\x1b");
+  });
+
+  test("leaves the resume command unchanged when its directory is null or absent", () => {
+    const absent = render().at(-1)!;
+    const nullDirectory = render({ resumeCwd: null }).at(-1)!;
+
+    expect(absent).toBe("claudish --model provider@test-model --resume session-123");
+    expect(nullDirectory).toBe(absent);
+  });
+
   test("omits the entire resume section when no session id was found", () => {
     const plain = render({ resumeId: null }).map(stripAnsi);
 
@@ -151,5 +175,27 @@ describe("renderSessionSummary status and cost wording", () => {
 
     expect(savingRow).toContain("over by");
     expect(savingRow).not.toContain("saved");
+  });
+
+  test("scales free-session savings bars by dollar magnitude", () => {
+    const plain = render({
+      stats: {
+        isFree: true,
+        costUsd: 0,
+        inputCostUsd: 0,
+        outputCostUsd: 0,
+        savings: [
+          { label: "Opus", modelId: "opus", baselineUsd: 1, savedUsd: 1 },
+          { label: "Sonnet", modelId: "sonnet", baselineUsd: 0.4, savedUsd: 0.4 },
+        ],
+      },
+    }).map(stripAnsi);
+    const opus = plain.find((line) => line.includes("vs Opus"))!;
+    const sonnet = plain.find((line) => line.includes("vs Sonnet"))!;
+    const filledCells = (line: string): number => line.match(/█/g)?.length ?? 0;
+
+    expect(filledCells(opus)).toBeGreaterThan(filledCells(sonnet));
+    expect(opus).toContain("100% saved $1.00");
+    expect(sonnet).toContain("100% saved $0.40");
   });
 });

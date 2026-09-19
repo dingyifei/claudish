@@ -11,6 +11,7 @@
  * This format handles Codex models only. All other OpenAI models use OpenAIAPIFormat.
  */
 
+import { mapToolChoiceToResponsesAPI } from "../handlers/shared/format/openai-tools.js";
 import { log } from "../logger.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 import {
@@ -129,6 +130,14 @@ export class CodexAPIFormat extends BaseAPIFormat {
         }
         return tool;
       });
+
+      // The Responses API spells tool_choice as Chat Completions does, except
+      // that the function form is flat. Gated on there being tools, for the
+      // same reason Gemini is.
+      const toolChoice = mapToolChoiceToResponsesAPI(claudeRequest.tool_choice);
+      if (toolChoice !== undefined) {
+        payload.tool_choice = toolChoice;
+      }
     }
 
     return payload;
