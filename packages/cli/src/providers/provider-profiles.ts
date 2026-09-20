@@ -407,8 +407,12 @@ export const openCodeZenProfile: ProviderProfile = {
     const zenApiKey = ctx.apiKey;
     const isGoProvider = ctx.provider.name === "opencode-zen-go";
 
-    // GPT models are served via the OpenAI Responses API (/v1/responses), not /v1/chat/completions.
-    if (ctx.modelName.toLowerCase().startsWith("gpt-")) {
+    // GPT and Muse Spark models are served via the OpenAI Responses API (/v1/responses), not
+    // /v1/chat/completions. Measured 2026-09-19 on Zen Go, `muse-spark-1.3-contributor`:
+    // chat/completions -> 500 "Internal server error" (with or without tools), /v1/responses
+    // -> 200 with a real `function_call` item.
+    const lowerModel = ctx.modelName.toLowerCase();
+    if (lowerModel.startsWith("gpt-") || lowerModel.startsWith("muse-")) {
       const responsesProvider = { ...ctx.provider, apiPath: "/v1/responses" };
       const transport = new OpenCodeZenTransport(responsesProvider, ctx.modelName, zenApiKey);
       const adapter = new CodexAPIFormat(ctx.modelName);
