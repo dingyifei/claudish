@@ -1,6 +1,6 @@
 /**
  * Which xAI models accept `reasoning_effort` — decided at RUNTIME, not from a
- * pinned roster.
+ * pinned model list.
  *
  * ## Why this module exists
  *
@@ -171,7 +171,7 @@ export function isReasoningEffortRejection(errorText: string): boolean {
 //    "error":"This model does not support `reasoning_effort` value `none`."}
 //
 // That is a second axis, and enumerating it per model would recreate exactly the
-// stale-roster problem this module exists to remove. So it is learned the same
+// stale-model-list problem this module exists to remove. So it is learned the same
 // way: send the honest mapping, and on a value rejection remember the specific
 // (model, value) pair and fall back one rung.
 

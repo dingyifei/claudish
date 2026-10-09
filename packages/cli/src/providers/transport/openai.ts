@@ -96,7 +96,7 @@ export class OpenAIProviderTransport implements ProviderTransport {
    * Discover from the provider definition's authenticated model-list endpoint.
    *
    * OpenAI-compatible subscriptions such as Sakana Subscription and Grok
-   * Build have account-scoped rosters that are not interchangeable with their
+   * Build have account-scoped dynamic models catalogs that are not interchangeable with their
    * metered siblings. The shared helper uses the same credential authority and
    * model-discovery cache as the picker, so probe fallback never guesses a
    * cross-silo model id.
@@ -154,11 +154,15 @@ export class OpenAIProviderTransport implements ProviderTransport {
       } catch (fetchError: any) {
         if (fetchError.name === "AbortError") {
           log(`[${this.displayName}] Request timed out after 30s`);
-          throw new OpenAITimeoutError(this.provider.baseUrl);
+          throw new OpenAITimeoutError(this.provider.baseUrl, fetchError);
         }
         if (fetchError.cause?.code === "UND_ERR_CONNECT_TIMEOUT") {
           log(`[${this.displayName}] Connection timeout: ${fetchError.message}`);
-          throw new OpenAIConnectionError(this.provider.baseUrl, fetchError.cause?.code);
+          throw new OpenAIConnectionError(
+            this.provider.baseUrl,
+            fetchError.cause?.code,
+            fetchError
+          );
         }
         throw fetchError;
       }
@@ -218,19 +222,41 @@ export function isTerminal429(body: string): boolean {
   );
 }
 
+/**
+ * Both classes carry `code` AND `cause` on purpose.
+ *
+ * `classifyConnectionError` (handlers/shared/connection-error.ts) recognises a
+ * failure-to-reach-the-host by walking `.code` and then the `.cause` chain to
+ * depth 8. These two classes used to set neither, so wrapping a real connect
+ * failure in one of them ERASED the evidence: the classifier returned `null`,
+ * ComposedHandler rethrew, and the throw escaped into `fallback-handler.ts`'s
+ * catch — which records `status: 0` and advances the chain unconditionally,
+ * moving a subscription user onto metered billing during a network outage.
+ *
+ * `cause` alone would be enough for the classifier, but `code` is set too so an
+ * inspector that only reads the top-level error still sees what happened.
+ */
 export class OpenAITimeoutError extends Error {
-  constructor(baseUrl: string) {
-    super(`Request to OpenAI API timed out. Check your network connection to ${baseUrl}`);
+  /** ETIMEDOUT: `connection-error.ts` maps this to kind "unreachable". */
+  readonly code = "ETIMEDOUT";
+  constructor(baseUrl: string, cause?: unknown) {
+    super(`Request to OpenAI API timed out. Check your network connection to ${baseUrl}`, {
+      cause,
+    });
     this.name = "OpenAITimeoutError";
   }
 }
 
 export class OpenAIConnectionError extends Error {
-  constructor(baseUrl: string, code: string) {
+  /** The originating syscall/undici code, e.g. UND_ERR_CONNECT_TIMEOUT. */
+  readonly code: string;
+  constructor(baseUrl: string, code: string, cause?: unknown) {
     super(
-      `Cannot connect to OpenAI API (${baseUrl}). This may be due to: network/firewall blocking, VPN interference, or regional restrictions. Error: ${code}`
+      `Cannot connect to OpenAI API (${baseUrl}). This may be due to: network/firewall blocking, VPN interference, or regional restrictions. Error: ${code}`,
+      { cause }
     );
     this.name = "OpenAIConnectionError";
+    this.code = code;
   }
 }
 

@@ -17,6 +17,95 @@
  *  - `invalidate()` — drop any memoized resolution (after a TUI hydrate-on-add).
  */
 
+/**
+ * Three-valued credential readiness — "I could not ask" is NOT "there is
+ * nothing there".
+ *
+ * `isAvailable()` answers a boolean, and a boolean has exactly one slot for two
+ * different facts. Every resolution failure therefore collapsed into `false`,
+ * which reads downstream as "this user has no credential for this provider":
+ * the candidate is filtered out of the routing chain and a metered provider
+ * serves the request with no line printed. A locked Mac, a denied 1Password
+ * handshake or a keychain ACL the user declined would silently move a
+ * flat-rate subscriber onto pay-per-token.
+ *
+ *  - `present` — a credential resolved (or none is required).
+ *  - `absent`  — every source was consulted and none holds one. A STABLE answer.
+ *  - `failed`  — a source could not be consulted at all. TRANSIENT, and it says
+ *                nothing about whether the credential exists.
+ *
+ * `failed` still keeps a candidate out of the chain — a credential that will
+ * not resolve cannot sign a request either — so routing is unchanged. What is
+ * new is that the REASON survives to the caller. The same line the keychain
+ * engine draws (`{present, failed}` / `{value?, failed}`) and the same line the
+ * op source draws for denied handshakes, carried one layer further up.
+ */
+export type CredentialReadiness = "present" | "absent" | "failed";
+
+/** A readiness verdict, with a one-line diagnostic when it is `failed`. */
+export interface ReadinessResult {
+  readiness: CredentialReadiness;
+  /**
+   * Why the credential could not be resolved. Set only for `failed`, and NEVER
+   * key material — these strings reach stderr and the routing warning.
+   */
+  detail?: string;
+}
+
+/**
+ * A thrown value as ONE bounded line, for {@link ReadinessResult.detail}.
+ *
+ * Lives here, beside the type it serves, so the authority, the composite and
+ * every provider format a failure the same way — a second implementation of
+ * this is a second thing that can disagree. It is bounded because an SDK error
+ * can be a multi-line Rust struct dump, and pasting one into a routing warning
+ * buries the sentence that matters.
+ *
+ * Message text only, and redacted — see {@link redactSecrets}. claudish's own
+ * credential sources never put key material in an error message, but this line
+ * is not always ours: it can be an SDK's, a shell tool's, or an upstream
+ * server's, and those quote what they were given.
+ */
+export function readinessDetail(err: unknown): string | undefined {
+  const raw = (err instanceof Error ? err.message : String(err ?? "")).split("\n")[0].trim();
+  if (!raw) return undefined;
+  const line = redactSecrets(raw);
+  return line.length > 200 ? `${line.slice(0, 199)}…` : line;
+}
+
+/**
+ * Remove anything key-shaped from a line that is about to be shown or logged.
+ *
+ * Defence in depth, for the case where the text is not ours. The concrete
+ * vector is a URL: Google's endpoints take the key as a QUERY PARAMETER, so any
+ * error that quotes the request URL — a fetch failure, a 400 body, a curl-style
+ * diagnostic from a shell tool — carries the key inside an otherwise ordinary
+ * sentence. An `Authorization` header echoed into an error body does the same.
+ *
+ * Deliberately narrow. It targets the shapes a secret actually takes, rather
+ * than masking every long token, because over-redacting destroys the part of
+ * the message a user needs: a redacted request id or model name turns a
+ * diagnosable failure into "something went wrong".
+ */
+export function redactSecrets(text: string): string {
+  return (
+    text
+      // `?key=…`, `&api_key=…`, `token=…`, `secret=…`, `password=…`
+      .replace(
+        /([?&](?:api[-_]?key|key|access[-_]?token|token|secret|password)=)[^&\s"']+/gi,
+        "$1[redacted]"
+      )
+      // `Authorization: Bearer …`, and a bare `Bearer …`
+      .replace(/(bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1[redacted]")
+      // Vendor-prefixed keys, which are self-identifying: sk-…, sk_live_…, AIza…,
+      // ghp_…, xoxb-…. The prefix is kept so the reader can see WHICH credential.
+      .replace(/\b(sk|rk|pk)[-_][A-Za-z0-9_-]{12,}/g, "$1-[redacted]")
+      .replace(/\bAIza[A-Za-z0-9_-]{10,}/g, "AIza[redacted]")
+      .replace(/\b(gh[pousr]_)[A-Za-z0-9]{16,}/g, "$1[redacted]")
+      .replace(/\b(xox[abposr]-)[A-Za-z0-9-]{10,}/g, "$1[redacted]")
+  );
+}
+
 export interface RequestAuthContext {
   model: string;
   forceRefresh?: boolean;
@@ -68,6 +157,23 @@ export interface CredentialProvider {
    * server keeps running. Memoized: the SDK is touched at most once per provider.
    */
   isAvailable(opts?: { allowOpPrompt?: boolean }): Promise<boolean>;
+  /**
+   * OPTIONAL three-valued readiness — implement it wherever this provider can
+   * tell "no credential" apart from "could not ask" (see
+   * {@link CredentialReadiness}).
+   *
+   * CONTRACT, and it is load-bearing: the authority projects
+   * `isAvailable(name)` as `describeReadiness(name).readiness === "present"`, so
+   * an implementation MUST agree with its own `isAvailable()` on that boundary
+   * or routing changes. The safe way to hold the contract is to define
+   * `isAvailable()` as the projection of this method rather than writing the
+   * two independently — every implementation here does.
+   *
+   * A provider that does not implement it is not wrong, only less informative:
+   * the authority falls back to `isAvailable()` and maps `false` to `absent`,
+   * which is exactly the behaviour that existed before.
+   */
+  describeReadiness?(opts?: { allowOpPrompt?: boolean }): Promise<ReadinessResult>;
   /** ASYNC: the rich artifact for an outgoing request. Refreshes OAuth / pulls op:// internally. */
   getRequestAuth(ctx: RequestAuthContext): Promise<RequestAuth>;
   /** Drop any memoized resolution so the next read re-resolves (TUI hydrate-on-add). */

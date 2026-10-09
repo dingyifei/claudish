@@ -41,11 +41,19 @@ const getRemoteProviders = (): RemoteProvider[] => {
     .filter(
       (def) =>
         !def.isLocal &&
-        // Resolve baseUrlEnvVars so user-deployed providers like LiteLLM
-        // (static baseUrl: "", populated via LITELLM_BASE_URL) aren't filtered
-        // out. Without this, resolveRemoteProvider("litellm@...") returns null
-        // and probe-discovery / runtime routing both fail.
-        getEffectiveBaseUrl(def) !== "" &&
+        // A provider needs SOMEWHERE to send the request. Two shapes satisfy
+        // that without a static baseUrl:
+        //
+        //   1. Resolve baseUrlEnvVars, so user-deployed providers like LiteLLM
+        //      (static baseUrl: "", populated via LITELLM_BASE_URL) aren't
+        //      filtered out. Without this, resolveRemoteProvider("litellm@...")
+        //      returns null and probe-discovery / runtime routing both fail.
+        //   2. `buildsOwnEndpoint`, where the TRANSPORT assembles the URL per
+        //      request — Vertex, from project + location + publisher. No env var
+        //      can ever fill that in, so case 1 cannot cover it, and being
+        //      dropped here made `vertex@…` unreachable while reporting itself as
+        //      a missing credential.
+        (getEffectiveBaseUrl(def) !== "" || def.buildsOwnEndpoint === true) &&
         def.name !== "qwen" &&
         def.name !== "native-anthropic"
     )
@@ -138,7 +146,8 @@ export function validateRemoteProviderApiKey(provider: RemoteProvider): string |
         "export OPENAI_API_KEY='sk-...' (get from https://platform.openai.com/api-keys)",
       OPENROUTER_API_KEY:
         "export OPENROUTER_API_KEY='sk-or-...' (get from https://openrouter.ai/keys)",
-      MINIMAX_API_KEY: "export MINIMAX_API_KEY='your-key' (get from https://www.minimaxi.com/)",
+      MINIMAX_API_KEY:
+        "export MINIMAX_API_KEY='your-key' (get from https://platform.minimax.io/user-center/basic-information/interface-key; a China-platform key also needs MINIMAX_BASE_URL=https://api.minimaxi.com)",
       MINIMAX_CODING_API_KEY:
         "export MINIMAX_CODING_API_KEY='your-key' (get from https://platform.minimax.io/user-center/basic-information/interface-key)",
       MOONSHOT_API_KEY:

@@ -7,6 +7,7 @@ import {
   advisorModelStatus,
   decideAdvisorStartup,
   evaluateAdvisorStartup,
+  resolveMainModelFact,
 } from "./advisor-startup.js";
 import { resolveAdvisorToolEnv } from "./claude-runner.js";
 import type { ClaudishConfig } from "./types.js";
@@ -85,6 +86,17 @@ function expectProceed(decision: AdvisorStartupDecision) {
   if (decision.kind !== "proceed") throw new Error(decision.reason);
   return decision;
 }
+
+describe("resolveMainModelFact", () => {
+  it("labels a bare non-Claude name as unresolved until its first routed request", () => {
+    expect(resolveMainModelFact("o4-mini")).toEqual({
+      model: "o4-mini",
+      providerName: "unresolved (routed on the first request)",
+      carriesTools: true,
+      wireFormat: undefined,
+    });
+  });
+});
 
 describe("decideAdvisorStartup", () => {
   describe("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", () => {

@@ -43,6 +43,8 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GROK_PUBLIC_CLIENT_ID, GrokOAuth } from "../../auth/grok-oauth.js";
+import { markOwnTimeout } from "../../handlers/shared/connection-error.js";
+import { TOKEN_REFRESH_TIMEOUT_MS } from "../../handlers/shared/transient-retry.js";
 
 /** Base-URL override, the same variable the Grok CLI installer honours. */
 export const GROK_PROXY_URL_ENV = "GROK_PROXY_URL";
@@ -419,12 +421,34 @@ async function performRefresh(cred: GrokCredential): Promise<string> {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
+      // Bounds the single-flight latch below — see TOKEN_REFRESH_TIMEOUT_MS.
+      signal: AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
     });
   } catch (error) {
     // A network failure is NOT terminal — it can self-heal, so let the normal
     // retry path see it rather than rendering a dead-end 400.
-    throw new Error(
-      `Could not reach ${tokenEndpoint} to refresh the Grok token: ${(error as Error).message}`
+    // `{ cause }` so `classifyConnectionError` can find the real syscall code
+    // instead of depending on Bun's connect sentence surviving inside the
+    // interpolated message above — which it does today, by luck, and would stop
+    // doing the moment either side of that string is reworded. This is the
+    // FIRST network touch of a `gk@` request (ComposedHandler calls getHeaders()
+    // before the upstream fetch), so an unclassifiable failure here escapes into
+    // the fallback chain with `status: 0`.
+    //
+    // `claudishEndpoint` names the host that ACTUALLY failed. Without it the
+    // handler falls back to the model endpoint, so an `auth.x.ai` outage was
+    // reported — in the banner, in the log, and in the episode key — as
+    // `api.x.ai`: the wrong host, and the wrong advice for a user trying to fix
+    // it. `local.ts` attaches the same property for the same reason.
+    //
+    // `markOwnTimeout`: the ceiling above is ours, so a `TimeoutError` from it
+    // is a reachability fact about the auth host, and must classify as one.
+    throw Object.assign(
+      new Error(
+        `Could not reach ${tokenEndpoint} to refresh the Grok token: ${(error as Error).message}`,
+        { cause: markOwnTimeout(error) }
+      ),
+      { claudishEndpoint: tokenEndpoint }
     );
   }
 

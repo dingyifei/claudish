@@ -7,7 +7,19 @@
  * Wire format: OTLP JSON Logs
  * Signal type: LogRecord per request
  * Namespace: llm.* for custom attributes, standard OTel for resource/HTTP
+ *
+ * ── THE ONE TRAP IN THIS FILE ────────────────────────────────────────────────
+ *
+ * `eventToLogRecord` below is a HAND-WRITTEN ALLOWLIST. A field added to
+ * `StatsEvent` and populated by `stats.ts` but not pushed there is typed,
+ * type-checked, buffered, and written to `~/.claudish/stats-buffer.json` — and
+ * never leaves the machine. Nothing fails; the number is simply absent from
+ * every dashboard that was built to read it. Add the push, and add a case to
+ * `stats-otlp.test.ts`'s emit/omit table, which exists to make the omission
+ * cost a red test instead of a silent quarter.
  */
+
+import type { RecoveryOutcome } from "./recovery/coordinator.js";
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -45,6 +57,61 @@ export interface StatsEvent {
   fallback_used: boolean;
   fallback_chain?: string[]; // provider names tried, in order
   fallback_attempts?: number; // how many failed before success
+
+  // ── Network recovery ────────────────────────────────────────────────────────
+  // Present only on a request that hit a classified connection failure. On every
+  // healthy request all five are absent, and `eventToLogRecord` emits nothing
+  // for them — so a machine that never loses its network sends exactly the
+  // bytes it sent before this feature existed.
+
+  /**
+   * Connect retries THIS REQUEST made against the SAME provider.
+   *
+   * NOT `fallback_attempts`, which counts how many DIFFERENT providers were
+   * tried. The two answer opposite questions and a chain that never advanced
+   * can still have retried thirty times.
+   *
+   * Per-request, not per-episode: one episode can serve several concurrent
+   * requests and can outlive any of them, so the episode's cumulative count
+   * would over-report every request in it. `recovery_episode_id` is what joins
+   * them back together.
+   */
+  retry_attempts?: number;
+
+  /**
+   * Ms of this request's own `latency_ms` spent inside the retry ladder —
+   * backoff waits plus failed connects.
+   *
+   * `latency_ms` deliberately still INCLUDES that time (`adapters.md`: "the
+   * honest figure is time-to-usable-response"). This field is what makes the
+   * resulting skew explicable rather than mysterious: `latency_ms: 246_000,
+   * recovery_ms: 201_900` reads as a 44-second turn behind a three-and-a-half
+   * minute outage. Without it, the same record reads as a four-minute model.
+   */
+  recovery_ms?: number;
+
+  /**
+   * The episode this request belonged to — the correlation id, and the only
+   * field that makes "how often does recovery happen" answerable.
+   *
+   * One outage is one episode and may span several requests (each tier-2
+   * handoff is a new request re-entering the same episode), so counting
+   * records over-counts outages by the retry factor.
+   * `count(distinct recovery_episode_id)` is the honest figure.
+   *
+   * A request that hits BOTH an auth-path episode and a fetch-path episode
+   * carries the id of the one that DECIDED ITS STATUS. An auth episode that
+   * recovered has no record of its own: its attempts fold into this request's
+   * `retry_attempts` and its waits into this request's `recovery_ms`, because
+   * there is exactly one record per request.
+   */
+  recovery_episode_id?: string;
+
+  /** Which tier-2 re-entry this request is. 0 = the original request. */
+  recovery_client_retry?: number;
+
+  /** How the episode ended for this request. */
+  recovery_outcome?: RecoveryOutcome;
 
   // Invocation
   invocation_mode: string; // "profile" | "explicit-model" | "auto-route" | "env-var" | "model-map"
@@ -217,6 +284,25 @@ export function eventToLogRecord(event: StatsEvent): OtlpLogRecord {
   }
   if (event.fallback_attempts !== undefined) {
     attributes.push(intAttr("llm.fallback_attempts", event.fallback_attempts));
+  }
+
+  // Optional network-recovery fields. THIS IS THE STEP WHOSE OMISSION IS
+  // SILENT — see the file header. Each is emitted only when set, so a healthy
+  // request's record is byte-identical to what it was before recovery existed.
+  if (event.retry_attempts !== undefined) {
+    attributes.push(intAttr("llm.retry_attempts", event.retry_attempts));
+  }
+  if (event.recovery_ms !== undefined) {
+    attributes.push(intAttr("llm.recovery_ms", event.recovery_ms));
+  }
+  if (event.recovery_episode_id !== undefined) {
+    attributes.push(stringAttr("llm.recovery_episode_id", event.recovery_episode_id));
+  }
+  if (event.recovery_client_retry !== undefined) {
+    attributes.push(intAttr("llm.recovery_client_retry", event.recovery_client_retry));
+  }
+  if (event.recovery_outcome !== undefined) {
+    attributes.push(stringAttr("llm.recovery_outcome", event.recovery_outcome));
   }
 
   return {

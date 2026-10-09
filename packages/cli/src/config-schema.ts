@@ -2,12 +2,13 @@
  * Config schemas for the LiteLLM-demotion refactor (Phase 1).
  *
  * Defines:
- *   - BuiltinDefaultProviderSchema — enum of provider names users can name as
- *     their default provider for bare model names.
  *   - CustomEndpointSimpleSchema    — "URL + format + key" custom endpoints.
  *   - CustomEndpointComplexSchema   — full provider profile (Phase 3 will register).
  *   - CustomEndpointSchema          — discriminated union of the two.
- *   - DefaultProviderSchema         — builtin enum OR custom-endpoint name string.
+ *
+ * `defaultProvider` has no schema. Nothing validated it, and the one that existed
+ * rejected `""`, which is a valid value (no fallback provider), and listed
+ * `anthropic`, which is not a claudish provider.
  *
  * NOTE: This module is intentionally NOT imported by `profile-config.ts`.
  * Validation happens at the consumption site (Phase 3 will add a
@@ -17,16 +18,6 @@
  */
 
 import { z } from "zod";
-
-// Built-in providers users can name as their default.
-// "litellm" is preserved for legacy compat (Phase 2 will gate auto-promotion on this).
-export const BuiltinDefaultProviderSchema = z.enum([
-  "openrouter",
-  "litellm",
-  "openai",
-  "anthropic",
-  "google",
-]);
 
 /**
  * How a custom endpoint authenticates.
@@ -159,11 +150,6 @@ export const PredefinedEndpointsConfigSchema = z.object({
   enable: z.array(z.string()).optional(),
 });
 
-// defaultProvider can be a builtin OR the name of a custom endpoint
-// (we validate the cross-reference at load time, not in the schema).
-export const DefaultProviderSchema = z.union([BuiltinDefaultProviderSchema, z.string().min(1)]);
-
-export type BuiltinDefaultProvider = z.infer<typeof BuiltinDefaultProviderSchema>;
 export type CustomEndpointSimple = z.infer<typeof CustomEndpointSimpleSchema>;
 export type CustomEndpointComplex = z.infer<typeof CustomEndpointComplexSchema>;
 export type CustomEndpoint = z.infer<typeof CustomEndpointSchema>;

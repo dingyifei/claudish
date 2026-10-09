@@ -132,7 +132,7 @@ child already owned the *file descriptor*, and the write happened in another pro
 `execFileSync` ever threw.
 
 Shipped in `auth/antigravity-token.ts`'s `defaultReadStore` up to v9.0.7. The config TUI rebuilds
-its provider roster on every render and each rebuild calls `hasSharedAntigravityToken()`, so the
+its provider list on every render and each rebuild calls `hasSharedAntigravityToken()`, so the
 two memos only collapse a burst — one spawn, and one leaked line, still got through every
 `HAS_TOKEN_TTL_MS` (5 s) for as long as the view was open. claudish shares a terminal with the
 Claude Code TUI, so the result was a display corrupted every five seconds for any user not signed

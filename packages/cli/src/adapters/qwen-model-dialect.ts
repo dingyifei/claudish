@@ -11,7 +11,7 @@
  * do not share a reasoning knob. Only the DashScope half lives here: the
  * Anthropic half is a property of the WIRE, not of the Qwen family, so it lives
  * in BaseAPIFormat.applyAnthropicWireReasoning() where every dialect inherits
- * it. (Qwen Plan serves glm-5.2 and deepseek-v4-* over the same endpoint, so a
+ * it. (Alibaba Token Plan serves glm-5.2 and deepseek-v4-* over the same endpoint, so a
  * Qwen-only implementation left those two emitting knobs that endpoint ignores.)
  *
  * `applyNativeReasoning` is not called at all on the Anthropic wire, so nothing
@@ -81,7 +81,11 @@ export class QwenModelDialect extends BaseAPIFormat {
     const effort = this.resolveEffortLevel(originalRequest);
     if (!effort) return request;
 
-    if (effort === "none" || effort === "minimal") {
+    // Same rule as every other wire (BaseAPIFormat.meansReasoningOff): `minimal`
+    // is the lowest rung where the catalog advertises one, and a model marked
+    // `mandatory` is never sent `enable_thinking: false`. DashScope serves GLM
+    // alongside Qwen on this wire, so the mandatory case is reachable here too.
+    if (this.meansReasoningOff(effort, this.lookupReasoningCapability())) {
       request.enable_thinking = false;
       log(`[QwenModelDialect] effort ${effort} -> enable_thinking: false for ${this.modelId}`);
     } else {

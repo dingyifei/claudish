@@ -19,7 +19,17 @@
  * SDK or the keychain. The authority is the ONLY code that pushes keys from
  * either vault into process.env.
  *
- * `isAvailable()` additionally honors one affordance the legacy oracle granted:
+ * `describeReadiness()` reports `present` / `absent` / `failed`, and
+ * `isAvailable()` is its `=== "present"` projection. Steps 4 and 5 are the two
+ * measured ways a REAL credential resolves to nothing — a locked or declined
+ * keychain, a denied 1Password handshake — and both used to arrive here as a
+ * bare `""`, indistinguishable from "this user has no key". That is what let a
+ * flat-rate subscription be dropped from the routing chain and replaced by a
+ * metered provider with nothing printed. The reason now survives; what routing
+ * DOES with it is unchanged, since `failed` still projects to unavailable.
+ *
+ * `describeReadiness()` additionally honors one affordance the legacy oracle
+ * granted:
  *   - `oauthFallback`: a `<file>` under ~/.claudish/ — if that OAuth credential
  *     file exists, the provider is available even without an env/config/op key.
  *
@@ -45,7 +55,27 @@ import {
 } from "./keychain-source.js";
 import { resolveLocalApiKey } from "./local-api-key.js";
 import { hasOpSources, resolveOpKeyForEnvVars } from "./op-source.js";
-import type { CredentialProvider, RequestAuth, RequestAuthContext } from "./types.js";
+import type {
+  CredentialProvider,
+  ReadinessResult,
+  RequestAuth,
+  RequestAuthContext,
+} from "./types.js";
+
+/**
+ * The outcome of one async key resolution: the key (possibly ""), plus WHY it
+ * is empty when a credential STORE could not be consulted.
+ *
+ * `failure` is set only for "could not ask" — a keychain that would not answer,
+ * a 1Password handshake that was denied or unavailable. It is deliberately NOT
+ * set for "every source answered and none holds this key", which is an ordinary,
+ * stable `absent` and must stay one: marking that `failed` would make every
+ * provider the user has not configured report an error.
+ */
+interface KeyResolution {
+  key: string;
+  failure?: string;
+}
 
 export interface ApiKeyDescriptor {
   catalogName: string;
@@ -113,8 +143,16 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
 
   /** Memoized resolved key ("" = resolved-and-empty). undefined = not yet resolved. */
   private cachedKey: string | undefined;
-  /** In-flight resolution, so concurrent callers share one op pull. */
-  private resolving: Promise<string> | undefined;
+  /**
+   * In-flight resolution, so concurrent callers share one op pull.
+   *
+   * It carries the FAILURE alongside the key rather than leaving the reason in
+   * an instance field: several callers share one resolution (a bare model name
+   * credential-filters a whole chain, and the config TUI resolves ~16 providers
+   * at once), so a field would be read by whichever caller happened to land
+   * after the next resolution had already overwritten it.
+   */
+  private resolving: Promise<KeyResolution> | undefined;
 
   constructor(descriptor: ApiKeyDescriptor) {
     this.catalogName = descriptor.catalogName;
@@ -170,19 +208,42 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
    * THROUGH to process.env so spawned children inherit it.
    */
   private async resolveKey(opts?: { allowOpPrompt?: boolean }): Promise<string> {
-    if (this.cachedKey !== undefined) return this.cachedKey;
+    return (await this.resolveKeyDetailed(opts)).key;
+  }
+
+  /**
+   * The same resolution, keeping the REASON an empty result is empty.
+   *
+   * Both vault steps below can come back with nothing for two different
+   * reasons, and the old `Promise<string>` had one slot for both. "The keychain
+   * is locked" and "there is no item for this variable" arrived as the same
+   * `""`, so `isAvailable()` reported a subscriber with a perfectly good key as
+   * uncredentialed, routing dropped the provider, and a metered vendor served
+   * the request. The stores already distinguish the two — `{value?, failed}`
+   * from the keychain, and now `onFailure` from the op source — so this method
+   * carries the distinction up instead of flattening it.
+   *
+   * The failure is reported WITHOUT ever being cached: transience is the whole
+   * point, and the existing "do not memoize a miss that might have been a
+   * failure" rules below are what make the next call retry.
+   */
+  private async resolveKeyDetailed(opts?: { allowOpPrompt?: boolean }): Promise<KeyResolution> {
+    // A cached key is a SETTLED answer — either a real value or a stable,
+    // deliberately-memoized absence. Neither carries a failure, because the
+    // rules below refuse to cache anything that might have been one.
+    if (this.cachedKey !== undefined) return { key: this.cachedKey };
     if (this.resolving) return this.resolving;
 
-    this.resolving = (async () => {
+    this.resolving = (async (): Promise<KeyResolution> => {
       // Steps 1-3: env / aliases / config — no SDK.
       const local = this.resolveFromEnvConfig();
       if (local) {
         this.cachedKey = local;
-        return local;
+        return { key: local };
       }
       // Step 4: macOS Keychain, only if the backend is on (the sync sniff gates
       // the `security` spawn). Local and quiet, so it is tried before 1Password.
-      let keychainFailed = false;
+      let keychainFailure: string | undefined;
       if (hasKeychainSource()) {
         const kc = resolveKeychainKeyForEnvVars([this.envVar, ...this.aliases]);
         if (kc.value) {
@@ -191,20 +252,32 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
           process.env[this.envVar] = kc.value;
           recordKeychainHydratedVar(this.envVar);
           this.cachedKey = kc.value;
-          return kc.value;
+          return { key: kc.value };
         }
         // A keychain MISS is stable (the item is genuinely absent) and may be
         // cached below. A keychain FAILURE — locked, or a declined ACL — is
         // transient and must not be, or one early stumble would mark this
         // provider unavailable for the rest of the process.
-        keychainFailed = kc.failed;
+        if (kc.failed) {
+          keychainFailure = kc.error
+            ? `macOS Keychain could not be read: ${kc.error}`
+            : "macOS Keychain could not be read";
+        }
       }
       // Step 5: 1Password, only if a source exists (the sync sniff gates the SDK).
       if (hasOpSources()) {
         const wanted = new Set<string>([this.envVar, ...this.aliases]);
+        // Capture the first swallowed reason. `onAuthFailure:"skip"` is right —
+        // a credential backend having a bad day must not take down an MCP or
+        // serve process — but skipping the ERROR is not the same as skipping
+        // the exception, and this is where the two were conflated.
+        let opFailure: string | undefined;
         const resolved = await resolveOpKeyForEnvVars(wanted, {
           onAuthFailure: "skip",
           allowPrompt: opts?.allowOpPrompt ?? false,
+          onFailure: (reason) => {
+            opFailure ??= reason;
+          },
         });
         const value =
           resolved[this.envVar] ?? this.aliases.map((a) => resolved[a]).find((v) => !!v);
@@ -212,21 +285,26 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
           // Write-through mirror: child processes inherit this, no re-resolve.
           process.env[this.envVar] = value;
           this.cachedKey = value;
-          return value;
+          return { key: value };
         }
         // op source EXISTS but resolution came back empty — this can be a
         // TRANSIENT op-auth failure (onAuthFailure:"skip" swallows it). Do NOT
         // cache the miss, or a single early failure would mark the provider
         // permanently unavailable. Return "" WITHOUT caching so the next call
         // retries (e.g. once the 1Password desktop handshake completes).
-        return "";
+        //
+        // The keychain failure is reported only when 1Password did not fail
+        // too: one reason is a remedy the user can act on, two are a list to
+        // triage. 1Password wins because it is the step that actually answered
+        // last for this key.
+        return { key: "", failure: opFailure ?? keychainFailure };
       }
       // No op source at all → the empty result is stable and safe to cache,
       // UNLESS the keychain step above failed rather than simply missing: that
       // failure is transient, so leave the result uncached and let the next
       // call retry once the keychain is unlocked.
-      if (!keychainFailed) this.cachedKey = "";
-      return "";
+      if (!keychainFailure) this.cachedKey = "";
+      return { key: "", failure: keychainFailure };
     })();
 
     try {
@@ -236,17 +314,35 @@ export class ApiKeyCredentialProvider implements CredentialProvider {
     }
   }
 
-  async isAvailable(opts?: { allowOpPrompt?: boolean }): Promise<boolean> {
+  /**
+   * Three-valued readiness. `isAvailable()` below is its `=== "present"`
+   * projection, so the two cannot disagree about whether this provider routes.
+   *
+   * The ORDER of the cheap checks is the same as it always was, and it matters
+   * for more than speed: a key already in env/config, or an oauth file on disk,
+   * makes the provider `present` without ever touching a vault — so a broken
+   * keychain or a denied 1Password cannot downgrade a provider that was never
+   * going to ask them.
+   */
+  async describeReadiness(opts?: { allowOpPrompt?: boolean }): Promise<ReadinessResult> {
     // A provider that takes no credential is always available. Checked FIRST and
     // before any resolution, because there is nothing to resolve: reaching the
     // env/config/oauth/1Password chain for it would be pure cost, and on the
     // 1Password step a real prompt for a key that does not exist.
-    if (this.authScheme === "none") return true;
+    if (this.authScheme === "none") return { readiness: "present" };
     // Cheap checks first — avoid the op pull when an oauth file already qualifies.
-    if (this.resolveFromEnvConfig()) return true;
-    if (this.hasOauthFallbackFile()) return true;
-    const key = await this.resolveKey(opts);
-    return !!key;
+    if (this.resolveFromEnvConfig()) return { readiness: "present" };
+    if (this.hasOauthFallbackFile()) return { readiness: "present" };
+    const { key, failure } = await this.resolveKeyDetailed(opts);
+    if (key) return { readiness: "present" };
+    // No key AND no failure means every store answered and none holds one —
+    // which is the ordinary state of every provider the user has not set up,
+    // and must stay `absent`.
+    return failure ? { readiness: "failed", detail: failure } : { readiness: "absent" };
+  }
+
+  async isAvailable(opts?: { allowOpPrompt?: boolean }): Promise<boolean> {
+    return (await this.describeReadiness(opts)).readiness === "present";
   }
 
   invalidate(): void {

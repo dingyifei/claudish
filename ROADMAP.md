@@ -590,3 +590,46 @@ never `git checkout` or `git stash`, the index is shared with sibling worktrees.
 executed the truncated `Write` and returned `InputValidationError`, while the fixed build
 executed no tool at all and retried the turn. Method and raw evidence:
 `ai-docs/reports/truncated-toolcall-live-verification.md`.
+
+## Picker: the `all-filtered` notice must say "no capability data", not "not chat-capable"
+
+Status: not started. Found in the v10.1.1 release review (merge of the strict chat rule with v10.1.0's picker outcome states).
+
+`buildDiscoveredModelOutcome` (`model-selector.ts`) returns `all-filtered` whenever every served row fails `isReportedChatCapable`, and `DiscoveryNotice.tsx` renders it as "served N models, none of them chat-capable". That wording dates from when an undescribed model counted as chat. Under the strict rule it also fires when nobody DESCRIBED the rows: LM Studio's picker path reads `/v1/models` (no `type` field) while `--probe` reads `/api/v0/models` and its `type`, so the two screens disagree about the same daemon. Hiding the rows is correct; the sentence is false. Carry the undescribed count (`unavailableForMissingCapability` already computes it for the probe path) on the variant and word the notice from it; optionally read LM Studio's `type` in the picker fetcher too.
+
+**Trigger condition**: the next change to `buildDiscoveredModelOutcome` or `DiscoveryNotice.tsx`, or the first user report of a picker notice calling local models not chat-capable.
+
+## Picker tests: cover admission by catalog evidence alone
+
+Status: not started. Found in the same review.
+
+No picker-level test covers an `openai-models-list` provider (13 builtins plus LM Studio), whose discovered rows carry no `reported` and are admitted by the catalog alone; only the negative case is tested. `model-selector-discovery.test.ts` also now uses `mock.module("…/all-models-cache.js")` (contained, restored in `afterAll`), and its STATE C endpoint assertion is circular because the fixture sets the endpoint. Add a positive case (a served id the catalog fixture knows by alias is kept with no `reported`), assert the endpoint on a path the fixture does not control, and replace the module mock with a test-only catalog hook like `catalog-client`'s `_setCatalogEntriesForTest`.
+
+**Trigger condition**: before the next change to the discovered-row admission path, or with the item above.
+
+## MCP pane children: follow-ups deferred from the 10.4.0 migration
+
+Status: not started. Deferred during code review of the pane migration (PR #288); each line names the
+finding id in `ai-docs/reports/mcp-magmux-panes/session-record/implementation-log.md` ("Code-review fixes
+(iteration 1)"), where the reason is recorded.
+
+- **Background-shell orphan between refreshes.** A shell started and orphaned between two 2 s group refreshes
+  is never recorded in the pane's group file, so the watcher cannot reap it. Trigger: any report of a
+  leftover process after a pane closed, or the next change to `pane-registry.ts` group snapshots.
+- **A-L2 — shutdown reap ≈ 6–7 s instead of ≈ 3 s.** Watchers already cover an early SIGKILL. Trigger: an MCP
+  host that kills the server before ~7 s on shutdown.
+- **A-L5 — spurious re-wake after a screen-only settle.** Needs a deterministic degraded-mode fixture.
+  Trigger: a degraded (no-transcript) turn reported as a model re-wake in the field.
+- **A-L9 — a prompt starting `/word ` is typed as a slash command.** Needs a product decision (escape it, or
+  document it). Trigger: the first prompt that starts with a slash but is not a command.
+- **B-L4 — `run_id` falls back to the basename before the first flush.** Needs the id minted before
+  prehydrate. Trigger: the next change to `team(mode="run")` start-up ordering.
+- **C-L1 — an `invalid_args` spawn model is recorded as `pane_lost`.** Trigger: the next change to
+  `create_session` argument handling.
+- **C-L5 — accounting freezes at the terminal transition.** The Magus monitor reads `tokens.json`, so it is
+  unaffected today. Trigger: a consumer that reads final tokens from the session row instead.
+- **gpt-5-mini cost is estimated** (`stats/*.json` prices it at $2/$8 per M with `is_estimated:true`), so
+  `cost_usd` may be overstated for it. Trigger: the catalog publishing real gpt-5-mini pricing.
+- **`proxy-server.test.ts` "keyless custom endpoint" timed out at 5 s in CI** (once, on PR #288; it
+  passes 3/3 locally; main's own CI also failed once on 2026-09-26, cause not checked). Trigger: a second
+  CI failure of that test.

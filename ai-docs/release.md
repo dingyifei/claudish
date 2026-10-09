@@ -58,6 +58,21 @@ the GitHub Release as a prerelease, which is the only variant.
 `test.yml` triggers only on `pull_request` and `push` to `main`. The tag is
 therefore the gate: everything must be green before the tag leaves the machine.
 
+**The PR run tests a merge preview, not the merge commit.** On `pull_request`,
+`test.yml` checks out GitHub's merge of the PR head into `main`. Before tagging,
+confirm the merge commit's tree equals
+`git merge-tree --write-tree <main before the merge> <tested PR head>`; if `main`
+moved in between, the tag would mark an untested tree.
+
+**Local gates do not replace the clean runner.** Run `bun run typecheck` again
+after the LAST test file lands, not only after the source change. Treat CI as the
+only neutral environment for tests that touch credentials or `~/.claudish`
+caches: a developer machine (and a claudish-spawned session even more) carries
+state a clean runner lacks. The 10.3.0 PR needed four CI runs for three faults
+no local run showed — a test reading `~/.claudish/probe-models.json`, a type
+error in a test written after the last typecheck, and a global `fetch` stub
+counting a background request only a clean runner makes.
+
 npm publishing uses OIDC trusted publishing, so no `NPM_TOKEN` exists and nothing
 can be published from a developer machine. `HOMEBREW_TAP_TOKEN` is the only
 release secret, and only the tap job uses it.
@@ -89,7 +104,10 @@ Verification.
   commit on `main`, not at a branch head.
 - `npm view claudish version` and `npm view claudish dist-tags` — npm only moves
   `latest` to the highest semver, so a publish that leaves `latest` behind is
-  invisible to `npm i`.
+  invisible to `npm i`. A 404 right after the job prints `+ claudish@X.Y.Z` is
+  propagation, not a failed publish: for 10.3.0 each package appeared 1 to 6
+  minutes later. Poll for up to 15 minutes before treating a package as missing,
+  and read the job log's `+ <package>@<version>` lines to tell the two apart.
 - `npm view @claudish/magmux-darwin-arm64 versions` and its three siblings — this
   is the check the swallowed publish failure above makes necessary.
 - `gh release view vX.Y.Z` — exists, not a draft, assets attached.
@@ -125,9 +143,12 @@ Two constraints hold regardless of who authorises:
   shared with the main checkout and every sibling worktree. Never `git stash`
   during a release; use a WIP commit.
 
-TODO — not settled by detection, and worth answering on the next release:
-- whether a failed magmux download from `MadAppGang/magmux` should block a release
-  or pin to a known-good magmux tag instead of `latest`.
+SETTLED 2026-09-23 — the magmux source. The build keeps downloading the LATEST
+release of `MadAppGang/magmux`; it is not pinned to a known-good tag. A failed
+download, or a latest release missing a platform asset, BLOCKS the release: the
+build job fails before anything publishes, which is the intended behaviour and
+needs no workflow change. Decided by the repository owner when asked during the
+v10.0.2 release. Preflight checks it by listing the latest release's assets.
 
 SETTLED 2026-09-15 — the two `displayWidth` tests in
 `packages/cli/src/tui/viz/color.test.ts`. They were NOT flaky and must NOT be
@@ -143,4 +164,4 @@ not the pinned one, so the local red is gone and the gate's coverage is not.
 When the Bun pin is bumped, RE-BASELINE those budgets against the new oracle.
 Never widen them to clear a red run: the budget is the whole assertion.
 
-verified: 2026-09-15 @ 13c858e
+verified: 2026-09-24 @ b0ab89f

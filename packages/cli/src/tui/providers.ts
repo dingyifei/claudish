@@ -6,6 +6,12 @@
 import { hasSharedAntigravityToken } from "../auth/antigravity-token.js";
 import { type CredentialSource, describeSourceSync } from "../auth/credentials/source.js";
 import { hasOAuthCredentials } from "../auth/oauth-registry.js";
+import {
+  VERTEX_SET_PROJECT_REMEDY,
+  describeVertexProjectSource,
+  hasVertexAdcCredentials,
+  peekVertexProjectOrigin,
+} from "../auth/vertex-auth.js";
 import { hasDevinCredentials } from "../providers/devin/devin-credentials.js";
 import type { LocalLiveness } from "../providers/local-liveness.js";
 import { type ProviderDefinition, getAllProviders } from "../providers/provider-definitions.js";
@@ -179,14 +185,21 @@ export function providerAuthCapabilities(
   // render the row as "not configurable" for a user who is signed in. Relaxing
   // the local expression is the narrow fix; adding a slug would advertise a
   // `claudish login devin` command that does not exist.
-  const oauthSupported = !!p.oauthSlug || p.catalogName === "devin";
+  // Vertex joins Devin here for the same reason: it is token-authenticated
+  // (Application Default Credentials, or a service-account file) with no
+  // claudish-side login, so it declares no oauthLoginSlug — but a row rendering
+  // "no auth method available" for a machine that holds a live `ya29…` token is
+  // the wrong statement, and the `l` keybinding stays gated on `oauthSlug` so no
+  // `claudish login vertex` is advertised.
+  const oauthSupported = !!p.oauthSlug || p.catalogName === "devin" || p.catalogName === "vertex";
   // Antigravity's OAuth token is in the shared keychain, not an oauth-file — so
   // hasOAuthCredentials can't see it; check the keychain directly (memoized).
   const oauthSet =
     oauthSupported &&
     (hasOAuthCredentials(p.catalogName) ||
       (p.catalogName === "antigravity" && hasSharedAntigravityToken()) ||
-      (p.catalogName === "devin" && hasDevinCredentials()));
+      (p.catalogName === "devin" && hasDevinCredentials()) ||
+      (p.catalogName === "vertex" && hasVertexAdcCredentials()));
   return {
     apiKey: { supported: apiKeySupported, set: apiKeySet },
     oauth: { supported: oauthSupported, set: oauthSet },
@@ -194,7 +207,35 @@ export function providerAuthCapabilities(
 }
 
 /**
- * The provider roster, built LIVE from the catalog on every call.
+ * One line naming WHERE this provider's credential came from, for providers the
+ * generic `Env: <VAR>` / `From: env|config` row cannot describe.
+ *
+ * Returns undefined for every env-var provider, so the detail pane is unchanged
+ * for them. Vertex is the case it exists for: its `apiKeyEnvVar` is a Google
+ * Cloud PROJECT id, resolvable from the ADC file or `gcloud config`, and there
+ * is NO API key to go and find — the Express mode was deleted on 2026-09-21, so
+ * "Env: VERTEX_PROJECT" plus "Get Key" sent the reader after a credential that
+ * does not exist.
+ *
+ * Sync and free of subprocesses (see `peekVertexProjectOrigin`), so it is safe
+ * on a render path.
+ */
+export function providerCredentialNote(p: ProviderDef): string | undefined {
+  if (p.catalogName !== "vertex") return undefined;
+  const origin = peekVertexProjectOrigin();
+  if (!origin) {
+    // The two failures are different and so are their fixes: a credential that
+    // signs nothing, versus a signed credential with nowhere to send it. Neither
+    // sentence mentions an API key, because there is none to find.
+    return hasVertexAdcCredentials()
+      ? `ADC present, no project — ${VERTEX_SET_PROJECT_REMEDY}`
+      : `No credential — run \`gcloud auth application-default login\`, then ${VERTEX_SET_PROJECT_REMEDY}`;
+  }
+  return `Project ${origin.projectId} from ${describeVertexProjectSource(origin)}`;
+}
+
+/**
+ * The provider list, built LIVE from the catalog on every call.
  *
  * It used to be a module-load-time `const`, and that made it a snapshot taken
  * before `ensureEndpointsRegistered()` had run — so a runtime provider (a

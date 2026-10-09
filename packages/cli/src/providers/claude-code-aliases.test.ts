@@ -1,5 +1,49 @@
 import { describe, expect, test } from "bun:test";
-import { claudeCodeTierAlias, normalizeNativeModelSpec } from "./claude-code-aliases.js";
+import {
+  CLAUDE_CODE_MODEL_ALIASES,
+  claudeCodeTierAlias,
+  isClaudeCodeModelName,
+  normalizeNativeModelSpec,
+} from "./claude-code-aliases.js";
+
+describe("isClaudeCodeModelName", () => {
+  test("pins Claude Code's model alias list", () => {
+    expect(CLAUDE_CODE_MODEL_ALIASES).toEqual([
+      "opus",
+      "sonnet",
+      "haiku",
+      "internal",
+      "default",
+      "opusplan",
+      "best",
+    ]);
+  });
+
+  test("accepts every alias with and without the 1M-context suffix", () => {
+    for (const alias of CLAUDE_CODE_MODEL_ALIASES) {
+      expect(isClaudeCodeModelName(alias), alias).toBe(true);
+      expect(isClaudeCodeModelName(`${alias}[1m]`), `${alias}[1m]`).toBe(true);
+    }
+  });
+
+  test("accepts concrete claude ids, including dated and 1M-context ids", () => {
+    for (const model of ["claude-opus-5", "claude-haiku-4-5-20251001", "claude-opus-4-6[1m]"]) {
+      expect(isClaudeCodeModelName(model), model).toBe(true);
+    }
+  });
+
+  test("ignores case and surrounding whitespace", () => {
+    for (const model of [" OPUS ", " Sonnet[1M] ", " CLAUDE-OPUS-5 "]) {
+      expect(isClaudeCodeModelName(model), model).toBe(true);
+    }
+  });
+
+  test("rejects foreign, incomplete, empty, and provider-like names", () => {
+    for (const model of ["o4-mini", "swe-1.7", "gpt-5", "claude", "", "@model"]) {
+      expect(isClaudeCodeModelName(model), model).toBe(false);
+    }
+  });
+});
 
 describe("claudeCodeTierAlias", () => {
   test("maps every Claude Code alias to its tier", () => {

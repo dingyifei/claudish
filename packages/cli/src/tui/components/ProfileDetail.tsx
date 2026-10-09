@@ -55,10 +55,14 @@ export function ProfileDetail({ config, profileIndex }: ProfileDetailProps) {
                 <span fg={C.blue} attributes={A.bold}>
                   {`${label}: `}
                 </span>
+                {/* An unmapped role sends whatever model the session would (the
+                    --model default, else Claude Code's own), and that name is
+                    routed as every name is: native, a user rule, or the catalog.
+                    There is no routing table to consult. */}
                 {isAuto ? (
                   <>
                     <span fg={C.yellow}>(auto-route</span>
-                    <span fg={C.dim}> — uses routing table</span>
+                    <span fg={C.dim}> — calculated per model · Routing → p shows the chain</span>
                     <span fg={C.yellow}>)</span>
                   </>
                 ) : (

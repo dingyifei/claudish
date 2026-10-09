@@ -1,6 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { resolveDefaultProvider } from "./default-provider.js";
 import type { ClaudishProfileConfig } from "./profile-config.js";
+
+const STAGE4_CATALOG_FIXTURE = join(
+  import.meta.dir,
+  "test-fixtures",
+  "stage4-default-provider-catalog.json"
+);
+const CLI_ENTRY = join(import.meta.dir, "index.ts");
 
 function makeConfig(overrides: Partial<ClaudishProfileConfig> = {}): ClaudishProfileConfig {
   return {
@@ -41,6 +51,44 @@ describe("resolveDefaultProvider precedence", () => {
     expect(result.provider).toBe("from-env");
     expect(result.source).toBe("env-var");
     expect(result.legacyAutoPromoted).toBe(false);
+  });
+
+  test("an empty env var disables the fallback and keeps the env-var source", () => {
+    expect(
+      resolveDefaultProvider({
+        config: makeConfig(),
+        env: { CLAUDISH_DEFAULT_PROVIDER: "" },
+      })
+    ).toEqual({ provider: "", source: "env-var", legacyAutoPromoted: false });
+  });
+
+  test("an empty config value disables the fallback and keeps the config-file source", () => {
+    expect(
+      resolveDefaultProvider({ config: makeConfig({ defaultProvider: "" }), env: {} })
+    ).toEqual({
+      provider: "",
+      source: "config-file",
+      legacyAutoPromoted: false,
+    });
+  });
+
+  test("an empty env var beats a non-empty config value", () => {
+    expect(
+      resolveDefaultProvider({
+        config: makeConfig({ defaultProvider: "from-config" }),
+        env: { CLAUDISH_DEFAULT_PROVIDER: "" },
+      })
+    ).toEqual({ provider: "", source: "env-var", legacyAutoPromoted: false });
+  });
+
+  test("a non-empty CLI flag beats an empty env var", () => {
+    expect(
+      resolveDefaultProvider({
+        cliFlag: "from-flag",
+        config: makeConfig({ defaultProvider: "from-config" }),
+        env: { CLAUDISH_DEFAULT_PROVIDER: "" },
+      })
+    ).toEqual({ provider: "from-flag", source: "cli-flag", legacyAutoPromoted: false });
   });
 
   test("config wins over legacy", () => {
@@ -125,8 +173,88 @@ describe("resolveDefaultProvider precedence", () => {
   });
 });
 
-describe("buildLegacyHint (commit 5: now a no-op)", () => {
-  // Pre-commit-5, this returned a stderr hint when legacyAutoPromoted=true.
-  // Since LiteLLM auto-promotion was removed, the function always returns
-  // null — kept for backwards-compat with existing callers.
+interface ProbeJson {
+  chain: Array<{ provider: string }>;
+  dropped: Array<{
+    provider: string;
+    position: "candidate" | "fallback";
+    label: string;
+    outcome: string;
+  }>;
+}
+
+function sandboxedProbe(flagBeforeProbe: boolean, provider: string): ProbeJson {
+  const home = mkdtempSync(join(tmpdir(), "claudish-default-provider-probe-"));
+  const configDir = join(home, ".claudish");
+  mkdirSync(configDir, { recursive: true });
+  copyFileSync(STAGE4_CATALOG_FIXTURE, join(configDir, "cloud-models-catalog-v3.json"));
+  writeFileSync(
+    join(configDir, "config.json"),
+    JSON.stringify({ version: "1.0.0", defaultProfile: "default", profiles: {} }),
+    "utf8"
+  );
+
+  const flag = ["--default-provider", provider];
+  const probe = ["--probe", "no-such-model-xyz"];
+  const args = flagBeforeProbe
+    ? [CLI_ENTRY, ...flag, ...probe, "--json", "--no-probe"]
+    : [CLI_ENTRY, ...probe, ...flag, "--json", "--no-probe"];
+  const env: Record<string, string> = {
+    HOME: home,
+    PATH: process.env.PATH ?? "",
+    TMPDIR: process.env.TMPDIR ?? tmpdir(),
+    CLAUDISH_DISABLE_CATALOG_WARM: "1",
+    CLAUDISH_DISABLE_KEYCHAIN: "1",
+    CLAUDISH_DISABLE_OP: "1",
+    CLAUDISH_SKIP_LIVE_E2E: "1",
+  };
+
+  try {
+    const result = Bun.spawnSync([process.execPath, ...args], {
+      cwd: join(import.meta.dir, "../../.."),
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = result.stdout.toString();
+    const stderr = result.stderr.toString();
+    expect(result.exitCode, stderr || stdout).toBe(0);
+    const parsed = JSON.parse(stdout) as ProbeJson[];
+    expect(parsed).toHaveLength(1);
+    return parsed[0];
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+describe("--default-provider pre-scan reaches --probe", () => {
+  test("uses poe when the flag appears before --probe", () => {
+    const result = sandboxedProbe(true, "poe");
+    expect([...result.chain, ...result.dropped].map((entry) => entry.provider)).toEqual(["poe"]);
+    expect(result.dropped).toEqual([
+      expect.objectContaining({
+        provider: "poe",
+        position: "fallback",
+        label: "fallback",
+        outcome: "no-credential",
+      }),
+    ]);
+  });
+
+  test("uses poe when the flag appears after the probed model", () => {
+    const result = sandboxedProbe(false, "poe");
+    expect([...result.chain, ...result.dropped].map((entry) => entry.provider)).toEqual(["poe"]);
+    expect(result.dropped).toEqual([
+      expect.objectContaining({
+        provider: "poe",
+        position: "fallback",
+        label: "fallback",
+        outcome: "no-credential",
+      }),
+    ]);
+  });
+
+  test("an empty flag value produces an empty chain", () => {
+    expect(sandboxedProbe(true, "").chain).toEqual([]);
+  });
 });

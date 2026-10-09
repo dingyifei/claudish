@@ -27,13 +27,16 @@ import { LiteLLMAPIFormat } from "../adapters/litellm-api-format.js";
 import { lookupModelEndpoint } from "../adapters/model-catalog.js";
 import { OllamaAPIFormat } from "../adapters/ollama-api-format.js";
 import { OpenAIAPIFormat } from "../adapters/openai-api-format.js";
-import { getVertexConfig, validateVertexOAuthConfig } from "../auth/vertex-auth.js";
+import {
+  resolveVertexConfig,
+  selectVertexAuthMode,
+  validateVertexOAuthConfig,
+} from "../auth/vertex-auth.js";
 import { ComposedHandler } from "../handlers/composed-handler.js";
 import type { ModelHandler } from "../handlers/types.js";
 import { log, logStderr } from "../logger.js";
-import { formatProvenanceLog, resolveApiKeyProvenance } from "./api-key-provenance.js";
+import { formatProvenanceLog, resolveCredentialProvenance } from "./api-key-provenance.js";
 import { getProviderByName } from "./provider-definitions.js";
-import { getRegisteredRemoteProviders } from "./remote-provider-registry.js";
 import { getRuntimeProfiles } from "./runtime-providers.js";
 import { AnthropicProviderTransport } from "./transport/anthropic-compat.js";
 import { AntigravityProviderTransport } from "./transport/antigravity.js";
@@ -44,7 +47,8 @@ import { LiteLLMProviderTransport } from "./transport/litellm.js";
 import { OllamaProviderTransport } from "./transport/ollamacloud.js";
 import { OpenAICodexTransport } from "./transport/openai-codex.js";
 import { OpenAIProviderTransport } from "./transport/openai.js";
-import { OpenCodeZenTransport } from "./transport/opencode-zen.js";
+import { OpenCodeZenMessagesTransport, OpenCodeZenTransport } from "./transport/opencode-zen.js";
+import { PoeProvider } from "./transport/poe.js";
 import { VertexProviderTransport, parseVertexModel } from "./transport/vertex-oauth.js";
 
 // ---------------------------------------------------------------------------
@@ -71,7 +75,7 @@ export interface ProfileContext {
    *
    * `requiresResponsesApi` reads the model catalog, which made the composition
    * table in `provider-profiles.test.ts` depend on whichever
-   * `~/.claudish/all-models.json` the machine happened to have. That is the
+   * `~/.claudish/cloud-models-catalog-v3.json` the machine happened to have. That is the
    * v7.43.0 trap: green on every dev box, and a different answer on a cold CI
    * runner. Passing a fixture path here keeps that table hermetic.
    */
@@ -105,6 +109,23 @@ export interface ProviderProfile {
    * Returning null causes proxy-server.ts to skip caching and fall through.
    */
   createHandler(ctx: ProfileContext): ModelHandler | null;
+}
+
+/**
+ * A profile whose construction needs I/O before it can build anything.
+ *
+ * Only Vertex needs this: its endpoint is built from a project that may have to
+ * be read out of the ADC file or `gcloud config`. Kept as a SEPARATE type rather
+ * than widening `ProviderProfile.createHandler` to a union, because a union
+ * return type would force every existing caller of a sync profile to disambiguate
+ * a Promise it will never receive.
+ *
+ * `LazyHandlerFactory` (provider-definitions.ts) already returns a Promise, so a
+ * definition wires this exactly like a sync profile and nothing downstream
+ * changes.
+ */
+export interface AsyncProviderProfile {
+  createHandler(ctx: ProfileContext): Promise<ModelHandler | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,13 +232,14 @@ export const devinProfile: ProviderProfile = {
  * `openaiCodexProfile` builds `CodexAPIFormat` unconditionally and never calls
  * this function at all.
  *
- * Pick the verification model carefully. /v1/models is a CATALOGUE, not a served
- * set: of those six ids, only `gpt-5.3-codex` actually answers 200 on
+ * Pick the verification model carefully. /v1/models is a dynamic models catalog,
+ * NOT an entitlement: of those six ids, only `gpt-5.3-codex` actually answers 200 on
  * /v1/responses for the developer's account — the rest return 404 "Model not
  * found" there, and `gpt-5-codex` is additionally reported DEPRECATED on
  * /v1/chat/completions. Testing against any of them looks exactly like "the
- * routing fix did not work" when the model is simply not being served. Same
- * catalogue-vs-served-set trap the Antigravity and Devin providers document.
+ * routing fix did not work" when the model is simply not being served. It is the
+ * same dynamic-models-catalog-vs-entitlement trap the Antigravity and Devin
+ * providers document.
  *
  * THE CATALOG MAY ONLY WIDEN THIS GATE, NEVER NARROW IT. The name rule stays an
  * unconditional `||` below for the reason above: the transport routes every
@@ -240,7 +262,7 @@ export const devinProfile: ProviderProfile = {
  * opinion to read.
  *
  * @param cachePath Test seam. Points the catalog lookup at a fixture, so a test
- *   never depends on a warm `~/.claudish/all-models.json`.
+ *   never depends on a warm `~/.claudish/cloud-models-catalog-v3.json`.
  */
 export function requiresResponsesApi(modelName: string, cachePath?: string): boolean {
   const endpoint = lookupModelEndpoint(modelName, "openai", cachePath);
@@ -307,6 +329,18 @@ export const openaiProfile: ProviderProfile = {
   },
 };
 
+export const poeProfile: ProviderProfile = {
+  createHandler(ctx) {
+    const transport = new PoeProvider();
+    const adapter = new OpenAIAPIFormat(ctx.modelName);
+    return new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
+      adapter,
+      tokenStrategy: "delta-aware",
+      ...ctx.sharedOpts,
+    });
+  },
+};
+
 /** OpenAI Codex — uses the Responses API (/v1/responses) with CodexAPIFormat.
  *  Uses OpenAICodexTransport which checks for OAuth credentials first (ChatGPT subscription),
  *  falling back to API key (OPENAI_CODEX_API_KEY). */
@@ -354,65 +388,46 @@ export const glmProfile: ProviderProfile = {
 };
 
 /**
- * OpenCode Zen / Zen Go — two tiers:
- *   zen/  (opencode-zen):    OPENCODE_API_KEY
- *   zgo/  (opencode-zen-go): go-plan models (glm-5, minimax-m2.5, kimi-k2.5) via zen/go/v1/
- *
- * ZEN REQUIRES A REAL KEY (changed 2026-08-22). The catalog used to declare
- * `publicKeyFallback: "public"`, so the credential authority emitted the literal
- * string "public" whenever no real key resolved and `ctx.apiKey` was always
- * populated here. Measured: the endpoint answers `401 — Missing API key` to
- * that token, so the "free anonymous" tier it modelled does not exist (or no
- * longer does). The affordance is removed entirely; `ctx.apiKey` can now be
- * empty here, exactly as for any other keyed provider without a key.
- *
- * Model routing inside the profile:
- *   - GPT-* models    → OpenCodeZenTransport (/v1/responses) + CodexAPIFormat (Responses API)
- *   - All other models → OpenCodeZenTransport (/v1/chat/completions) + OpenAIAPIFormat (delta-aware)
- *
- * Both branches use OpenCodeZenTransport, the OpenAI transport plus the per-conversation
- * `x-opencode-session` header that Zen Go answers `400 MissingSessionID` without.
- *
- * MiniMax models take the SAME OpenAI path as everything else. They briefly had
- * their own Anthropic branch (AnthropicProviderTransport + AnthropicAPIFormat),
- * added to cure a `401 {"type":"AuthError","message":"Missing API key."}` — but
- * that 401 was purely an auth-HEADER problem: the Anthropic transport defaults to
- * `x-api-key` and only sends Bearer when the provider declares
- * `authScheme: "bearer"`, which neither Zen definition does (their own OpenAI
- * transport is Bearer-only, so they never needed to). Swapping in an entire
- * transport+format pair to fix a header carried an endpoint assumption that does
- * not hold here: AnthropicProviderTransport builds its URL as
- * `baseUrl + provider.apiPath`, and BOTH Zen tiers declare
- * `apiPath: "/v1/chat/completions"`. So an Anthropic-shaped body was being posted
- * to an OpenAI endpoint.
- *
- * That survived verification because a tool-free Anthropic body is close enough to
- * an OpenAI one to be accepted. Tools are where the shapes diverge: Anthropic tools
- * carry `input_schema` and NO `type` field, and MiniMax validates them OpenAI-style,
- * reporting the missing type as empty. Measured live 2026-08-08 against
- * `opencode.ai/zen/go/v1/chat/completions`:
- *
- *   anthropic body + tools  → 400 "invalid params, invalid tool type:  (2013)"
- *   anthropic body, NO tools → 200        ← why the original fix looked correct
- *   openai body + tools      → 200
- *   openai body + tools + stream → 200, real tool_calls frames (m2.5 and m3)
- *   anthropic body → /v1/messages → 401 AuthError (no usable Anthropic route)
- *
- * Every Claude Code request carries tools, so this failed 100% of real turns. The
- * non-Go tier is structurally identical (same apiPath, same transport) and shares
- * the fix; it could not be re-measured without an OPENCODE_API_KEY.
+ * OpenCode Zen and Go use model-specific wire APIs. The official endpoint tables
+ * assign Qwen to Messages on both products, MiniMax to Messages on Go, GPT to
+ * Responses, and most other listed families to Chat Completions. All paths
+ * carry a stable per-conversation session header and the resolved product key.
  */
 export const openCodeZenProfile: ProviderProfile = {
   createHandler(ctx) {
     const zenApiKey = ctx.apiKey;
     const isGoProvider = ctx.provider.name === "opencode-zen-go";
+    const model = ctx.modelName.toLowerCase();
+
+    // OpenCode serves these model families over its Anthropic Messages endpoint.
+    // The Go MiniMax route differs from the metered Zen route.
+    if (
+      model.startsWith("qwen3") ||
+      (!isGoProvider && model.startsWith("claude-")) ||
+      (isGoProvider && model.startsWith("minimax-"))
+    ) {
+      const messagesProvider = {
+        ...ctx.provider,
+        apiPath: "/v1/messages",
+        authScheme: "x-api-key" as const,
+      };
+      const transport = new OpenCodeZenMessagesTransport(messagesProvider, zenApiKey);
+      const adapter = new AnthropicAPIFormat(ctx.modelName, ctx.provider.name);
+      return new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
+        adapter,
+        ...ctx.sharedOpts,
+      });
+    }
 
     // GPT and Muse Spark models are served via the OpenAI Responses API (/v1/responses), not
     // /v1/chat/completions. Measured 2026-09-19 on Zen Go, `muse-spark-1.3-contributor`:
     // chat/completions -> 500 "Internal server error" (with or without tools), /v1/responses
-    // -> 200 with a real `function_call` item.
-    const lowerModel = ctx.modelName.toLowerCase();
-    if (lowerModel.startsWith("gpt-") || lowerModel.startsWith("muse-")) {
+    // -> 200 with a real `function_call` item. Metered Zen also serves grok-* this way.
+    if (
+      model.startsWith("gpt-") ||
+      model.startsWith("muse-") ||
+      (!isGoProvider && model.startsWith("grok-"))
+    ) {
       const responsesProvider = { ...ctx.provider, apiPath: "/v1/responses" };
       const transport = new OpenCodeZenTransport(responsesProvider, ctx.modelName, zenApiKey);
       const adapter = new CodexAPIFormat(ctx.modelName);
@@ -475,72 +490,57 @@ export const litellmProfile: ProviderProfile = {
 };
 
 /**
- * Vertex AI — supports two modes:
- *   1. Express Mode (VERTEX_API_KEY) — uses the Gemini API endpoint with a Vertex key.
- *      Uses GeminiProviderTransport (with the gemini provider config) + GeminiAPIFormat.
- *   2. OAuth Mode (VERTEX_PROJECT) — full project-based access with OAuth tokens.
- *      Uses VertexProviderTransport + publisher-specific format (Gemini/Anthropic/Default).
+ * Vertex AI — ONE mode: OAuth over a Google Cloud project.
  *
- * Returns null if neither key nor project config is available.
+ * Uses VertexProviderTransport + a publisher-specific format
+ * (Gemini/Anthropic/Default). The project comes from `resolveVertexConfig`
+ * (VERTEX_PROJECT, the ADC file's quota_project_id, or `gcloud config`), and the
+ * token from the credential authority via the transport.
+ *
+ * The Express API-key mode (VERTEX_API_KEY on the plain Gemini endpoint) was
+ * deleted on 2026-09-21. Returns null when no project resolves or no ADC /
+ * service-account credential is present, having logged which of the two it was.
+ *
+ * ASYNC because project resolution is: it may read the ADC file or shell out to
+ * gcloud. That is why this is an AsyncProviderProfile rather than a
+ * ProviderProfile — the sync contract every other provider meets cannot express
+ * an I/O-backed endpoint.
  */
-export const vertexProfile: ProviderProfile = {
-  createHandler(ctx) {
-    const hasApiKey = !!process.env.VERTEX_API_KEY;
-    const vertexConfig = getVertexConfig();
-
-    if (hasApiKey) {
-      // Express Mode — Vertex Express uses the standard Gemini API endpoint
-      // but with VERTEX_API_KEY instead of GEMINI_API_KEY.
-      // Must use the Gemini provider config (which has the correct baseUrl/apiPath)
-      // because the vertex provider config has empty baseUrl/apiPath (designed for OAuth mode).
-      const geminiConfig = getRegisteredRemoteProviders().find((p) => p.name === "gemini");
-      const expressProvider = geminiConfig || ctx.provider;
-      // ctx.apiKey is the authority-resolved Vertex credential (Express key when
-      // VERTEX_API_KEY is set) — single source of truth, no raw env read here.
-      const transport = new GeminiProviderTransport(expressProvider, ctx.modelName, ctx.apiKey);
-      const adapter = new GeminiAPIFormat(ctx.modelName);
-      const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
-        adapter,
-        ...ctx.sharedOpts,
-      });
-      log(`[Proxy] Created Vertex AI Express handler (composed): ${ctx.modelName}`);
-      return handler;
+export const vertexProfile: AsyncProviderProfile = {
+  async createHandler(ctx) {
+    const configError = await validateVertexOAuthConfig();
+    const vertexConfig = await resolveVertexConfig();
+    if (
+      configError ||
+      !vertexConfig ||
+      selectVertexAuthMode({ project: vertexConfig.projectId }) !== "project"
+    ) {
+      log(`[Proxy] Vertex AI is not usable: ${configError ?? "no Google Cloud project resolved"}`);
+      return null;
     }
 
-    if (vertexConfig) {
-      // OAuth Mode — ComposedHandler with publisher-specific adapter
-      const oauthError = validateVertexOAuthConfig();
-      if (oauthError) {
-        log(`[Proxy] Vertex OAuth config error: ${oauthError}`);
-        return null;
-      }
-      const parsed = parseVertexModel(ctx.modelName);
-      const transport = new VertexProviderTransport(vertexConfig, parsed);
+    const parsed = parseVertexModel(ctx.modelName);
+    const transport = new VertexProviderTransport(vertexConfig, parsed);
 
-      let adapter: BaseModelAdapter;
-      if (parsed.publisher === "google") {
-        adapter = new GeminiAPIFormat(ctx.modelName);
-      } else if (parsed.publisher === "anthropic") {
-        adapter = new AnthropicAPIFormat(parsed.model, "vertex");
-      } else {
-        // Mistral/Meta use OpenAI format; Mistral rawPredict uses bare model name
-        const modelId =
-          parsed.publisher === "mistralai" ? parsed.model : `${parsed.publisher}/${parsed.model}`;
-        adapter = new DefaultAPIFormat(modelId);
-      }
-
-      const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
-        adapter,
-        ...ctx.sharedOpts,
-      });
-      log(
-        `[Proxy] Created Vertex AI OAuth handler (composed): ${ctx.modelName} [${parsed.publisher}] (project: ${vertexConfig.projectId})`
-      );
-      return handler;
+    let adapter: BaseModelAdapter;
+    if (parsed.publisher === "google") {
+      adapter = new GeminiAPIFormat(ctx.modelName);
+    } else if (parsed.publisher === "anthropic") {
+      adapter = new AnthropicAPIFormat(parsed.model, "vertex");
+    } else {
+      const modelId =
+        parsed.publisher === "mistralai" ? parsed.model : `${parsed.publisher}/${parsed.model}`;
+      adapter = new DefaultAPIFormat(modelId);
     }
 
-    log("[Proxy] Vertex AI requires either VERTEX_API_KEY or VERTEX_PROJECT");
-    return null;
+    const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
+      adapter,
+      ...ctx.sharedOpts,
+    });
+    log(
+      `[Proxy] Created Vertex AI OAuth handler (composed): ${ctx.modelName} [${parsed.publisher}] (project: ${vertexConfig.projectId})`
+    );
+    return handler;
   },
 };
 
@@ -587,10 +587,13 @@ export async function createHandlerForProvider(ctx: ProfileContext): Promise<Mod
     return null;
   }
 
-  // Log API key provenance so debug logs show exactly which key is used and where it came from
+  // Log credential provenance so debug logs show exactly which credential is in
+  // use and where it came from. Provider-aware: Vertex's `apiKeyEnvVar` holds a
+  // PROJECT id, which may come from the ADC file or `gcloud config`, so the
+  // env-only reading logged "VERTEX_PROJECT=(not set)" for a working install.
   if (ctx.provider.apiKeyEnvVar) {
-    const provenance = resolveApiKeyProvenance(ctx.provider.apiKeyEnvVar);
-    log(`[Proxy] API key: ${formatProvenanceLog(provenance)}`);
+    const provenance = resolveCredentialProvenance(definitionName, ctx.provider.apiKeyEnvVar);
+    log(`[Proxy] Credential: ${formatProvenanceLog(provenance)}`);
   }
   log(`[Proxy] Handler: provider=${ctx.provider.name}, model=${ctx.modelName}`);
 

@@ -11,11 +11,11 @@
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { TOOL_NAME_SHAPE } from "../../adapters/tool-name-utils.js";
 import { type PlanUsage, isPlanStale } from "../../auth/quota/types.js";
 import { log } from "../../logger.js";
+import { resolveTokenFilePath } from "../../session/token-file.js";
 import { type ModelPricing, getModelPricing } from "./remote-provider-types.js";
 
 export interface TokenTrackerConfig {
@@ -48,8 +48,8 @@ export interface UsageCacheDetail {
  * Strip a `provider@` routing prefix from a model spec.
  *
  * The status line renders `"<provider_name> <model_name>"`, so a model_name that
- * still carries its routing prefix names the provider twice — `qc@qwen3.7-plus`
- * under the "Qwen Plan" label reads as "Qwen Plan qc@qwen3.7-plus".
+ * still carries its routing prefix names the provider twice — `qtoken@qwen3.7-plus`
+ * under the "Alibaba Token Plan" label reads as "Alibaba Token Plan qtoken@qwen3.7-plus".
  * ComposedHandler already enforces a bare `modelName`, but a fallback override
  * comes from a transport and this is cheap insurance.
  */
@@ -521,8 +521,8 @@ export class TokenTracker {
       };
       // model_name is ALWAYS written, not just when a fallback override is active.
       // The status line's fallback for a missing key is $CLAUDISH_ACTIVE_MODEL_NAME,
-      // which is the full routed spec (`qc@qwen3.7-plus`) — rendered next to the
-      // provider label that produces "Qwen Plan qc@qwen3.7-plus". The override
+      // which is the full routed spec (`qtoken@qwen3.7-plus`) — rendered next to the
+      // provider label that produces "Alibaba Token Plan qtoken@qwen3.7-plus". The override
       // still wins when set, because a capacity fallback legitimately needs to show
       // the SUBSTITUTED model rather than the one the user asked for.
       const displayModel = stripProviderPrefix(
@@ -554,8 +554,8 @@ export class TokenTracker {
       // orchestrator spawning N children has no way to tell which file belongs
       // to which model. Pointing each child at a known path is what makes
       // per-model token/cost reporting possible.
-      const override = process.env.CLAUDISH_TOKEN_FILE;
-      const outPath = override || join(homedir(), ".claudish", `tokens-${this.port}.json`);
+      // The ONE rule the status line and the end-of-session summary read by.
+      const outPath = resolveTokenFilePath(this.port);
       mkdirSync(dirname(outPath), { recursive: true });
       writeFileSync(outPath, JSON.stringify(data), "utf-8");
     } catch (e) {

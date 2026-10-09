@@ -13,6 +13,7 @@
 
 import { Agent } from "undici";
 import { credentials } from "../../auth/credentials/authority.js";
+import { markOwnTimeout } from "../../handlers/shared/connection-error.js";
 import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
 import { log } from "../../logger.js";
 import type { LocalProvider as LocalProviderConfig } from "../../providers/provider-registry.js";
@@ -48,8 +49,24 @@ export class LocalTransport implements ProviderTransport {
   private config: LocalProviderConfig;
   private modelName: string;
   private concurrency?: number;
+  /**
+   * SUCCESS-ONLY latch: true once a probe has actually reached the server.
+   * A FAILED probe must never set it — see the comment at the end of
+   * `checkHealth()` for what setting it there made `refreshAuth()` return.
+   */
   private healthChecked = false;
   private isHealthy = false;
+  /**
+   * The last error a health probe THREW, kept so `refreshAuth()` can hand it on
+   * as a `cause`. `checkHealth()` catches its probe failures and only logs them;
+   * without this field the syscall error — the sole evidence that this was a
+   * failure to REACH the server rather than a server saying no — is destroyed
+   * inside the catch, and `classifyConnectionError` returns `null` for every
+   * ollama/lmstudio/vllm outage.
+   */
+  private lastProbeError: unknown;
+  /** The URL of the probe that failed, for the same reason. */
+  private lastProbeUrl: string | undefined;
   private _contextWindow = 32768;
 
   constructor(config: LocalProviderConfig, modelName: string, options?: { concurrency?: number }) {
@@ -112,6 +129,7 @@ export class LocalTransport implements ProviderTransport {
       key: `${this.config.name}:${this.config.baseUrl}`,
       displayName: this.displayName,
       exclude,
+      hasApiKey: Boolean(this.config.apiKey),
     };
     if (this.config.name === "ollama") {
       return discoverViaOllama(this.config.baseUrl, {
@@ -147,9 +165,17 @@ export class LocalTransport implements ProviderTransport {
     return {};
   }
 
-  async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
+  async enqueueRequest(
+    fetchFn: () => Promise<Response>,
+    opts?: { signal?: AbortSignal }
+  ): Promise<Response> {
     if (!LocalModelQueue.isEnabled()) return fetchFn();
-    return LocalModelQueue.getInstance().enqueue(fetchFn, this.name, this.concurrency);
+    return LocalModelQueue.getInstance().enqueue(
+      fetchFn,
+      this.name,
+      this.concurrency,
+      opts?.signal
+    );
   }
 
   /**
@@ -161,7 +187,20 @@ export class LocalTransport implements ProviderTransport {
 
     const healthy = await this.checkHealth();
     if (!healthy) {
-      throw new Error(this.getConnectionErrorMessage());
+      // `{ cause }` is the whole point. `classifyConnectionError` walks `.code`
+      // and then the `.cause` chain to depth 8; the sentence below carries
+      // neither a code nor any phrase the message fallback matches, so a bare
+      // `new Error(msg)` classified as `null` and a stopped Ollama reached
+      // ComposedHandler's refreshAuth catch as an unclassified failure — 401,
+      // which `isRetryableError` treats as retryable, walking the user down the
+      // fallback chain and onto metered billing while their own machine was
+      // simply not running the server.
+      throw Object.assign(
+        new Error(this.getConnectionErrorMessage(), {
+          cause: this.lastProbeError,
+        }),
+        { claudishEndpoint: this.lastProbeUrl ?? this.config.baseUrl }
+      );
     }
 
     await this.fetchContextWindow();
@@ -181,9 +220,14 @@ export class LocalTransport implements ProviderTransport {
   private async checkHealth(): Promise<boolean> {
     if (this.healthChecked) return this.isHealthy;
 
+    // Each probe attempt starts from a clean slate: a stale error from an
+    // earlier attempt must never be handed on as this failure's cause.
+    this.lastProbeError = undefined;
+    this.lastProbeUrl = undefined;
+
     // Try Ollama-specific health check first
+    const healthUrl = `${this.config.baseUrl}/api/tags`;
     try {
-      const healthUrl = `${this.config.baseUrl}/api/tags`;
       log(`[${this.displayName}] Trying health check: ${healthUrl}`);
       const response = await fetch(healthUrl, {
         method: "GET",
@@ -198,12 +242,22 @@ export class LocalTransport implements ProviderTransport {
       }
       log(`[${this.displayName}] /api/tags returned ${response.status}, trying /v1/models`);
     } catch (e: any) {
+      // KEEP the error, do not merely log it. See `lastProbeError`'s docs: this
+      // catch is where the connect evidence used to die.
+      //
+      // `markOwnTimeout` because the probe's 5 s ceiling is OURS: we asked "is
+      // anything there" and got no answer inside a window we chose, which is a
+      // reachability fact. Untagged, a `TimeoutError` is now deliberately
+      // unclassified — see `connection-error.ts`'s `NAME_KIND` header for the
+      // billing reason a transport's own inference ceiling must not be one.
+      this.lastProbeError = markOwnTimeout(e);
+      this.lastProbeUrl = healthUrl;
       log(`[${this.displayName}] /api/tags failed: ${e?.message || e}, trying /v1/models`);
     }
 
     // Try generic OpenAI-compatible health check
+    const modelsUrl = `${this.config.baseUrl}/v1/models`;
     try {
-      const modelsUrl = `${this.config.baseUrl}/v1/models`;
       log(`[${this.displayName}] Trying health check: ${modelsUrl}`);
       const response = await fetch(modelsUrl, {
         method: "GET",
@@ -217,10 +271,30 @@ export class LocalTransport implements ProviderTransport {
       }
       log(`[${this.displayName}] /v1/models returned ${response.status}`);
     } catch (e: any) {
+      // Tagged for the same reason as the /api/tags probe above.
+      this.lastProbeError = markOwnTimeout(e);
+      this.lastProbeUrl = modelsUrl;
       log(`[${this.displayName}] /v1/models failed: ${e?.message || e}`);
     }
 
-    this.healthChecked = true;
+    // `healthChecked` latches SUCCESS ONLY. It used to be set here too, and
+    // that made a retried `refreshAuth()` a LIE: `refreshAuth` opens with
+    // `if (this.healthChecked) return;`, so the second call issued no probe and
+    // DID NOT THROW — it returned successfully for a server that was still
+    // dead. Harmless while nothing called it twice inside a request; the moment
+    // a retry ladder does, attempt 2 resolves instantly, the episode closes as
+    // "recovered", and a recovery record is written for an outage that never
+    // ended, while the real failure re-appears milliseconds later from the
+    // fetch path as a second, unrelated-looking episode.
+    //
+    // Three consequences of the fix, all wanted:
+    //   - a retried refreshAuth() RE-PROBES, which is the entire point;
+    //   - a dead local server costs one extra probe per request instead of
+    //     latching unhealthy for the process lifetime. Against a refused
+    //     loopback port that probe returns in ~1 ms;
+    //   - a recovered server now runs fetchContextWindow(). Today it never
+    //     does: the failed probe latched the flag that guards it, so the
+    //     provider served forever on a stale context window.
     this.isHealthy = false;
     log(`[${this.displayName}] Health check FAILED - provider not available`);
     return false;

@@ -27,6 +27,14 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parse as parseDotenv } from "dotenv";
 import { isKeychainHydratedVar } from "../auth/credentials/keychain-source.js";
+import {
+  VERTEX_NO_PROJECT_REMEDY,
+  VERTEX_PROJECT_ENV_VARS,
+  adcCredentialsPath,
+  describeVertexProjectSource,
+  peekVertexAdcProject,
+  peekVertexProjectOrigin,
+} from "../auth/vertex-auth.js";
 import { activeGlobalConfigFile, getConfigFileOverride } from "../config-override.js";
 import { isOpHydratedVar } from "./onepassword.js";
 
@@ -75,6 +83,25 @@ export interface KeyProvenance {
   effectiveMasked: string | null;
   effectiveSource: string;
   layers: KeyLayer[];
+  /**
+   * What to print INSTEAD of `$envVar` when the credential did not come from an
+   * environment variable at all.
+   *
+   * Undefined for every provider whose credential is an env-var API key — which
+   * is all but one — so their lines are unchanged. It exists because Vertex has
+   * no API key: it authenticates with Application Default Credentials and
+   * addresses a Google Cloud project that may come from the ADC file or
+   * `gcloud config`, and a row reading `$VERTEX_PROJECT (not set)` about a
+   * working install is worse than no row at all.
+   *
+   * SECURITY: display-safe by construction, like `effectiveMasked`. A builder
+   * that sets it must put no key material in it. Vertex's is a GCP project id,
+   * which is an identifier rather than a secret — it appears in every Vertex
+   * request URL and in the proxy's own handler log line — so it is shown whole:
+   * masking it would hide the one fact the row exists to report, WHICH project
+   * this machine will bill.
+   */
+  effectiveLabel?: string;
 }
 
 function maskKey(key: string | undefined | null): string | null {
@@ -174,11 +201,100 @@ export function resolveApiKeyProvenance(envVar: string, aliases?: string[]): Key
 }
 
 /**
+ * Provenance for ONE provider's credential — the entry point every display
+ * surface should call.
+ *
+ * Identical to {@link resolveApiKeyProvenance} for every provider whose
+ * credential is an env-var API key. It exists for the one that is not: Vertex
+ * resolves a PROJECT (not a key) from the environment, the ADC file's
+ * `quota_project_id`, or `gcloud config`, so the env/config layers alone report
+ * "not set" about an install that works perfectly.
+ *
+ * The branch lives here, in the module that owns provenance, rather than in each
+ * of the four call sites (`--probe`'s three chain builders and the handler log).
+ * Four copies of one provider rule is the second-table coupling this codebase
+ * keeps paying for.
+ */
+export function resolveCredentialProvenance(
+  provider: string,
+  envVar: string,
+  aliases?: string[]
+): KeyProvenance {
+  if (provider === "vertex") return vertexProjectProvenance(envVar, aliases);
+  return resolveApiKeyProvenance(envVar, aliases);
+}
+
+/**
+ * Vertex's provenance: the env/config layers, PLUS the two tiers
+ * `resolveVertexConfig` consults that no environment inspection can see.
+ *
+ * `GOOGLE_CLOUD_PROJECT` is passed as an alias because `resolveVertexConfig`
+ * reads it — not because `API_KEY_MAP` lists it. The variable list comes from
+ * `VERTEX_PROJECT_ENV_VARS`, the same constant the resolution uses, so this
+ * cannot drift from what actually decides the project.
+ *
+ * The non-env tiers are read through `peekVertexProjectOrigin`, which is sync
+ * and never shells out; a project that only `gcloud config` knows therefore
+ * shows up here once anything async (the credential authority, a probe, a real
+ * request) has resolved it. Until then this reports the honest "no project yet"
+ * with both remedies, never a missing API key.
+ */
+function vertexProjectProvenance(envVar: string, aliases?: string[]): KeyProvenance {
+  const envNames = [...new Set([envVar, ...(aliases ?? []), ...VERTEX_PROJECT_ENV_VARS])];
+  const base = resolveApiKeyProvenance(envNames[0], envNames.slice(1));
+  const origin = peekVertexProjectOrigin();
+  // Always shown, value included when known, so a project the ADC file holds is
+  // visible even while an env var shadows it — the same "(shadowed)" honesty the
+  // config layer already gets.
+  const adc = peekVertexAdcProject();
+  const adcLayer: KeyLayer = {
+    source: `${adcCredentialsPath()} (quota_project_id)`,
+    maskedValue: adc?.projectId ?? null,
+    isActive: origin?.source === "adc-file",
+  };
+  const gcloudLayer: KeyLayer = {
+    source: "`gcloud config get project`",
+    maskedValue: origin?.source === "gcloud-config" ? origin.projectId : null,
+    isActive: origin?.source === "gcloud-config",
+  };
+
+  if (!origin) {
+    return {
+      ...base,
+      hasValue: false,
+      effectiveMasked: null,
+      effectiveLabel: "no project",
+      effectiveSource: VERTEX_NO_PROJECT_REMEDY,
+      layers: [...base.layers, adcLayer, gcloudLayer],
+    };
+  }
+  if (origin.source === "env") {
+    // The env tiers are exactly what `resolveApiKeyProvenance` already models —
+    // including .env and the config file, which reach Vertex the same way they
+    // reach any other provider. Only the two extra layers are appended.
+    return { ...base, layers: [...base.layers, adcLayer, gcloudLayer] };
+  }
+  return {
+    ...base,
+    hasValue: true,
+    // The project id, whole and unmasked — see `KeyProvenance.effectiveLabel`.
+    effectiveMasked: origin.projectId,
+    effectiveLabel: `project ${origin.projectId}`,
+    effectiveSource: describeVertexProjectSource(origin),
+    // Nothing in the environment supplied the value, so no env layer is active.
+    layers: [...base.layers.map((l) => ({ ...l, isActive: false })), adcLayer, gcloudLayer],
+  };
+}
+
+/**
  * Format provenance for debug log output (single line).
  */
 export function formatProvenanceLog(p: KeyProvenance): string {
   if (!p.hasValue) {
-    return `${p.envVar}=(not set)`;
+    return p.effectiveLabel ? `${p.effectiveLabel}: ${p.effectiveSource}` : `${p.envVar}=(not set)`;
+  }
+  if (p.effectiveLabel) {
+    return `${p.effectiveLabel} [from: ${p.effectiveSource}]`;
   }
   return `${p.envVar}=${p.effectiveMasked} [from: ${p.effectiveSource}]`;
 }
@@ -190,11 +306,21 @@ export function formatProvenanceProbe(p: KeyProvenance, indent = "    "): string
   const lines: string[] = [];
 
   if (!p.hasValue) {
-    lines.push(`${indent}${p.envVar}: not set`);
+    // `effectiveLabel` carries the remedy for a provider with no env-var key at
+    // all (Vertex), where "VERTEX_PROJECT: not set" is the wrong instruction.
+    lines.push(
+      p.effectiveLabel
+        ? `${indent}${p.effectiveLabel}: ${p.effectiveSource}`
+        : `${indent}${p.envVar}: not set`
+    );
     return lines;
   }
 
-  lines.push(`${indent}${p.envVar} = ${p.effectiveMasked}  [from: ${p.effectiveSource}]`);
+  lines.push(
+    p.effectiveLabel
+      ? `${indent}${p.effectiveLabel}  [from: ${p.effectiveSource}]`
+      : `${indent}${p.envVar} = ${p.effectiveMasked}  [from: ${p.effectiveSource}]`
+  );
 
   for (const layer of p.layers) {
     const marker = layer.isActive ? ">>>" : "   ";

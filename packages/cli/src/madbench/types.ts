@@ -10,7 +10,7 @@
  *
  * The model names are deliberately NOT pinned. The prompt asks for "the latest
  * models" and Claude Code resolves that itself against claudish's live catalog.
- * Pinning ids would make the test a snapshot of one afternoon's model roster —
+ * Pinning ids would make the test a snapshot of one afternoon's model list —
  * it would go red every time a vendor ships, for reasons that have nothing to do
  * with claudish. What is asserted instead is the invariant: three DISTINCT
  * models, each one real (present in the catalog the session itself saw), each

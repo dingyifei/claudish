@@ -9,6 +9,7 @@
 import { credentials } from "../../auth/credentials/authority.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
 import { log } from "../../logger.js";
+import { getProviderByName } from "../provider-definitions.js";
 import { isTerminal429 } from "./openai.js";
 import type { DiscoveryOutcome } from "./probe-discovery.js";
 import { discoverProviderProbeModel } from "./provider-model-discovery.js";
@@ -100,7 +101,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * model list.
    *
    * Why this transport needs it at all: several Anthropic-compat providers are
-   * SUBSCRIPTIONS (Qwen Plan, Kimi Coding). The cloud /probeModels
+   * SUBSCRIPTIONS (Alibaba Token Plan, Kimi Coding). The cloud /probeModels
    * catalog fundamentally cannot know which models a given key is entitled to
    * — that is a property of the caller's plan, not of the provider — so the
    * TUI falls back to GET /v1/probe-discover, which requires this method.
@@ -108,7 +109,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * support discovery" for every subscription provider.
    *
    * Source of truth is the provider's own `modelDiscovery` descriptor (already
-   * declared by qwen-cloud and kimi-coding), reached through the shared
+   * declared by qwen-token-plan and kimi-coding), reached through the shared
    * `discoverProviderModels()` — the same authenticated call the picker and
    * the context-window resolver use, so it shares their cache and their
    * credential-authority auth path. No new HTTP path is introduced here.
@@ -117,9 +118,10 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * alphabetical tiebreak) — the same order the picker defaults to, so the
    * probe exercises the model the user would actually get.
    *
-   * Non-chat rows are dropped with the shared `isChatCapable()` filter rather
-   * than a per-provider skip list: qwen-cloud's roster mixes image/TTS models
-   * (`wan2.7-image`, `qwen-audio-3.0-tts-plus`) in with the text models, and
+   * Non-chat rows are dropped by `discoverProviderProbeModel`, with the shared
+   * `isReportedChatCapable()` filter the picker uses too, rather
+   * than a per-provider skip list: qwen-token-plan's dynamic models catalog mixes
+   * image/TTS models (`wan2.7-image`, `qwen-audio-3.0-tts-plus`) in with the text models, and
    * hardcoding model ids here would rot the moment Alibaba ships the next one.
    */
   async discoverProbeModel(exclude?: ReadonlySet<string>): Promise<DiscoveryOutcome> {
@@ -175,18 +177,37 @@ export class AnthropicProviderTransport implements ProviderTransport {
     return lastResponse!;
   }
 
-  private static formatDisplayName(name: string): string {
-    const map: Record<string, string> = {
-      minimax: "MiniMax",
-      "minimax-coding": "MiniMax Coding",
-      kimi: "Kimi",
-      "kimi-coding": "Kimi Coding",
-      "qwen-cloud": "Qwen Plan",
-      "qwen-payg": "Qwen API",
-      moonshot: "Kimi",
-      "z-ai": "Z.AI",
-    };
-    return map[name.toLowerCase()] || name.charAt(0).toUpperCase() + name.slice(1);
+  /**
+   * DERIVED from the provider catalog — deliberately not a second table.
+   *
+   * This used to be a private map of eight names that SHADOWED
+   * `ProviderDefinition.displayName`, so renaming a provider in one place
+   * silently left this transport's log lines on the old label. That is the
+   * two-table coupling `provider-definitions.ts` exists to prevent: a provider
+   * whose label is stored twice keeps the stale one wherever nobody looked.
+   * `qwen-coding` was missing from the map and logged "Qwen-coding";
+   * `qwen-payg` logged "Qwen API" while its definition says "Alibaba PAYG".
+   *
+   * The other former entries are byte-identical to their definition's
+   * `displayName` (minimax, minimax-coding, kimi, kimi-coding, z-ai,
+   * qwen-token-plan). `moonshot → "Kimi"` is dropped on purpose: `moonshot` is
+   * one of `kimi`'s SHORTCUTS, never a provider `name`, so the entry was
+   * unreachable from `provider.name` — and `moonshot-cn` is a genuinely
+   * different service (CLAUDE.md), which the old entry would have collapsed
+   * into "Kimi" had it ever been reached.
+   *
+   * The title-case fallback is unchanged, so a runtime custom endpoint with no
+   * definition renders exactly as it did before.
+   *
+   * NOTE: `transport/openai.ts` keeps its own map on purpose — it carries no
+   * Alibaba entry, and deriving it would rename `Zen`/`Zen Go` in every log
+   * line for two providers this change has no business touching.
+   */
+  static formatDisplayName(name: string): string {
+    return (
+      getProviderByName(name.toLowerCase())?.displayName ||
+      name.charAt(0).toUpperCase() + name.slice(1)
+    );
   }
 }
 

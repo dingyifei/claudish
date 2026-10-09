@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { ModelDiscoveryFetcher } from "./model-discovery.js";
 import { getModelDiscoveryFetcher, registerModelDiscoveryFetcher } from "./model-discovery.js";
 
 const realFetch = globalThis.fetch;
@@ -15,8 +16,11 @@ afterEach(() => {
 
 describe("model discovery fetcher registration", () => {
   test("returns the registered fetcher and lets the last writer win", () => {
-    const firstFetcher = async () => [];
-    const replacementFetcher = async () => [{ id: "replacement-model" }];
+    const firstFetcher: ModelDiscoveryFetcher = async () => ({ kind: "models", models: [] });
+    const replacementFetcher: ModelDiscoveryFetcher = async () => ({
+      kind: "models",
+      models: [{ id: "replacement-model" }],
+    });
 
     registerModelDiscoveryFetcher("test-format", firstFetcher);
     expect(getModelDiscoveryFetcher("test-format")).toBe(firstFetcher);

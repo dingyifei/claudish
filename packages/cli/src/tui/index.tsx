@@ -33,7 +33,7 @@ import { invalidateProbeProxyHandlers, shutdownProbeProxy } from "./probe-proxy.
 export async function startConfigTui(): Promise<void> {
   // Register bundled endpoints before the first render: the Providers tab is
   // built from `getAllProviders()`, so a catalog vendor the user has a key for
-  // must already be in the roster or it simply is not there to configure.
+  // must already be in the provider list or it simply is not there to configure.
   // Re-entry after an OAuth login calls this again — idempotent by design.
   ensureEndpointsRegistered();
 

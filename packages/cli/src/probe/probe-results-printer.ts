@@ -9,11 +9,13 @@
  * ANSI text that persists in the scrollback without any diff-based redraws.
  *
  * The output is rendered as one bordered card per model. Each card contains
- * a chain table with provider/spec/status columns, optional error detail
- * sub-rows, and a compact key/wire footer.
+ * a chain table with provider/tier/spec/status columns (the kept hops, then the
+ * candidates the routing chain dropped), optional detail sub-rows, and a compact
+ * key/wire/route footer.
  */
 
 import type { KeyProvenance } from "../providers/api-key-provenance.js";
+import { NATIVE_NOT_PROBED } from "../providers/native-route.js";
 import {
   type ProbeResult,
   type ProbeTiming,
@@ -21,7 +23,8 @@ import {
   isFailureState,
   isReadyState,
 } from "../providers/probe-live.js";
-import { pinProbeModelSpec } from "../providers/probe-runner.js";
+import { DROPPED_LABEL, type DroppedOutcome, droppedRemedy } from "../providers/probe-runner.js";
+import type { RouteExplanation, RouteWarning, RuleScope } from "../providers/routing-rules.js";
 import { bgHex, cliAnsi } from "../theme/ansi.js";
 import { getThemeMode } from "../theme/theme-mode.js";
 import {
@@ -216,7 +219,6 @@ function computeBarScales(results: ModelResult[]): BarScales {
     if (scaledTps > maxTokPerSec) maxTokPerSec = scaledTps;
   };
   for (const r of results) {
-    consider(r.directProbe);
     for (const c of r.chain ?? []) consider(c.probe);
   }
 
@@ -349,14 +351,29 @@ function buildBarsLine(
   return `${timeline}  ${total}${breakdown}${tokBar}${tokValue}${crown}`;
 }
 
+/** One hop of the routing chain `route()` calculates (or a native target's one link). */
 export interface ChainEntry {
   provider: string;
   displayName: string;
   modelSpec: string;
+  /** The hop's tier label, or `fallback` for the fallback position. */
+  label?: string;
   hasCredentials: boolean;
   credentialHint?: string;
   provenance?: KeyProvenance;
   probe?: ProbeResult;
+  /** A native link: served on Claude Code's own auth, so it is never probed. */
+  notProbed?: "native-auth";
+}
+
+/** A candidate the routing chain did not keep. Listed with its outcome, never probed. */
+export interface DroppedEntry {
+  provider: string;
+  displayName: string;
+  wireId: string;
+  label?: string;
+  outcome: DroppedOutcome;
+  credentialHint?: string;
 }
 
 export interface WiringInfo {
@@ -369,14 +386,25 @@ export interface WiringInfo {
   effectiveStreamFormat: string;
 }
 
+/**
+ * One model's routing decision, as `explainRoute` made it. The parser's provider
+ * (`nativeProvider`) is deliberately absent: it is not a routing decision, and a
+ * bare non-Claude name reads `auto-route` there. It stays in `--probe --json` only.
+ */
 export interface ModelResult {
   model: string;
-  nativeProvider: string;
-  isExplicit: boolean;
-  routingSource: "direct" | "custom-rules" | "auto-chain";
+  routingSource: RouteExplanation["source"];
+  /** `describeRouteExplanation`: the one line `--probe` and the config TUI share. */
+  routingExplanation: string;
   matchedPattern?: string;
+  ruleScope?: RuleScope;
+  /** The kept hops, in chain order; a native target's one not-probed link. `[]` = no route. */
   chain: ChainEntry[];
-  directProbe?: ProbeResult;
+  /** The candidates the routing chain dropped, in chain order. */
+  dropped?: DroppedEntry[];
+  /** Set when there is no route: `route()`'s reason and hint, verbatim. */
+  noRoute?: { reason: string; hint?: string };
+  warnings?: RouteWarning[];
   wiring?: WiringInfo;
 }
 
@@ -570,11 +598,16 @@ function renderSepRow(widths: number[], width: number): string {
 }
 
 interface RowData {
+  /** The hop's position in the chain, or "–" for a dropped candidate (not a hop). */
   num: string;
   provider: string;
+  /** Tier label (`subscription`, `gateway`, `fallback`, …). */
+  label: string;
   spec: string;
   status: string;
   errorDetail?: string;
+  /** A dim, non-error sub-row: why a link is not probed, or a dropped candidate's remedy. */
+  note?: string;
   /** True if this is the fastest live provider in the chain (green bg) */
   fastest?: boolean;
   /** True if this is the slowest live provider in the chain (red bg) */
@@ -617,6 +650,18 @@ function buildRowData(result: ModelResult, isLiveProbe: boolean): RowData[] {
     const isFastest = i === fastestIdx;
     const isSlowest = i === slowestIdx;
 
+    // A native link is a third outcome, neither live nor failed: nothing was sent.
+    if (entry.notProbed) {
+      return {
+        num: `${i + 1}`,
+        provider: entry.displayName,
+        label: entry.label ?? "",
+        spec: entry.modelSpec,
+        status: `${pc.cyan}◐ native — not probed${pc.reset}`,
+        note: NATIVE_NOT_PROBED,
+      };
+    }
+
     let status = shortStatusLabel(entry.probe, entry.hasCredentials, entry.credentialHint);
     if (isFastest) {
       status = `${status} ${pc.brightGreen}●${pc.reset}`;
@@ -635,6 +680,7 @@ function buildRowData(result: ModelResult, isLiveProbe: boolean): RowData[] {
     return {
       num: `${i + 1}`,
       provider: entry.displayName,
+      label: entry.label ?? "",
       spec: entry.modelSpec,
       status,
       errorDetail,
@@ -645,46 +691,29 @@ function buildRowData(result: ModelResult, isLiveProbe: boolean): RowData[] {
   });
 }
 
-function buildDirectRowData(result: ModelResult): RowData[] {
-  const probe = result.directProbe;
-  let status: string;
-  if (!probe) {
-    status = `${pc.dim}— no probe —${pc.reset}`;
-  } else {
-    status = shortStatusLabel(probe, true);
-    if (probe.state === "live") {
-      status = `${status} ${pc.brightGreen}●${pc.reset}`;
-    }
-  }
-  let errorDetail: string | undefined;
-  if (probe && isFailureState(probe.state) && probe.errorMessage) {
-    errorDetail = stripAnsi(probe.errorMessage).replace(/\s+/g, " ").trim();
-  }
-  const barsTiming = probe?.state === "live" && probe.timing ? probe.timing : undefined;
-  return [
-    {
-      num: "1",
-      provider: result.nativeProvider,
-      // `result.model` is the RAW user input, so it already carries the prefix
-      // whenever the user typed one — `--probe openrouter@gpt-5.6-sol` rendered
-      // as "openrouter@openrouter@gpt-5.6-sol". pinProbeModelSpec owns the
-      // prefixing rule (it also keeps native-anthropic bare, which a plain
-      // template would break); reuse it rather than repeat a second guard here.
-      spec: pinProbeModelSpec({ provider: result.nativeProvider, modelSpec: result.model }),
-      status,
-      errorDetail,
-      barsTiming,
-    },
-  ];
+/**
+ * One row per candidate the routing chain dropped, after the kept hops. Never
+ * probed: the status is the outcome, and the sub-row names the remedy when the
+ * credential filter dropped it.
+ */
+function buildDroppedRowData(result: ModelResult): RowData[] {
+  return (result.dropped ?? []).map((entry) => ({
+    num: "–",
+    provider: entry.displayName,
+    label: entry.label ?? "",
+    spec: entry.wireId,
+    status: `${pc.dim}– ${DROPPED_LABEL[entry.outcome]}${pc.reset}`,
+    note: droppedRemedy(entry.credentialHint),
+  }));
 }
 
+const COLUMN_HEADERS = ["#", "Provider", "Tier", "Model Spec", "Status"];
+
 function computeColumnWidths(rows: RowData[]): number[] {
-  const headers = ["#", "Provider", "Model Spec", "Status"];
-  const wNum = Math.max(headers[0].length, ...rows.map((r) => r.num.length));
-  const wProv = Math.max(headers[1].length, ...rows.map((r) => visibleLength(r.provider)));
-  const wSpec = Math.max(headers[2].length, ...rows.map((r) => visibleLength(r.spec)));
-  const wStatus = Math.max(headers[3].length, ...rows.map((r) => visibleLength(r.status)));
-  return [wNum, wProv, wSpec, wStatus];
+  const cells = (r: RowData) => [r.num, r.provider, r.label, r.spec, r.status];
+  return COLUMN_HEADERS.map((header, col) =>
+    Math.max(header.length, ...rows.map((r) => visibleLength(cells(r)[col])))
+  );
 }
 
 /**
@@ -730,12 +759,21 @@ function formatContextWindow(ctx: number): string {
 }
 
 function buildKeyLine(activeEntry?: ChainEntry, directKeyVar?: string): string {
+  if (activeEntry?.notProbed) {
+    return `${pc.bold}Key${pc.reset}  ${pc.dim}Claude Code's own auth (not visible to this process)${pc.reset}`;
+  }
   if (activeEntry?.provenance) {
     const p = activeEntry.provenance;
+    // `effectiveLabel` replaces `$ENV_VAR` for a provider whose credential is not
+    // an environment variable — Vertex, whose project comes from the ADC file or
+    // `gcloud config`. Printing `$VERTEX_PROJECT (not set)` there names a
+    // variable that is not how the install works.
+    const subject = p.effectiveLabel ?? `$${p.envVar}`;
     if (p.hasValue) {
-      return `${pc.bold}Key${pc.reset}  $${p.envVar}  ${pc.dim}(${p.effectiveSource})${pc.reset}`;
+      return `${pc.bold}Key${pc.reset}  ${subject}  ${pc.dim}(${p.effectiveSource})${pc.reset}`;
     }
-    return `${pc.bold}Key${pc.reset}  $${p.envVar}  ${pc.dim}(not set)${pc.reset}`;
+    const why = p.effectiveLabel ? p.effectiveSource : "not set";
+    return `${pc.bold}Key${pc.reset}  ${subject}  ${pc.dim}(${why})${pc.reset}`;
   }
   if (directKeyVar) {
     const has = !!process.env[directKeyVar];
@@ -744,7 +782,7 @@ function buildKeyLine(activeEntry?: ChainEntry, directKeyVar?: string): string {
   return `${pc.bold}Key${pc.reset}  ${pc.dim}—${pc.reset}`;
 }
 
-function buildWireLine(wiring: WiringInfo, activeProvider?: string): string {
+function buildWireLine(wiring: WiringInfo, activeProvider: string | undefined): string {
   const ctx = formatContextWindow(wiring.contextWindow);
   const head = activeProvider ? `${activeProvider} → ` : "";
   return `${pc.bold}Wire${pc.reset} ${head}${wiring.effectiveStreamFormat} · ${wiring.modelTranslator} · ${ctx}`;
@@ -762,8 +800,28 @@ interface CardLayout {
   summaryStyled: string;
   keyLine: string;
   wireLine: string;
+  /** `Route <describeRouteExplanation>`: where the chain came from, in the shared wording. */
+  routeLine: string;
   footerVis: number;
   activeEntry: ChainEntry | undefined;
+}
+
+/**
+ * The card heading's right-hand summary. It names the FIRST KEPT hop — the
+ * provider a request uses — never the parser's provider, which for a bare
+ * non-Claude name is the internal `auto-route`. A native link says "not probed";
+ * an empty chain says why, in the shared explanation line.
+ */
+function cardSummary(result: ModelResult): { text: string; color: string } {
+  const first = result.chain[0];
+  if (!first) return { text: result.routingExplanation || "no route", color: pc.red };
+  if (first.notProbed) return { text: `${first.displayName} · not probed`, color: pc.cyan };
+  const probed = result.chain.filter((c) => !c.notProbed);
+  const live = probed.filter((c) => c.probe?.state === "live").length;
+  return {
+    text: `${first.displayName} · ${live}/${probed.length} live`,
+    color: summaryColor(live, probed.length),
+  };
 }
 
 function buildCardLayout(
@@ -771,35 +829,29 @@ function buildCardLayout(
   isLiveProbe: boolean,
   directKeyVar?: string
 ): CardLayout {
-  const rows =
-    result.routingSource === "direct"
-      ? buildDirectRowData(result)
-      : buildRowData(result, isLiveProbe);
+  const rows = [...buildRowData(result, isLiveProbe), ...buildDroppedRowData(result)];
 
-  const totalLinks = rows.length;
-  const liveCount = result.chain
-    ? result.chain.filter((c) => c.probe?.state === "live").length
-    : result.directProbe?.state === "live"
-      ? 1
-      : 0;
-  const effLive = result.routingSource === "direct" ? liveCount : liveCount;
-  const effTotal = result.routingSource === "direct" ? totalLinks : result.chain.length;
-
-  const titleText = result.model;
-  const sumColor = summaryColor(effLive, effTotal);
-  const summaryPlain = `${result.nativeProvider} · ${effLive}/${effTotal} live`;
-  const titleStyled = `${pc.bold}${pc.cyan}${titleText}${pc.reset}`;
-  const summaryStyled = `${sumColor}${summaryPlain}${pc.reset}`;
+  const summary = cardSummary(result);
+  const titleStyled = `${pc.bold}${pc.cyan}${result.model}${pc.reset}`;
+  const summaryStyled = `${summary.color}${summary.text}${pc.reset}`;
 
   const activeEntry =
-    result.chain?.find((c) => c.probe?.state === "live") ??
-    result.chain?.find((c) => c.hasCredentials);
+    result.chain.find((c) => c.probe?.state === "live") ??
+    result.chain.find((c) => c.hasCredentials);
 
   const keyLine = buildKeyLine(activeEntry, directKeyVar);
-  const wireLine = result.wiring
-    ? buildWireLine(result.wiring, activeEntry?.displayName ?? result.nativeProvider)
+  const wireLine =
+    result.wiring && !activeEntry?.notProbed
+      ? buildWireLine(result.wiring, activeEntry?.displayName)
+      : "";
+  const routeLine = result.routingExplanation
+    ? `${pc.bold}Route${pc.reset} ${result.routingExplanation}`
     : "";
-  const footerVis = Math.max(visibleLength(keyLine), visibleLength(wireLine));
+  const footerVis = Math.max(
+    visibleLength(keyLine),
+    visibleLength(wireLine),
+    visibleLength(routeLine)
+  );
 
   const widths = computeColumnWidths(rows);
 
@@ -810,6 +862,7 @@ function buildCardLayout(
     summaryStyled,
     keyLine,
     wireLine,
+    routeLine,
     footerVis,
     activeEntry,
   };
@@ -845,19 +898,14 @@ function renderCard(
   directKeyVar?: string
 ): void {
   const layout = buildCardLayout(result, isLiveProbe, directKeyVar);
-  const { rows, widths, titleStyled, summaryStyled, keyLine, wireLine } = layout;
+  const { rows, widths, titleStyled, summaryStyled, keyLine, wireLine, routeLine } = layout;
 
   // === Render ===
   w(`${renderBorderTop(titleStyled, summaryStyled, width)}\n`);
   w(`${renderBlankLine(width)}\n`);
 
   // Header row (dim styled headers)
-  const headerCells = [
-    `${pc.dim}#${pc.reset}`,
-    `${pc.dim}Provider${pc.reset}`,
-    `${pc.dim}Model Spec${pc.reset}`,
-    `${pc.dim}Status${pc.reset}`,
-  ];
+  const headerCells = COLUMN_HEADERS.map((h) => `${pc.dim}${h}${pc.reset}`);
   w(`${renderRow(headerCells, widths, width)}\n`);
   w(`${renderSepRow(widths, width)}\n`);
 
@@ -868,7 +916,13 @@ function renderCard(
     const r = rows[rowIdx];
     const bg = r.fastest ? pc.bgFastest : r.slowest ? pc.bgSlowest : undefined;
 
-    const cells = [r.num, r.provider, `${pc.dim}${r.spec}${pc.reset}`, r.status];
+    const cells = [
+      r.num,
+      r.provider,
+      `${pc.dim}${r.label}${pc.reset}`,
+      `${pc.dim}${r.spec}${pc.reset}`,
+      r.status,
+    ];
     w(`${renderRow(cells, widths, width, bg)}\n`);
 
     // Bars sub-row beneath a live provider row (timeline + breakdown + tok/s).
@@ -887,62 +941,96 @@ function renderCard(
       }
     }
 
-    if (r.errorDetail) {
-      // Render the error as a full-width sub-row (or rows) beneath the
-      // failed row, word-wrapped to fit the card's inner usable width.
-      // Layout inside the card for an error line:
-      //   │{leftPad}{errorIndent}└ {text}{pad}{rightPad}│
-      // where errorIndent visually insets the error one column past the
-      // "#" column so it reads as a child of the failed row.
-      const innerUsable = width - 2 - CARD_PADDING_LEFT - CARD_PADDING_RIGHT;
-      const errorIndent = 4; // 4 spaces of indent inside the usable area
-      const prefixVis = 2; // "└ " or "  "
-      const textWidth = innerUsable - errorIndent - prefixVis;
-      const MAX_ERROR_LINES = 4;
-
-      if (textWidth > 0) {
-        let wrapped = wordWrap(r.errorDetail, textWidth);
-        let truncated = false;
-        if (wrapped.length > MAX_ERROR_LINES) {
-          wrapped = wrapped.slice(0, MAX_ERROR_LINES);
-          truncated = true;
-        }
-        if (truncated) {
-          const last = wrapped[wrapped.length - 1];
-          // Append an ellipsis to the last kept line (replace last char if needed).
-          if (last.length >= textWidth) {
-            wrapped[wrapped.length - 1] = `${last.slice(0, textWidth - 1)}…`;
-          } else {
-            wrapped[wrapped.length - 1] = `${last}…`;
-          }
-        }
-        const indentStr = " ".repeat(errorIndent);
-        for (let i = 0; i < wrapped.length; i++) {
-          const prefix = i === 0 ? "└ " : "  ";
-          const body = `${indentStr}${pc.dim}${pc.red}${prefix}${wrapped[i]}${pc.reset}`;
-          w(`${renderTextLine(body, width, bg)}\n`);
-        }
-      }
-    }
+    // A failed probe's error in dim red; a not-probed link's or a dropped
+    // candidate's note in dim only — neither of those is a failure.
+    if (r.errorDetail) writeSubRows(w, r.errorDetail, `${pc.dim}${pc.red}`, width, bg);
+    if (r.note) writeSubRows(w, r.note, pc.dim, width, bg);
   }
 
   w(`${renderBlankLine(width)}\n`);
 
-  // Footer: Key + Wire
+  // Footer: Key + Wire + Route (the shared explanation line)
   if (visibleLength(keyLine) > 0) {
     w(`${renderTextLine(keyLine, width)}\n`);
   }
   if (visibleLength(wireLine) > 0) {
     w(`${renderTextLine(wireLine, width)}\n`);
   }
-
-  // Routing-source note (custom rules)
-  if (result.routingSource === "custom-rules" && result.matchedPattern) {
-    const note = `${pc.dim}Custom rule: ${pc.reset}${pc.cyan}${result.matchedPattern}${pc.reset}`;
-    w(`${renderTextLine(note, width)}\n`);
+  if (visibleLength(routeLine) > 0) {
+    w(`${renderTextLine(routeLine, width)}\n`);
   }
+  writeDecisionNotes(w, result, width);
 
   w(`${renderBorderBottom(width)}\n`);
+}
+
+/**
+ * The card lines under the footer that only some decisions have: a no-route's
+ * reason and hint (`route()`'s own, verbatim), then each billing notice `route()`
+ * would print to stderr for this decision. Rule problems are printed once, above
+ * the cards, because they are about the config rather than one model.
+ */
+function writeDecisionNotes(w: Writer, result: ModelResult, width: number): void {
+  const textWidth = cardTextWidth(width);
+  if (result.noRoute) {
+    const head = "No route  ";
+    wordWrap(result.noRoute.reason, textWidth - head.length).forEach((line, i) => {
+      const lead = i === 0 ? `${pc.red}No route${pc.reset}  ` : " ".repeat(head.length);
+      w(`${renderTextLine(`${lead}${line}`, width)}\n`);
+    });
+    // The hint is pre-formatted (its options are indented): a line that fits is
+    // kept as written, and only a line too long for the card is re-wrapped.
+    const hintLines = (result.noRoute.hint ?? "").split("\n").filter((l) => l.trim());
+    const fitted = hintLines.flatMap((l) => (l.length <= textWidth ? [l] : wordWrap(l, textWidth)));
+    for (const line of fitted) {
+      w(`${renderTextLine(`${pc.dim}${line}${pc.reset}`, width)}\n`);
+    }
+  }
+  const notices = (result.warnings ?? []).filter((warning) => warning.type !== "rule-problem");
+  for (const line of notices.flatMap((warning) => wordWrap(`⚠ ${warning.message}`, textWidth))) {
+    w(`${renderTextLine(`${pc.yellow}${line}${pc.reset}`, width)}\n`);
+  }
+}
+
+/** Usable text width inside a card of `width` columns. */
+function cardTextWidth(width: number): number {
+  return Math.max(10, width - 2 - CARD_PADDING_LEFT - CARD_PADDING_RIGHT);
+}
+
+/**
+ * Write `text` as a full-width sub-row (or rows) beneath its row, word-wrapped to
+ * the card's inner usable width, in `color`. Layout inside the card:
+ *   │{leftPad}{indent}└ {text}{pad}{rightPad}│
+ * where the indent insets it one column past the "#" column so it reads as a
+ * child of the row above.
+ */
+function writeSubRows(
+  w: Writer,
+  text: string,
+  color: string,
+  width: number,
+  bg: string | undefined
+): void {
+  const indent = 4; // 4 spaces of indent inside the usable area
+  const prefixVis = 2; // "└ " or "  "
+  const textWidth = cardTextWidth(width) - indent - prefixVis;
+  const MAX_LINES = 4;
+  if (textWidth <= 0) return;
+
+  let wrapped = wordWrap(text, textWidth);
+  if (wrapped.length > MAX_LINES) {
+    wrapped = wrapped.slice(0, MAX_LINES);
+    const last = wrapped[wrapped.length - 1];
+    // Append an ellipsis to the last kept line (replace last char if needed).
+    wrapped[wrapped.length - 1] =
+      last.length >= textWidth ? `${last.slice(0, textWidth - 1)}…` : `${last}…`;
+  }
+  const indentStr = " ".repeat(indent);
+  for (let i = 0; i < wrapped.length; i++) {
+    const prefix = i === 0 ? "└ " : "  ";
+    const body = `${indentStr}${color}${prefix}${wrapped[i]}${pc.reset}`;
+    w(`${renderTextLine(body, width, bg)}\n`);
+  }
 }
 
 /**
@@ -984,13 +1072,15 @@ interface LeaderRow {
   provider: string;
   /** Live+timed timing for the representative entry; undefined = unavailable. */
   timing?: ProbeTiming;
+  /** Why an unavailable row has no timing: `no live route`, `not probed (native)`, `no route`. */
+  missing?: string;
 }
 
 /**
  * Pick the representative entry for a model: the first chain link that probed
- * live AND carried timing (the route claudish would actually use), else the
- * direct probe if it's live+timed. Returns undefined timing for models with no
- * usable route so they can be listed dim as "unavailable".
+ * live AND carried timing (the route claudish would actually use). A model with
+ * none is listed dim, under its first kept hop — or, with no hop at all, under
+ * the explanation line. Never under the parser's provider (`auto-route`).
  */
 function pickRepresentative(result: ModelResult): LeaderRow {
   for (const entry of result.chain ?? []) {
@@ -998,11 +1088,12 @@ function pickRepresentative(result: ModelResult): LeaderRow {
       return { model: result.model, provider: entry.displayName, timing: entry.probe.timing };
     }
   }
-  const direct = result.directProbe;
-  if (direct?.state === "live" && direct.timing) {
-    return { model: result.model, provider: result.nativeProvider, timing: direct.timing };
-  }
-  return { model: result.model, provider: result.nativeProvider };
+  const first = result.chain?.[0];
+  return {
+    model: result.model,
+    provider: first?.displayName ?? result.routingExplanation,
+    missing: first?.notProbed ? "not probed (native)" : first ? "no live route" : "no route",
+  };
 }
 
 /**
@@ -1157,7 +1248,7 @@ function renderLeaderboard(
     const rankStr = " ".repeat(rankW);
     const name = padEnd(`${pc.dim}${truncate(row.model, nameW)}${pc.reset}`, nameW);
     const prov = padEnd(`${pc.dim}${truncate(row.provider, provW)}${pc.reset}`, provW);
-    w(`${margin}${rankStr}   ${name} ${prov} ${pc.dim}— no live route${pc.reset}\n`);
+    w(`${margin}${rankStr}   ${name} ${prov} ${pc.dim}— ${row.missing}${pc.reset}\n`);
   }
 
   // ── Bottom rule — matches the ACTUAL rendered data-row width (not the
@@ -1174,6 +1265,19 @@ function renderLeaderboard(
   w("\n");
 }
 
+/** Rule problems are about the config, not one model: each is printed once, above the cards. */
+function renderRuleProblems(results: ModelResult[], w: Writer): void {
+  const messages = new Set(
+    results.flatMap((r) =>
+      (r.warnings ?? []).filter((x) => x.type === "rule-problem").map((x) => x.message)
+    )
+  );
+  for (const message of messages) {
+    w(`  ${pc.yellow}⚠ routing rule: ${message}${pc.reset}\n`);
+  }
+  if (messages.size > 0) w("\n");
+}
+
 export function printProbeResults(results: ModelResult[], isLiveProbe: boolean): void {
   refreshPc();
   const w: Writer = process.stderr.write.bind(process.stderr);
@@ -1186,11 +1290,11 @@ export function printProbeResults(results: ModelResult[], isLiveProbe: boolean):
   const scales = computeBarScales(results);
 
   // Has any live probe carried timing? Only then is the legend meaningful.
-  const anyTimedLive =
-    results.some((r) => r.directProbe?.state === "live" && r.directProbe.timing !== undefined) ||
-    results.some((r) =>
-      (r.chain ?? []).some((c) => c.probe?.state === "live" && c.probe.timing !== undefined)
-    );
+  const anyTimedLive = results.some((r) =>
+    (r.chain ?? []).some((c) => c.probe?.state === "live" && c.probe.timing !== undefined)
+  );
+
+  renderRuleProblems(results, w);
 
   if (isLiveProbe && anyTimedLive) {
     renderLegend(w);
@@ -1232,9 +1336,14 @@ export function printProbeResults(results: ModelResult[], isLiveProbe: boolean):
     w("\n");
   }
 
-  // Compact tip footer (no legend — cards are self-describing).
+  // Compact tip footer (no legend — cards are self-describing). It states the
+  // rule the chain is calculated by, never a provider order: that comes from the
+  // cloud models catalog and this account's credentials, per model.
   w(
-    `  ${pc.dim}Tip: chain order is LiteLLM → Zen Go → Subscription → Native API → OpenRouter${pc.reset}\n`
+    `  ${pc.dim}Tip: a matching user rule is used as written; otherwise the catalog orders hops by tier,${pc.reset}\n`
+  );
+  w(
+    `  ${pc.dim}     subscription first, and the fallback hop comes last. Dropped candidates are never probed.${pc.reset}\n`
   );
   w("\n");
 

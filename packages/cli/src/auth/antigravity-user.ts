@@ -34,7 +34,7 @@ import { log } from "../logger.js";
  *     daily-cloudcode-pa.googleapis.com  generate gemini-3.6-flash-high -> 200
  *
  * On `cloudcode-pa` that account reads `currentTier: free-tier`, is served a
- * roster of `gemini-2.5-*` and editor-internal `chat_*`/`tab_*` ids, reports
+ * dynamic models catalog of `gemini-2.5-*` and editor-internal `chat_*`/`tab_*` ids, reports
  * every quota bucket at 100% forever (nothing is ever consumed), and can
  * generate with EXACTLY the two `tab_*` completion models — free Code Assist's
  * remaining entitlement — while all 28 chat models return a contentless
@@ -60,8 +60,9 @@ function apiBase(): string {
 }
 
 /**
- * The served set changes on the daily-quota cadence, not per request, and both
- * lookups below are real network calls we don't want on every refreshAuth.
+ * The account's dynamic models catalog changes on the daily-quota cadence, not
+ * per request, and both lookups below are real network calls we don't want on
+ * every refreshAuth.
  */
 const SERVED_MODELS_TTL_MS = 10 * 60 * 1000;
 
@@ -213,11 +214,11 @@ export interface QuotaBucket {
  *   antigravity UA -> 24 buckets: the 3.x families (3.6-flash-*, 3.5-flash-*,
  *                      3.1-pro-*), plus claude-* and gpt-oss-* uids
  *
- * Those 4 are precisely the RETIRED free Code Assist served set. Identifying
- * as gemini-cli therefore asked the backend for a product the user is not on,
- * and the quota UI rendered "Antigravity Ultra" — a correct tier label from
- * `loadCodeAssist`, which always identified correctly — directly above four
- * models an Ultra subscriber does not use, all pinned at 0%.
+ * Those 4 are precisely the membership of the RETIRED free Code Assist plan.
+ * Identifying as gemini-cli therefore asked the backend for a product the user
+ * is not on, and the quota UI rendered "Antigravity Ultra" — a correct tier
+ * label from `loadCodeAssist`, which always identified correctly — directly
+ * above four models an Ultra subscriber does not use, all pinned at 0%.
  *
  * So this MUST match `loadCodeAssist`'s identity. Both calls hit the same host
  * and the backend answers each according to who is asking.
@@ -257,7 +258,7 @@ interface AntigravityModelRecord {
 
 /** The Antigravity `fetchAvailableModels` response (only the fields we read). */
 interface FetchAvailableModelsResponse {
-  /** The served set — the KEYS of this dict ARE the served model ids. */
+  /** The dynamic models catalog — the KEYS of this dict ARE the served model ids. */
   models?: Record<string, AntigravityModelRecord>;
   /** Backend-provided default model id (e.g. "gemini-3.6-flash-high"). */
   defaultAgentModelId?: string;
@@ -294,7 +295,7 @@ export interface AntigravityModelMeta {
   displayName?: string;
 }
 
-/** The live served-set + default id for the Antigravity account. */
+/** The dynamic models catalog + default id for the Antigravity account. */
 export interface AntigravityServedModels {
   servedIds: string[];
   defaultId: string | null;
@@ -334,10 +335,11 @@ let agServedCacheAt = 0;
 /**
  * Discover which model ids this account's Antigravity subscription serves — LIVE.
  *
- * `fetchAvailableModels` is the authoritative per-subscription served-set
- * endpoint: the KEYS of its `models` dict ARE the served ids (already carrying
- * their reasoning-tier suffix, e.g. `gemini-3.6-flash-high`), and
- * `defaultAgentModelId` is the backend's own default.
+ * `fetchAvailableModels` is the authoritative discovery endpoint for this
+ * account's dynamic models catalog: the KEYS of its `models` dict ARE the served
+ * ids (already carrying their reasoning-tier suffix, e.g.
+ * `gemini-3.6-flash-high`), and `defaultAgentModelId` is the backend's own
+ * default.
  *
  * Degrades to `{ servedIds: [], defaultId: null }` on any error, so the
  * transport's 404 handling still functions.

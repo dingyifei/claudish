@@ -1,18 +1,20 @@
 /**
- * Tests for buildFieldOptions — the pure field-picker option builder in
- * OnepasswordModal.tsx. These exercise the GROUPING + the two ★ rows across the
+ * Tests for buildFieldOptions — the pure field-picker option builder behind the
+ * 1Password add-wizard. These exercise the GROUPING + the two ★ rows across the
  * three item shapes (no-sections / all-sectioned / mixed). No secrets here: the
  * DiscoveredField inputs are field METADATA (labels/sections/types) — no secret
  * values — so structural fixtures are appropriate (the no-handcraft rule targets
  * secret-like fixtures, which these aren't).
  *
- * buildFieldOptions is a plain function (no JSX), so importing it from the
- * OpenTUI component module is safe — the @jsxImportSource pragma only affects JSX.
+ * The subject MOVED from `components/OnepasswordModal.tsx` to the JSX-free leaf
+ * `../onepassword-fields.ts`, so this file no longer has to justify importing a
+ * plain function out of an OpenTUI component module — it imports a plain module.
+ * The test bodies are unchanged, which is the point: the move is address-only.
  */
 
 import { describe, expect, test } from "bun:test";
 import type { DiscoveredField } from "../../providers/onepassword.js";
-import { buildFieldOptions } from "./OnepasswordModal.js";
+import { buildFieldOptions } from "../onepassword-fields.js";
 
 const V = "Vault";
 const I = "Item";

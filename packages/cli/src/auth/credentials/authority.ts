@@ -22,8 +22,23 @@ import { GrokSubscriptionCredentialProvider } from "./grok-credential.js";
 import { makeKimiCodingCredential, makeKimiCredential } from "./kimi-credential.js";
 import { LocalCredentialProvider } from "./local-credential.js";
 import { NativeAnthropicCredentialProvider } from "./native-anthropic-credential.js";
-import type { CredentialProvider, RequestAuth, RequestAuthContext } from "./types.js";
+import type {
+  CredentialProvider,
+  ReadinessResult,
+  RequestAuth,
+  RequestAuthContext,
+} from "./types.js";
+import { readinessDetail } from "./types.js";
 import { VertexCredentialProvider } from "./vertex-credential.js";
+
+/**
+ * Re-exported from `types.js`, which is where the interface that carries them
+ * lives. The authority is the documented home of the readiness vocabulary, so
+ * consumers import it from here and never have to know which of the two files
+ * declares it.
+ */
+export type { CredentialReadiness, ReadinessResult } from "./types.js";
+export { readinessDetail } from "./types.js";
 
 /** Built-in local provider names that get a LocalCredentialProvider. */
 const LOCAL_PROVIDER_NAMES = ["ollama", "lmstudio", "vllm", "mlx"];
@@ -101,18 +116,66 @@ export class CredentialAuthority {
   }
 
   /**
+   * ASYNC readiness, THREE-VALUED: resolves env → config → oauth-file →
+   * keychain → op:// (both lazy) and reports `present` / `absent` / `failed`.
+   *
+   * This method exists because `isAvailable` had exactly one slot for two facts
+   * and the old `catch { return false }` here put both in it. Every resolution
+   * failure — a denied 1Password handshake and its 15-second machine-wide
+   * suppression, a locked Mac, a keychain ACL the user declined, a `security`
+   * binary that is not there — became indistinguishable from "this user has no
+   * key for this provider". Downstream, `hasCredentialsForProvider`
+   * (routing-rules.ts) drops such a candidate from the routing chain, so a
+   * flat-rate subscription the user DOES hold was silently replaced by a
+   * metered provider and billed per token, with nothing printed.
+   *
+   * Three things make the third value REACHABLE rather than decorative, since
+   * no production source throws:
+   *   - a provider may implement `describeReadiness()` itself and report
+   *     `failed` from a propagated flag — `ApiKeyCredentialProvider` does this
+   *     for the keychain's `{value?, failed}` and for an op resolve whose
+   *     failure `onAuthFailure:"skip"` swallowed;
+   *   - `CompositeCredentialProvider` forwards a half's `failed` instead of
+   *     flattening it to a boolean;
+   *   - a source that DOES throw is caught here and reported as `failed`.
+   *
+   * Never throws. An unknown provider is genuinely `absent` — nothing was
+   * consulted, so there is no failure to report.
+   */
+  async describeReadiness(
+    name: string,
+    opts?: { allowOpPrompt?: boolean }
+  ): Promise<ReadinessResult> {
+    const provider = this.registry.get(name);
+    if (!provider) return { readiness: "absent" };
+    try {
+      if (provider.describeReadiness) {
+        // A provider is allowed to be sloppy about its return; a missing verdict
+        // must not become `undefined.readiness` at a call site that reads it.
+        return (await provider.describeReadiness(opts)) ?? { readiness: "absent" };
+      }
+      return { readiness: (await provider.isAvailable(opts)) ? "present" : "absent" };
+    } catch (err) {
+      return { readiness: "failed", detail: readinessDetail(err) };
+    }
+  }
+
+  /**
    * ASYNC readiness: resolves env → config → oauth-file → op:// (lazy SDK) for
    * the provider. Never throws — an unknown provider or a 1Password auth failure
    * resolves to false. Memoized inside each provider, so the SDK is touched at
    * most once. This is THE single readiness oracle (replaces the three old sync
    * ones: isProviderAvailable / isApiKeyAvailable / the old isAuthenticated).
+   *
+   * UNCHANGED SIGNATURE, UNCHANGED CONTRACT, and deliberately a pure PROJECTION
+   * of `describeReadiness` rather than a second implementation. `failed` maps to
+   * `false` exactly as it always did — a credential that will not resolve cannot
+   * sign a request either — so every routing decision is byte-identical to the
+   * boolean oracle it replaces. `equivalence.test.ts` is the pin on that claim.
+   * Only the REASON is new, and only for callers that ask for it.
    */
   async isAvailable(name: string, opts?: { allowOpPrompt?: boolean }): Promise<boolean> {
-    try {
-      return (await this.registry.get(name)?.isAvailable(opts)) ?? false;
-    } catch {
-      return false;
-    }
+    return (await this.describeReadiness(name, opts)).readiness === "present";
   }
 
   async getRequestAuth(name: string, ctx: RequestAuthContext): Promise<RequestAuth> {

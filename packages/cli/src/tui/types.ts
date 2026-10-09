@@ -3,6 +3,9 @@
  * avoid circular imports back into the root component.
  */
 
+import type { RouteTier } from "../providers/provider-definitions.js";
+import type { CandidateOutcome } from "../providers/routing-rules.js";
+
 export type Tab = "providers" | "profiles" | "routing" | "privacy" | "onepassword";
 
 export type Mode =
@@ -39,41 +42,88 @@ export type Mode =
 export type RoutingScope = "global" | "project";
 
 /**
- * A single row in the routing rules table. Rows from all three layers
- * (built-in defaults, global config, project-local config) are shown
- * concurrently — no shadowing in the UI. If a pattern exists at multiple
- * layers, multiple rows render and each is independently editable.
+ * A single row in the routing rules table — one of the USER's own rules, from
+ * global config or from project-local config. Both layers are shown
+ * concurrently, with no shadowing in the UI: if a pattern exists at both,
+ * two rows render and each is independently editable.
  *
- * Marker priority: project (▴ cyan) > override (★ yellow) > user (• green)
- * > default (· dim). `overridesDefault` is true when a user rule (global
- * or project) shares an exact pattern key with a built-in default — used
- * to pick ★ vs • for the marker. The runtime routing engine still applies
- * precedence (project beats global beats default), but the table reflects
- * disk state.
+ * There is no third `"default"` kind and no `overridesDefault` flag any more.
+ * Both described the shipped table of built-in rules, which was deleted when
+ * routing started gathering its candidates from the cloud models catalog.
+ * Nothing is left for a user rule to "override": a rule that matches is the
+ * whole chain, used verbatim, and a model with no matching rule is routed from
+ * the catalog. Keeping the flag would have gone on drawing a ★ against a
+ * comparison that no longer exists. A `"*"` rule is a row like the others.
+ *
+ * Marker priority: project (▴ cyan) > global (• green). The runtime routing
+ * engine still applies precedence (project beats global), but the table
+ * reflects disk state.
  */
 export interface MergedRule {
-  kind: "default" | "global" | "project";
+  kind: "global" | "project";
   pattern: string;
   chain: string[];
-  /** True when a user rule (global or project) shares a key with a built-in default. */
-  overridesDefault: boolean;
 }
 
 export type ProbeMode = "idle" | "input" | "running" | "done";
 
+/** What removed a route candidate: every `CandidateOutcome` except `kept`. */
+export type DroppedOutcome = Exclude<CandidateOutcome, "kept">;
+
+/**
+ * One row of the route probe: one candidate of the chain `explainRoute`
+ * calculated, in chain order, or the native passthrough.
+ */
 export interface ProbeEntry {
   provider: string;
   displayName: string;
   /**
-   * `unverified`: the route is real but this process cannot probe it — the
-   * native Claude passthrough, whose auth is the inbound Claude Code header.
-   * Neither a success nor a failure; the panel must not fold it into either.
+   * - `pending` → `testing` → `success` | `failed`, or `skipped` (not reached
+   *   because an earlier hop answered): a KEPT hop, which the probe tests.
+   * - `dropped`: `explainRoute` removed this candidate; `outcome` names the
+   *   filter. Never tested: the credential and availability verdicts are
+   *   `explainRoute`'s, and the probe keeps no second opinion.
+   * - `unverified`: the route is real but this process cannot probe it — the
+   *   native Claude passthrough, whose auth is the inbound Claude Code header.
+   *   Neither a success nor a failure; the panel must not fold it into either.
+   * - `no_key`: no longer produced. A missing credential is `dropped` with
+   *   outcome `no-credential`. It stays in the union only because
+   *   `probe-outcome.test.ts` names it; remove the two together.
    */
-  status: "pending" | "testing" | "success" | "failed" | "skipped" | "no_key" | "unverified";
+  status:
+    | "pending"
+    | "testing"
+    | "success"
+    | "failed"
+    | "skipped"
+    | "dropped"
+    | "no_key"
+    | "unverified";
+  /** `dropped` only: the filter that removed the candidate. */
+  outcome?: DroppedOutcome;
+  /** The spec a kept hop is probed with: exactly the `Route.modelSpec` a request uses. */
+  modelSpec?: string;
+  /** The definition's tier; absent for a provider no definition carries. */
+  tier?: RouteTier;
+  /** `fallback`: the fallback hop's position, whichever provider holds it. */
+  position?: "candidate" | "fallback";
   error?: string;
   ms?: number;
-  hasKey?: boolean;
-  reason?: string;
+}
+
+/**
+ * What the route probe says about the decision as a whole, beside its rows. All
+ * of it comes from one `explainRoute` call.
+ */
+export interface ProbeSummary {
+  /** `describeRouteExplanation`: where the chain came from, worded as `--probe` words it. */
+  line: string;
+  /** The explanation's warnings (billing notices, rule problems), one line each. */
+  warnings: string[];
+  /** Facts about the decision that are not warnings (a withheld fallback hop, native auth). */
+  notes: string[];
+  /** A no-route decision: the reason and hint `route()` would return, verbatim. */
+  noRoute?: { reason: string; hint?: string };
 }
 
 export interface TestResult {

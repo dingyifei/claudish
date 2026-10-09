@@ -17,7 +17,7 @@
  */
 export const PROVIDER_FILTER_ALIAS_EXTRA: Record<string, string> = {
   gem: "google",
-  // Legacy picker value for OpenCode Zen; the roster now uses the definition
+  // Legacy picker value for OpenCode Zen; the provider list now uses the definition
   // name, and both still resolve downstream.
   zen: "opencode-zen",
 };

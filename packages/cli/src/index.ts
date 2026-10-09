@@ -1,5 +1,10 @@
 #!/usr/bin/env bun
 
+// FIRST import, on purpose: in an MCP pane child it restores the server's exact
+// environment and cwd at import time — before `.env` loading and before any module
+// below reads the environment while it is being evaluated. A no-op everywhere else.
+import { assertPaneChildInteractive, paneChildBootNotes } from "./pane/child-env.js";
+
 // Load .env file before anything else (quiet mode to suppress verbose output)
 import { config } from "dotenv";
 config({ quiet: true }); // Loads .env from current working directory
@@ -15,6 +20,15 @@ import {
   traceSpan,
 } from "./startup-trace.js";
 import type { ClassifierStats } from "./types.js";
+// Two leaves that import NOTHING — see their headers. Static here on purpose: they
+// must not drag anything into this file's cold-start graph.
+import { canDrawTui } from "./tui/runtime/can-draw-tui.js";
+import { PickerCancelled } from "./tui/runtime/picker-cancelled.js";
+import {
+  type ModelPickerGate,
+  requiresExplicitModel,
+  shouldOpenPicker,
+} from "./tui/runtime/should-open-picker.js";
 
 // ── Startup-timing analytics (startup-trace.ts) ─────────────────────────────
 // Every launch appends one JSON line to ~/.claudish/startup-metrics.jsonl; a
@@ -281,6 +295,36 @@ const isProxyDaemon = process.argv.includes("--proxy-daemon");
 // a runaway daemon. A recovery path must not depend on the thing that broke.
 const isProxyManagementCommand = process.argv.slice(2).find((a) => !a.startsWith("-")) === "proxy";
 
+// `--default-provider <name>`: strip it from argv and export it as
+// CLAUDISH_DEFAULT_PROVIDER before parseArgs and every subcommand dispatch. The env
+// variable is the ONE place the flag lives after this: route(), the proxy, `--probe`
+// and every child claudish (team, channel sessions) read it through
+// `resolveDefaultProvider`. `--probe` is why this cannot wait for parseArgs: it
+// runs and exits inside parseArgs's argv loop, so a flag read there or after it
+// never reached it, in either argv order.
+//
+// Runs AFTER the two explicit 1Password flags, which overwrite env
+// unconditionally: an --op-env or --op value for CLAUDISH_DEFAULT_PROVIDER must
+// not beat the flag the user typed.
+async function applyDefaultProviderFlag(): Promise<void> {
+  const { planDefaultProviderFlag } = await import("./default-provider.js");
+  const plan = planDefaultProviderFlag(process.argv.slice(2));
+  if (plan.kind === "none") return;
+  if (plan.kind === "error") {
+    console.error(`[claudish] ${plan.message}`);
+    process.exit(1);
+  }
+
+  process.argv = [...process.argv.slice(0, 2), ...plan.argv];
+  // An in-process env write reaches children only because they INHERIT process.env:
+  // every claudish child today is spawned through node:child_process, with
+  // `...process.env` or default inheritance. `Bun.spawn`/`Bun.spawnSync` without an
+  // `env` option DROP in-process writes (measured on Bun 1.4.0), so a future spawn
+  // written that way silently loses this flag. Pass `env: process.env` there.
+  // `""` is exported as-is: it disables the fallback hop.
+  process.env.CLAUDISH_DEFAULT_PROVIDER = plan.value;
+}
+
 // The config override runs for the daemon TOO, unlike the op:// steps below.
 // It is not merely an env var: setConfigFileOverride() installs process-wide
 // in-process state that every config reader consults, and the daemon is a fresh
@@ -291,12 +335,28 @@ if (!isProxyDaemon && !isProxyManagementCommand) {
   await traceSpan("startup:op-env-flags", () => applyOpEnvironment());
   await traceSpan("startup:op-import-flag", () => applyOpImport());
 }
+await traceSpan("startup:default-provider-flag", () => applyDefaultProviderFlag());
 
 // Check for MCP mode before loading heavy dependencies
 const isMcpMode = process.argv.includes("--mcp");
 
 // Handle Ctrl+C gracefully during interactive prompts
+//
+// ONE CONDITION WIDER THAN IT WAS, and that is the only edit the new model picker
+// needs at a call site. `PickerCancelled` is what `selectModel` now throws when the
+// user declines to choose — it replaces a `process.exit(0)` that used to live INSIDE
+// the library (`model-selector.ts:822`). This handler is already attached at all three
+// entry points that can reach the picker (`:428`, `:432`, `:804`), so the blank line
+// and the exit 0 are byte-identical at every one of them and no caller changes.
+//
+// `NoTtyError` is deliberately NOT caught here. The user did not decline; the
+// environment could not ask. An exit 0 with no model chosen is indistinguishable from
+// success to a headless caller, so that one has to surface and exit non-zero.
 function handlePromptExit(err: unknown): void {
+  if (err instanceof PickerCancelled) {
+    console.log("");
+    process.exit(0);
+  }
   if (err && typeof err === "object" && "name" in err && err.name === "ExitPromptError") {
     console.log("");
     process.exit(0);
@@ -652,7 +712,7 @@ async function runCli() {
     getMissingKeyResolutions,
     getMissingKeysError,
   } = await import("./providers/provider-resolver.js");
-  const { initLogger, getLogFilePath, getAlwaysOnLogPath, setDiagOutput } = await import(
+  const { initLogger, getLogFilePath, getAlwaysOnLogPath, setDiagOutput, log } = await import(
     "./logger.js"
   );
   const { createDiagOutput } = await import("./diag-output.js");
@@ -689,15 +749,20 @@ async function runCli() {
     // --version/--models/--probe exit inside — the exit-hook fallback covers them)
     const cliConfig = await traceSpan("startup:parse-args", () => parseArgs(process.argv.slice(2)));
 
+    // An MCP pane child must be an interactive REPL: a positional prompt, -p,
+    // --stdin or --team that slipped past the server's flag check exits 64 here,
+    // before any team dispatch or proxy start. A no-op outside a pane child.
+    assertPaneChildInteractive(cliConfig);
+
     // Register the bundled endpoint catalog before ANYTHING enumerates or
     // validates providers. Two consumers below need it and both run long before
     // the proxy (which has always registered endpoints for the request path):
-    // the interactive picker enumerates the roster, and `validateApiKeysForModels`
+    // the interactive picker enumerates the provider list, and `validateApiKeysForModels`
     // decides whether an explicit `vendor@model` has a credential — a provider
     // that is not registered yet reads as an unknown one.
     //
     // Placed AFTER parseArgs on purpose: terminal flags (`--version`, `--models`,
-    // `--probe`) exit inside it, so those paths pay nothing for a roster they
+    // `--probe`) exit inside it, so those paths pay nothing for a provider list they
     // never show. Sync, config-only, idempotent; dynamically imported like every
     // other heavy module in runCli.
     await traceSpan("startup:endpoint-registration", async () => {
@@ -721,12 +786,27 @@ async function runCli() {
       const sessionPath = join(process.cwd(), `.claudish-team-${Date.now()}`);
 
       if (mode === "json") {
-        // JSON mode: run models without grid, collect JSON output to stdout
-        const { setupSession, runModels } = await import("./team-orchestrator.js");
+        // JSON mode: every model runs as an interactive pane in a headless magmux (the
+        // same runModels as the MCP `team` tool); each answer is read from its
+        // transcript, so no child output flag is passed. Ctrl-C reaps every pane.
+        const { installPaneShutdownHooks } = await import("./pane/index.js");
+        const { preflightTeamRun, setupSession, runModels } = await import(
+          "./team-orchestrator.js"
+        );
+        installPaneShutdownHooks({ exitAfter: true });
+        try {
+          await preflightTeamRun({
+            path: sessionPath,
+            slots: cliConfig.team.length,
+            input: prompt,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Error: ${msg}`);
+          process.exit(msg.startsWith("invalid_args") ? 2 : 1);
+        }
         setupSession(sessionPath, cliConfig.team, prompt);
-        const status = await runModels(sessionPath, {
-          claudeFlags: ["--json"],
-        });
+        const status = await runModels(sessionPath);
 
         // Build JSON result with model responses included
         const result: Record<string, unknown> = { ...status, responses: {} };
@@ -846,6 +926,7 @@ async function runCli() {
 
     // Initialize logger: always-on structural logging + optional debug logging
     initLogger(cliConfig.debug, cliConfig.logLevel, cliConfig.noLogs);
+    for (const note of paneChildBootNotes()) log(note);
 
     // Initialize telemetry (reads consent, generates session_id)
     // Must come after parseArgs() so cliConfig.interactive is known
@@ -897,22 +978,35 @@ async function runCli() {
 
     // Show interactive model selector ONLY when no model configuration exists
     // Skip if: explicit --model, OR profile provides tier mappings (Claude Code uses these internally)
-    const hasProfileTiers =
+    const hasProfileTiers = Boolean(
       cliConfig.modelOpus ||
-      cliConfig.modelSonnet ||
-      cliConfig.modelHaiku ||
-      cliConfig.modelSubagent;
+        cliConfig.modelSonnet ||
+        cliConfig.modelHaiku ||
+        cliConfig.modelSubagent
+    );
     // `--advisor` with no main model is a native session: Claude Code picks its own
-    // model, so there is nothing to select and nothing to demand. Both gates below
-    // were satisfied by --advisor implying --monitor; the predicate replaces that.
+    // model, so there is nothing to select and nothing to demand. It rides INSIDE the
+    // gate below, beside `monitor`, rather than as a separate `&&` at each call site:
+    // a term carried by only one of the two gates is how they drift apart.
     const advisorNativeSession = isAdvisorNativeSession(cliConfig);
-    if (
-      cliConfig.interactive &&
-      !cliConfig.monitor &&
-      !advisorNativeSession &&
-      !cliConfig.model &&
-      !hasProfileTiers
-    ) {
+    // ONE predicate behind BOTH gates below (tui/runtime/should-open-picker.ts), and the
+    // second is the exact complement of the first, so no input can skip the picker
+    // silently AND keep the error quiet. The `interactive` flag alone is not enough:
+    // cli.ts turns it on whenever no prompt was given, which includes `claudish <
+    // /dev/null`, a CI runner and a detached run — none of which can answer a prompt.
+    // Hence the TTY term, from the same oracle the resume picker uses below.
+    const pickerCanDraw = canDrawTui();
+    // Rebuilt per call rather than hoisted: the picker ASSIGNS cliConfig.model between
+    // the two gates, and the second one must see the model the first one obtained.
+    const pickerGate = (): ModelPickerGate => ({
+      interactive: cliConfig.interactive,
+      monitor: cliConfig.monitor,
+      advisorNativeSession,
+      model: cliConfig.model,
+      hasProfileTiers,
+    });
+
+    if (shouldOpenPicker(pickerGate(), pickerCanDraw)) {
       // Human wait (the interactive picker) + per-provider credential probes.
       cliConfig.model = (await traceSpan(
         "startup:model-select",
@@ -922,14 +1016,14 @@ async function runCli() {
       console.log(""); // Empty line after selection
     }
 
-    // In non-interactive mode, model must be specified (via --model, env var, or profile)
-    if (
-      !cliConfig.interactive &&
-      !cliConfig.monitor &&
-      !advisorNativeSession &&
-      !cliConfig.model &&
-      !hasProfileTiers
-    ) {
+    // No picker could run — non-interactive, or no terminal to draw one on — so the
+    // model has to come from the command line (--model, env var, or profile). NOT a
+    // fallback to the line-oriented prompt: in a non-TTY that prompt is the bug, not
+    // the safety net, so "falling back" would be falling back to a hang. These three
+    // lines — naming four ways to supply a model — are what a piped bare `claudish`
+    // prints now, where it used to paint a provider list into stdout and then block
+    // forever (measured: 195 bytes of menu, cursor-hide escape, killed at 45s).
+    if (requiresExplicitModel(pickerGate(), pickerCanDraw)) {
       console.error("Error: Model must be specified in non-interactive mode");
       console.error("Use --model <model> flag, set CLAUDISH_MODEL env var, or use --profile");
       console.error("Try: claudish --models");
@@ -1156,8 +1250,7 @@ async function runCli() {
       //     report "no sessions" and `exit(0)` — turning a previously working flag into
       //     a silent no-op in every non-git directory. Sessions may well exist there;
       //     claudish just has no worktree structure to group them by.
-      const canDrawTui = Boolean(process.stdin.isTTY && process.stdout.isTTY);
-      if (!canDrawTui || cliConfig._hasPrintFlag || !cliConfig.interactive) {
+      if (!canDrawTui() || cliConfig._hasPrintFlag || !cliConfig.interactive) {
         cliConfig.claudeArgs.push("--resume");
       } else {
         const { runResumePicker } = await import("./session/resume-picker-run.js");

@@ -1,3 +1,4 @@
+import { catalogRouteForProvider } from "./providers/catalog-route-bindings.js";
 /**
  * Tests for the pure-logic helpers in `model-selector.ts`.
  *
@@ -18,6 +19,7 @@ import {
 } from "./handlers/shared/remote-provider-types.js";
 import {
   type ModelInfo,
+  buildDiscoveredModelRows,
   buildExplicitModelSpec,
   buildProviderChoices,
   getProviderFilterAliases,
@@ -29,13 +31,23 @@ import {
 } from "./model-selector.js";
 import { createCatalogClient } from "./providers/model-catalog.js";
 import {
+  type DiscoveredModel,
   type DiscoveryFailureKind,
   discoverProviderModels,
+  discoverProviderModelsCatalog,
   getDiscoveryFailure,
   invalidateModelDiscovery,
+  registerModelDiscoveryFetcher,
 } from "./providers/model-discovery.js";
 import { parseModelSpec } from "./providers/model-parser.js";
 import { BUILTIN_PROVIDERS, getProviderByName } from "./providers/provider-definitions.js";
+import { clearRuntimeRegistry, registerRuntimeProvider } from "./providers/runtime-providers.js";
+import {
+  _clearChatCapabilityIndex,
+  isReportedChatCapable,
+  ollamaReported,
+} from "./providers/transport/probe-discovery.js";
+import { discoverProviderProbeModel } from "./providers/transport/provider-model-discovery.js";
 
 // ─── pickerProviderToFirebaseSlug ────────────────────────────────────────────
 
@@ -44,8 +56,8 @@ import { BUILTIN_PROVIDERS, getProviderByName } from "./providers/provider-defin
 // ─── buildExplicitModelSpec ──────────────────────────────────────────────────
 
 describe("warnDiscoveryFailure", () => {
-  const provider = "qwen-cloud";
-  const displayName = "Qwen Plan";
+  const provider = "qwen-token-plan";
+  const displayName = "Alibaba Token Plan";
   const def = getProviderByName(provider)!;
   const realFetch = globalThis.fetch;
   const realGetRequestAuth = credentials.getRequestAuth;
@@ -91,7 +103,7 @@ describe("warnDiscoveryFailure", () => {
           async () => new Response("not-json", { status: 200 })
         ) as unknown as typeof fetch;
         break;
-      case "empty-roster":
+      case "empty-models-catalog":
         globalThis.fetch = mock(
           async () => new Response(JSON.stringify({ data: [] }), { status: 200 })
         ) as unknown as typeof fetch;
@@ -124,10 +136,10 @@ describe("warnDiscoveryFailure", () => {
     }
   }
 
-  test("writes nothing when no failure is recorded or the roster is empty", async () => {
+  test("writes nothing when no failure is recorded or the dynamic models catalog is empty", async () => {
     expect(captureWarning()).toEqual({ stderr: "", stdout: "", stderrCalls: 0, stdoutCalls: 0 });
 
-    await recordFailure("empty-roster");
+    await recordFailure("empty-models-catalog");
     expect(captureWarning()).toEqual({ stderr: "", stdout: "", stderrCalls: 0, stdoutCalls: 0 });
   });
 
@@ -138,10 +150,8 @@ describe("warnDiscoveryFailure", () => {
 
       const output = captureWarning();
       expect(output.stderr).toContain(displayName);
-      expect(output.stderr).toContain("QWEN_CLOUD_PLAN_API_KEY");
-      expect(output.stderr).toContain(
-        "https://www.alibabacloud.com/help/en/model-studio/claude-code"
-      );
+      expect(output.stderr).toContain("QWEN_TOKEN_PLAN_API_KEY");
+      expect(output.stderr).toContain("https://docs.qwencloud.com/token-plan/overview");
       expect(output.stderr).toContain("Falling back to manual model entry.");
       expect(output.stderrCalls).toBeGreaterThan(0);
       expect(output.stdout).toBe("");
@@ -157,15 +167,209 @@ describe("warnDiscoveryFailure", () => {
       const output = captureWarning();
       expect(output.stderr).toContain(displayName);
       expect(output.stderr).toContain("Falling back to manual model entry.");
-      expect(output.stderr).not.toContain("QWEN_CLOUD_PLAN_API_KEY");
-      expect(output.stderr).not.toContain(
-        "https://www.alibabacloud.com/help/en/model-studio/claude-code"
-      );
+      expect(output.stderr).not.toContain("QWEN_TOKEN_PLAN_API_KEY");
+      expect(output.stderr).not.toContain("https://docs.qwencloud.com/token-plan/overview");
       expect(output.stderrCalls).toBeGreaterThan(0);
       expect(output.stdout).toBe("");
       expect(output.stdoutCalls).toBe(0);
     }
   );
+});
+
+describe("provider-reported chat capability in discovered model callers", () => {
+  const provider = "reported-capability-test";
+  const format = "reported-capability-test-format";
+  let discovered: DiscoveredModel[] = [];
+
+  const catalog = createCatalogClient({
+    getModelsByProvider: async () => {
+      throw new Error("local discovered rows must not query the cloud catalog");
+    },
+    readSlimCache: () => null,
+  });
+
+  beforeEach(() => {
+    invalidateModelDiscovery();
+    clearRuntimeRegistry();
+    _clearChatCapabilityIndex();
+    discovered = [];
+
+    const localTemplate = getProviderByName("ollama")!;
+    registerRuntimeProvider({
+      ...localTemplate,
+      name: provider,
+      displayName: "Reported Capability Test",
+      shortcuts: [],
+      legacyPrefixes: [],
+      modelDiscovery: {
+        path: "",
+        format: format as "ollama-tags",
+      },
+    });
+    registerModelDiscoveryFetcher(format, async () => ({ kind: "models", models: discovered }));
+  });
+
+  afterEach(() => {
+    invalidateModelDiscovery();
+    clearRuntimeRegistry();
+    _clearChatCapabilityIndex();
+  });
+
+  test("buildDiscoveredModelRows keeps catalog-unknown rows reported as chat", async () => {
+    discovered = [
+      { id: "swe-1-7-medium", reported: "chat" },
+      { id: "gemini-3.6-flash-high", reported: "chat" },
+      { id: "llama3.2:3b-q4_K_M", reported: "chat" },
+    ];
+
+    const rows = await buildDiscoveredModelRows(provider, "Reported Capability Test", catalog);
+
+    expect(rows.map((row) => row.id).sort()).toEqual(
+      ["swe-1-7-medium", "gemini-3.6-flash-high", "llama3.2:3b-q4_K_M"].sort()
+    );
+  });
+
+  test("buildDiscoveredModelRows drops a row reported as not-chat", async () => {
+    discovered = [{ id: "nomic-embed-text:latest", reported: "not-chat" }];
+
+    expect(await buildDiscoveredModelRows(provider, "Reported Capability Test", catalog)).toEqual(
+      []
+    );
+  });
+
+  test("buildDiscoveredModelRows still drops a catalog-unknown row with no report", async () => {
+    discovered = [{ id: "granite3.2-vision:2b-instruct-q4_K_M" }];
+
+    expect(await buildDiscoveredModelRows(provider, "Reported Capability Test", catalog)).toEqual(
+      []
+    );
+  });
+
+  test("discoverProviderProbeModel picks from catalog-unknown rows reported as chat", async () => {
+    discovered = [
+      { id: "swe-1-7-medium", reported: "chat" },
+      { id: "gemini-3.6-flash-high", reported: "chat" },
+      { id: "llama3.2:3b-q4_K_M", reported: "chat" },
+    ];
+
+    const outcome = await discoverProviderProbeModel(provider, "Reported Capability Test");
+
+    expect(outcome.model).not.toBeNull();
+    expect(discovered.map((row) => row.id)).toContain(outcome.model!);
+    expect(outcome.reason).toBeUndefined();
+  });
+
+  test("discoverProviderProbeModel still rejects a catalog-unknown row with no report", async () => {
+    discovered = [{ id: "granite3.2-vision:2b-instruct-q4_K_M" }];
+
+    expect(await discoverProviderProbeModel(provider, "Reported Capability Test")).toEqual({
+      model: null,
+      reason: "no chat-capable model among the 1 listed by Reported Capability Test",
+    });
+  });
+});
+
+describe("Ollama discovery capability reports", () => {
+  let realFetch: typeof globalThis.fetch;
+  let realOllamaHost: string | undefined;
+
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+    realOllamaHost = process.env.OLLAMA_HOST;
+    process.env.OLLAMA_HOST = "http://ollama-picker.test";
+    invalidateModelDiscovery("ollama");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (realOllamaHost === undefined) delete process.env.OLLAMA_HOST;
+    else process.env.OLLAMA_HOST = realOllamaHost;
+    invalidateModelDiscovery("ollama");
+  });
+
+  test("enriches missing tag capabilities before the picker filters discovered models", async () => {
+    const showRequests: string[] = [];
+    globalThis.fetch = mock(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/api/tags") {
+        return Response.json({
+          models: [{ name: "llama3.2:3b" }, { name: "nomic-embed-text:latest" }],
+        });
+      }
+      if (url.pathname === "/api/show") {
+        const body = JSON.parse(String(init?.body)) as { name: string };
+        showRequests.push(body.name);
+        return Response.json({
+          capabilities: body.name === "llama3.2:3b" ? ["completion", "tools"] : ["embedding"],
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const outcome = await discoverProviderModelsCatalog("ollama");
+
+    expect(showRequests.sort()).toEqual(["llama3.2:3b", "nomic-embed-text:latest"].sort());
+    expect(outcome.kind).toBe("served");
+    if (outcome.kind !== "served") throw new Error("unreachable");
+    expect(outcome.models).toEqual([
+      {
+        id: "llama3.2:3b",
+        displayName: "llama3.2:3b",
+        supportsTools: true,
+        reported: "chat",
+      },
+    ]);
+    expect(
+      outcome.models.filter((model) => isReportedChatCapable(model.id, model.reported))
+    ).toEqual(outcome.models);
+    expect(outcome.models.map((model) => model.id)).not.toContain("nomic-embed-text:latest");
+  });
+
+  test("uses inline tag capabilities without requesting per-model details", async () => {
+    let showRequests = 0;
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/api/tags") {
+        return Response.json({
+          models: [
+            { name: "llama3.2:3b", capabilities: ["completion", "tools"] },
+            { name: "qwen2.5-coder:7b", capabilities: ["completion"] },
+          ],
+        });
+      }
+      if (url.pathname === "/api/show") {
+        showRequests++;
+        return Response.json({ capabilities: ["completion"] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const outcome = await discoverProviderModelsCatalog("ollama");
+
+    expect(showRequests).toBe(0);
+    expect(outcome.kind).toBe("served");
+    if (outcome.kind !== "served") throw new Error("unreachable");
+    expect(outcome.models).toEqual([
+      {
+        id: "llama3.2:3b",
+        displayName: "llama3.2:3b",
+        supportsTools: true,
+        reported: "chat",
+      },
+      {
+        id: "qwen2.5-coder:7b",
+        displayName: "qwen2.5-coder:7b",
+        supportsTools: false,
+        reported: "chat",
+      },
+    ]);
+  });
+
+  test("ollamaReported maps completion, embedding, and silence", () => {
+    expect(ollamaReported({ capabilities: ["completion", "tools"] })).toBe("chat");
+    expect(ollamaReported({ capabilities: ["embedding"] })).toBe("not-chat");
+    expect(ollamaReported({})).toBeUndefined();
+  });
 });
 
 describe("buildExplicitModelSpec", () => {
@@ -181,7 +385,7 @@ describe("buildExplicitModelSpec", () => {
     ["minimax-coding", "MiniMax-M2", "mmc@MiniMax-M2"],
     ["kimi", "kimi-k2", "kimi@kimi-k2"],
     ["kimi-coding", "kimi-for-coding", "kc@kimi-for-coding"],
-    ["qwen-payg", "qwen3.7-plus", "qp@qwen3.7-plus"],
+    ["qwen-payg", "qwen3.7-plus", "qpay@qwen3.7-plus"],
     // antigravity renders google-catalog rows in the picker; without a prefix
     // entry, rows would emit a bare id that won't route to Antigravity.
     ["antigravity", "gemini-3-pro", "ag@gemini-3-pro"],
@@ -207,9 +411,9 @@ describe("buildExplicitModelSpec", () => {
   });
 });
 
-// ─── picker provider roster ──────────────────────────────────────────────────
+// ─── picker provider list ────────────────────────────────────────────────────
 
-describe("picker provider roster", () => {
+describe("picker provider list", () => {
   const pickableBuiltins = BUILTIN_PROVIDERS.filter(isPickableProvider);
   const unpickableBuiltins = BUILTIN_PROVIDERS.filter((def) => !isPickableProvider(def));
 
@@ -316,8 +520,11 @@ describe("picker provider roster", () => {
         provider: "Google",
         aggregators: [
           {
-            provider: "antigravity",
-            externalId: "gemini-3.1-pro-high",
+            sourceCollectorId: "test",
+            routeStatus: "mapped" as const,
+            route: catalogRouteForProvider("antigravity"),
+            sourceProviderId: "antigravity",
+            externalModelId: "gemini-3.1-pro-high",
             confidence: "gateway_official",
           },
         ],
@@ -329,8 +536,11 @@ describe("picker provider roster", () => {
         provider: "Google",
         aggregators: [
           {
-            provider: "antigravity",
-            externalId: "gemini-3.1-pro-high",
+            sourceCollectorId: "test",
+            routeStatus: "mapped" as const,
+            route: catalogRouteForProvider("antigravity"),
+            sourceProviderId: "antigravity",
+            externalModelId: "gemini-3.1-pro-high",
             confidence: "gateway_official",
           },
         ],
@@ -358,8 +568,11 @@ describe("picker provider roster", () => {
           provider: "Google",
           aggregators: [
             {
-              provider: "antigravity",
-              externalId: "gemini-3.1-flash",
+              sourceCollectorId: "test",
+              routeStatus: "mapped" as const,
+              route: catalogRouteForProvider("antigravity"),
+              sourceProviderId: "antigravity",
+              externalModelId: "gemini-3.1-flash",
               confidence: "gateway_official",
             },
           ],
@@ -379,8 +592,11 @@ describe("picker provider roster", () => {
         provider: "Google",
         aggregators: [
           {
-            provider: "openrouter",
-            externalId: "google/gemini-3.1-pro-preview",
+            sourceCollectorId: "test",
+            routeStatus: "mapped" as const,
+            route: catalogRouteForProvider("openrouter"),
+            sourceProviderId: "openrouter",
+            externalModelId: "google/gemini-3.1-pro-preview",
             confidence: "gateway_official",
           },
         ],
@@ -404,9 +620,30 @@ describe("resolveProviderExternalId", () => {
     description: "",
     provider: "OpenAI",
     aggregators: [
-      { provider: "openai", externalId: "gpt-5", confidence: "api_official" },
-      { provider: "openrouter", externalId: "openai/gpt-5", confidence: "gateway_official" },
-      { provider: "opencode-zen", externalId: "openai/gpt-5", confidence: "gateway_official" },
+      {
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("openai"),
+        sourceProviderId: "openai",
+        externalModelId: "gpt-5",
+        confidence: "api_official",
+      },
+      {
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("openrouter"),
+        sourceProviderId: "openrouter",
+        externalModelId: "openai/gpt-5",
+        confidence: "gateway_official",
+      },
+      {
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("opencode-zen"),
+        sourceProviderId: "opencode-zen",
+        externalModelId: "openai/gpt-5",
+        confidence: "gateway_official",
+      },
     ],
   };
 
@@ -471,20 +708,29 @@ describe("resolveProviderDisplayPrice", () => {
     pricing: { input: "$1.25", output: "$10.00", average: "$5.63/1M" },
     aggregators: [
       {
-        provider: "openai",
-        externalId: "gpt-5",
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("openai"),
+        sourceProviderId: "openai",
+        externalModelId: "gpt-5",
         confidence: "api_official",
         pricing: { input: 1.25, output: 10 },
       },
       {
-        provider: "openrouter",
-        externalId: "openai/gpt-5",
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("openrouter"),
+        sourceProviderId: "openrouter",
+        externalModelId: "openai/gpt-5",
         confidence: "gateway_official",
         pricing: { input: 1.3, output: 10.5 }, // marked-up gateway rate
       },
       {
-        provider: "opencode-zen",
-        externalId: "openai/gpt-5",
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("opencode-zen"),
+        sourceProviderId: "opencode-zen",
+        externalModelId: "openai/gpt-5",
         confidence: "gateway_official",
         pricing: { input: 1.07, output: 8.5 }, // cheaper gateway rate
       },
@@ -499,20 +745,29 @@ describe("resolveProviderDisplayPrice", () => {
     pricing: { input: "$1.25", output: "$10.00", average: "$5.63/1M" },
     aggregators: [
       {
-        provider: "openai",
-        externalId: "priced-model",
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("openai"),
+        sourceProviderId: "openai",
+        externalModelId: "priced-model",
         confidence: "api_official",
         pricing: { input: 1.25, output: 10 },
       },
       {
-        provider: "antigravity",
-        externalId: "priced-model",
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("antigravity"),
+        sourceProviderId: "antigravity",
+        externalModelId: "priced-model",
         confidence: "gateway_official",
         pricing: { input: 2, output: 12 },
       },
       {
-        provider: "sakana",
-        externalId: "priced-model",
+        sourceCollectorId: "test",
+        routeStatus: "mapped" as const,
+        route: catalogRouteForProvider("sakana"),
+        sourceProviderId: "sakana",
+        externalModelId: "priced-model",
         confidence: "gateway_official",
         pricing: { input: 3, output: 13 },
       },
@@ -530,9 +785,9 @@ describe("resolveProviderDisplayPrice", () => {
     expect(resolveProviderDisplayPrice("openai", pricedAcrossBillingModes)).toBe("$5.63/1M");
   });
 
-  test("keeps qwen-payg metered while qwen-cloud remains subscription-priced", () => {
+  test("keeps qwen-payg metered while qwen-token-plan remains subscription-priced", () => {
     expect(isSubscriptionProvider("qwen-payg")).toBe(false);
-    expect(isSubscriptionProvider("qwen-cloud")).toBe(true);
+    expect(isSubscriptionProvider("qwen-token-plan")).toBe(true);
     expect(resolveProviderDisplayPrice("qwen-payg", pricedAcrossBillingModes)).toBe("$5.63/1M");
     expect(resolveProviderDisplayPrice("qwen-payg", pricedAcrossBillingModes)).not.toBe("SUB");
   });
@@ -578,7 +833,14 @@ describe("resolveProviderDisplayPrice", () => {
       pricing: { input: "$1.00", output: "$2.00", average: "$1.50/1M" },
       aggregators: [
         // openrouter entry exists but carries NO pricing → fall back to model.pricing
-        { provider: "openrouter", externalId: "x/m", confidence: "gateway_official" },
+        {
+          sourceCollectorId: "test",
+          routeStatus: "mapped" as const,
+          route: catalogRouteForProvider("openrouter"),
+          sourceProviderId: "openrouter",
+          externalModelId: "x/m",
+          confidence: "gateway_official",
+        },
       ],
     };
     expect(resolveProviderDisplayPrice("openrouter", noEntryPrice)).toBe("$1.50/1M");
@@ -590,7 +852,16 @@ describe("resolveProviderDisplayPrice", () => {
       name: "m",
       description: "",
       provider: "OpenAI",
-      aggregators: [{ provider: "openrouter", externalId: "x/m", confidence: "gateway_official" }],
+      aggregators: [
+        {
+          sourceCollectorId: "test",
+          routeStatus: "mapped" as const,
+          route: catalogRouteForProvider("openrouter"),
+          sourceProviderId: "openrouter",
+          externalModelId: "x/m",
+          confidence: "gateway_official",
+        },
+      ],
     };
     expect(resolveProviderDisplayPrice("openrouter", noPrice)).toBe("N/A");
   });
@@ -606,22 +877,30 @@ describe("CatalogClient integration for the original Zen bug", () => {
     // aggregators[].provider. This test verifies the data plumbing is intact
     // independent of the inquirer widgets.
     const fakeReadSlimCache = mock(() => ({
-      version: 2 as const,
+      version: 3 as const,
+      catalogGenerationId: "test-generation",
+      plans: [],
       lastUpdated: new Date().toISOString(),
       entries: [
         {
           modelId: "claude-opus-4-7",
           aliases: [],
-          sources: {},
+
           aggregators: [
             {
-              provider: "anthropic",
-              externalId: "claude-opus-4-7",
+              sourceCollectorId: "test",
+              routeStatus: "mapped" as const,
+              route: catalogRouteForProvider("anthropic"),
+              sourceProviderId: "anthropic",
+              externalModelId: "claude-opus-4-7",
               confidence: "api_official" as const,
             },
             {
-              provider: "opencode-zen",
-              externalId: "anthropic/claude-opus-4-7",
+              sourceCollectorId: "test",
+              routeStatus: "mapped" as const,
+              route: catalogRouteForProvider("opencode-zen"),
+              sourceProviderId: "opencode-zen",
+              externalModelId: "anthropic/claude-opus-4-7",
               confidence: "gateway_official" as const,
             },
           ],
@@ -629,12 +908,22 @@ describe("CatalogClient integration for the original Zen bug", () => {
         {
           modelId: "gpt-5",
           aliases: [],
-          sources: {},
+
           aggregators: [
-            { provider: "openai", externalId: "gpt-5", confidence: "api_official" as const },
             {
-              provider: "opencode-zen",
-              externalId: "openai/gpt-5",
+              sourceCollectorId: "test",
+              routeStatus: "mapped" as const,
+              route: catalogRouteForProvider("openai"),
+              sourceProviderId: "openai",
+              externalModelId: "gpt-5",
+              confidence: "api_official" as const,
+            },
+            {
+              sourceCollectorId: "test",
+              routeStatus: "mapped" as const,
+              route: catalogRouteForProvider("opencode-zen"),
+              sourceProviderId: "opencode-zen",
+              externalModelId: "openai/gpt-5",
               confidence: "gateway_official" as const,
             },
           ],
@@ -642,9 +931,16 @@ describe("CatalogClient integration for the original Zen bug", () => {
         {
           modelId: "grok-4",
           aliases: [],
-          sources: {},
+
           aggregators: [
-            { provider: "x-ai", externalId: "grok-4", confidence: "api_official" as const },
+            {
+              sourceCollectorId: "test",
+              routeStatus: "mapped" as const,
+              route: catalogRouteForProvider("x-ai"),
+              sourceProviderId: "x-ai",
+              externalModelId: "grok-4",
+              confidence: "api_official" as const,
+            },
           ],
         },
       ],

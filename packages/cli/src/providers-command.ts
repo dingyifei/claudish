@@ -62,7 +62,7 @@ export async function collectProviderStatuses(
   // Called with NO argument on purpose. The `config` parameter here is a
   // deliberately narrow `{apiKeys?, localProviders?}` — it exists so the config
   // TUI can classify against an UNSAVED snapshot — and handing that to
-  // registration would mean deciding the endpoint roster from an object with no
+  // registration would mean deciding the endpoint list from an object with no
   // `customEndpoints` and no `predefinedEndpoints` at all. Every user endpoint
   // would vanish and every opt-out would be ignored, silently, for any caller
   // that passed one. Registration reads the real config itself; the latch makes

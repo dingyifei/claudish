@@ -3,9 +3,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { credentials } from "../auth/credentials/authority.js";
 import { __resetSniffForTests } from "../auth/credentials/op-source.js";
 import type { ClaudishProfileConfig } from "../profile-config.js";
+import { type DiskCacheV3, writeAllModelsCache } from "./all-models-cache.js";
 import {
   loadCustomEndpoints,
   resolveCustomEndpointApiKey,
@@ -106,6 +110,90 @@ describe("custom-endpoints-loader", () => {
     expect(def?.isDirectApi).toBe(true);
 
     expect(getRuntimeProfiles().get("my-vllm")).toBeDefined();
+  });
+
+  test("custom endpoint named anthropic is not a route candidate for a Claude model", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-anthropic-endpoint-"));
+    const cachePath = join(dir, "cloud-models-catalog-v3.json");
+
+    try {
+      const cache: DiskCacheV3 = {
+        version: 3,
+        catalogGenerationId: "stage8-custom-endpoint-fixture",
+        lastUpdated: "2026-09-24T00:00:00.000Z",
+        entries: [
+          {
+            modelId: "claude-stage8",
+            aliases: [],
+            provider: "anthropic",
+            aggregators: [
+              {
+                sourceProviderId: "anthropic",
+                sourceCollectorId: "stage8-fixture",
+                confidence: "api_official",
+                routeStatus: "mapped",
+                route: { routeId: "anthropic", routeProfileId: "direct-api" },
+                externalModelId: "claude-stage8",
+              },
+            ],
+          },
+        ],
+        models: [],
+        plans: [],
+      };
+      writeAllModelsCache(cache, cachePath);
+
+      const loaderModuleUrl = new URL("./custom-endpoints-loader.ts", import.meta.url).href;
+      const candidatesModuleUrl = new URL("./route-candidates.ts", import.meta.url).href;
+      const runtimeModuleUrl = new URL("./runtime-providers.ts", import.meta.url).href;
+      const script = `
+        const { loadCustomEndpoints } = await import(${JSON.stringify(loaderModuleUrl)});
+        const { gatherRouteCandidates } = await import(${JSON.stringify(candidatesModuleUrl)});
+        const { clearRuntimeRegistry } = await import(${JSON.stringify(runtimeModuleUrl)});
+        try {
+          const loaded = loadCustomEndpoints({
+            version: "1.0.0",
+            defaultProfile: "default",
+            profiles: {},
+            customEndpoints: {
+              anthropic: {
+                kind: "simple",
+                url: "https://custom-anthropic.invalid/v1",
+                format: "openai",
+                apiKey: "none",
+              },
+            },
+          });
+          const providers = gatherRouteCandidates("claude-stage8", ${JSON.stringify(cachePath)})
+            .candidates.map((candidate) => candidate.provider);
+          process.stdout.write(JSON.stringify({ loaded, providers }));
+        } finally {
+          clearRuntimeRegistry();
+        }
+      `;
+      const child = Bun.spawnSync([process.execPath, "-e", script], {
+        cwd: join(import.meta.dir, "../../../.."),
+        env: {
+          ...process.env,
+          HOME: dir,
+          CLAUDISH_DISABLE_CATALOG_WARM: "1",
+          CLAUDISH_DISABLE_KEYCHAIN: "1",
+          CLAUDISH_DISABLE_OP: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = child.stdout.toString();
+      const stderr = child.stderr.toString();
+
+      expect(child.exitCode, stderr || stdout).toBe(0);
+      expect(JSON.parse(stdout)).toEqual({
+        loaded: { registered: 1, errors: [], refused: [] },
+        providers: [],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("valid complex endpoint with litellm transport: registers", () => {
@@ -699,7 +787,7 @@ describe("custom-endpoints-loader", () => {
     test("anthropic-transport + streamFormat=anthropic-sse: propages to transport.overrideStreamFormat()", () => {
       loadCustomEndpoints(
         makeConfig({
-          "qwen-token-plan": {
+          "test-anthropic-sse": {
             kind: "complex",
             displayName: "Qwen Cloud Token Plan",
             transport: "anthropic",
@@ -711,7 +799,7 @@ describe("custom-endpoints-loader", () => {
         })
       );
 
-      const profile = getRuntimeProfiles().get("qwen-token-plan");
+      const profile = getRuntimeProfiles().get("test-anthropic-sse");
       expect(profile).toBeDefined();
       const handler = profile!.createHandler(makeCtx("qwen3.8-max"))!;
       expect(handler).toBeDefined();

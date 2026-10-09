@@ -84,8 +84,19 @@ export interface ProviderTransport {
   /**
    * Optional request queue for rate limiting / concurrency control.
    * If provided, the ComposedHandler will call this instead of raw fetch.
+   *
+   * `opts.signal` is OPTIONAL, and so is honouring it — the implementations
+   * that ignore the second argument keep compiling and behaving identically.
+   * It exists because a retry attempt is bounded by a per-attempt clamp, and a
+   * clamp that reaches the `fetch` but not the queue admission in front of it
+   * bounds the wrong thing: the caller's wall clock then includes a wait
+   * governed by whatever the ACTIVE request's own timeout is. On the local
+   * queue that number is ten minutes.
    */
-  enqueueRequest?(fetchFn: () => Promise<Response>): Promise<Response>;
+  enqueueRequest?(
+    fetchFn: () => Promise<Response>,
+    opts?: { signal?: AbortSignal }
+  ): Promise<Response>;
 
   /**
    * Optional auth refresh (e.g., OAuth token rotation).

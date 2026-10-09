@@ -5,10 +5,10 @@ import {
   rankDiscoveredModels,
 } from "../model-discovery.js";
 import { getProviderByName } from "../provider-definitions.js";
-import { type DiscoveryOutcome, isChatCapable } from "./probe-discovery.js";
+import { type DiscoveryOutcome, isReportedChatCapable } from "./probe-discovery.js";
 
 /**
- * Pick a probe model from one provider's authenticated, account-scoped roster.
+ * Pick a probe model from one provider's authenticated, account-scoped dynamic models catalog.
  *
  * The cloud catalog can publish a useful default, but it cannot know which
  * models a subscription credential serves today. Keeping this rule shared by
@@ -39,9 +39,13 @@ export async function discoverProviderProbeModel(
     };
   }
 
+  // Judge each row WITH the provider's own statement before reducing it to an
+  // id. The old order — `.map(id).filter(isChatCapable)` — discarded `reported`
+  // first, so a provider that had described every model still lost the ones the
+  // cloud catalog does not list verbatim, and the probe found nothing to pick.
   const ranked = rankDiscoveredModels(discovered)
-    .map((model) => model.id)
-    .filter(isChatCapable);
+    .filter((model) => isReportedChatCapable(model.id, model.reported))
+    .map((model) => model.id);
   if (ranked.length === 0) {
     return {
       model: null,

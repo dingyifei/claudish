@@ -8,7 +8,36 @@
  * "OAuth_FALLBACK_TO_API_KEY" when its refresh fails and an API key is present).
  */
 
-import type { CredentialProvider, RequestAuth, RequestAuthContext } from "./types.js";
+import type {
+  CredentialProvider,
+  ReadinessResult,
+  RequestAuth,
+  RequestAuthContext,
+} from "./types.js";
+
+/**
+ * One half's readiness, whether or not it implements the tri-state.
+ *
+ * A half that does not is not wrong, only less informative: its `false` means
+ * "absent", which is the answer the whole layer gave before.
+ *
+ * A half that THROWS is deliberately NOT caught here. The old `isAvailable` was
+ * `primary || fallback`, so a throwing half aborted the whole composite and the
+ * authority's catch turned it into `false`. Catching it here instead would let
+ * the fallback answer for a primary that blew up — better-looking, and a real
+ * routing change: a provider that reported unavailable would start reporting
+ * available. The throw propagates, the authority reports `failed`, and `failed`
+ * projects to `false` — the same boolean, with the reason now attached.
+ */
+async function readinessOf(
+  provider: CredentialProvider,
+  opts?: { allowOpPrompt?: boolean }
+): Promise<ReadinessResult> {
+  if (provider.describeReadiness) {
+    return (await provider.describeReadiness(opts)) ?? { readiness: "absent" };
+  }
+  return { readiness: (await provider.isAvailable(opts)) ? "present" : "absent" };
+}
 
 export interface CompositeOptions {
   /**
@@ -37,8 +66,34 @@ export class CompositeCredentialProvider implements CredentialProvider {
     this.opts = opts;
   }
 
+  /**
+   * Readiness for the pair, keeping a half's `failed` instead of flattening it.
+   *
+   * This method is not optional decoration. The fallback half is normally an
+   * `ApiKeyCredentialProvider`, which is the ONLY place the keychain and
+   * 1Password are consulted — so without forwarding, a denied handshake for
+   * `kimi` or `openai-codex` would be reported by this composite as a clean
+   * `absent`, and the tri-state would be dead on arrival for exactly the
+   * subscription providers it exists to protect.
+   *
+   * `present` short-circuits on the primary, matching the old `||` exactly: a
+   * broken fallback store is never consulted, and never downgrades a provider
+   * whose OAuth credential already answered. `failed` beats `absent` because a
+   * store that could not be asked has not established absence.
+   */
+  async describeReadiness(opts?: { allowOpPrompt?: boolean }): Promise<ReadinessResult> {
+    const primary = await readinessOf(this.primary, opts);
+    if (primary.readiness === "present") return primary;
+    const fallback = await readinessOf(this.fallback, opts);
+    if (fallback.readiness === "present") return fallback;
+    if (fallback.readiness === "failed") return fallback;
+    if (primary.readiness === "failed") return primary;
+    return { readiness: "absent" };
+  }
+
+  /** Unchanged contract: the `=== "present"` projection of the above. */
   async isAvailable(opts?: { allowOpPrompt?: boolean }): Promise<boolean> {
-    return (await this.primary.isAvailable(opts)) || (await this.fallback.isAvailable(opts));
+    return (await this.describeReadiness(opts)).readiness === "present";
   }
 
   invalidate(): void {

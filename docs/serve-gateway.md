@@ -156,7 +156,8 @@ GET https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?limit=200&
 
 **Method:** collect every distinct `provider` value the live catalog serves,
 then check each against claudish's routable slug set (`BUILTIN_PROVIDERS` names
-+ shortcuts + the `FIREBASE_SLUG_TO_PROVIDER_NAME` bridge).
++ shortcuts + the vendor → native provider bridge: at the time a hand-written
+table, `FIREBASE_SLUG_TO_PROVIDER_NAME`, since derived by `nativeProviderForVendor`).
 
 **Headline results:**
 
@@ -167,7 +168,7 @@ then check each against claudish's routable slug set (`BUILTIN_PROVIDERS` names
 - **Providers claudish routes directly all align** by identity:
   `openai`, `google`, `deepseek`, `minimax`, `qwen`, `x-ai`, `z-ai`.
 - **One real divergence among direct providers:** catalog **`moonshotai`** ↔
-  claudish **`kimi`**. `FIREBASE_SLUG_TO_PROVIDER_NAME` (`model-loader.ts`)
+  claudish **`kimi`**. `nativeProviderForVendor` (`providers/route-candidates.ts`)
   bridges `moonshotai → kimi` *for the recommended-catalog renderer*, but the
   **serve slot path does not apply that map** — it builds
   `${slot.provider}@${slot.model}` verbatim. So `provider: "moonshotai"` pinned

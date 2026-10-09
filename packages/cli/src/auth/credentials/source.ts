@@ -44,6 +44,7 @@ import { isLocalProviderEnabled } from "../../profile-config.js";
 import { hasDevinCredentials } from "../../providers/devin/devin-credentials.js";
 import { hasSharedAntigravityToken } from "../antigravity-token.js";
 import { hasOAuthCredentials } from "../oauth-registry.js";
+import { peekVertexProjectOrigin } from "../vertex-auth.js";
 import { realValue } from "./api-key-credential.js";
 import { credentials } from "./authority.js";
 
@@ -128,6 +129,22 @@ export function describeSourceSync(p: SourceClassifiable, config: SourceConfig):
   if (p.catalogName === "devin") {
     if (realValue(process.env.WINDSURF_API_KEY)) return "env";
     if (hasDevinCredentials()) return "oauth";
+  }
+  // Vertex's `apiKeyEnvVar` is not a key: it is a Google Cloud PROJECT id, and
+  // `resolveVertexConfig` reads it from the ADC file's `quota_project_id` or
+  // `gcloud config` as readily as from the environment. Without this branch the
+  // env/cfg rules below report `null` — "not configured" — for an install that
+  // signs every request, which is the display half of the defect this fixes.
+  //
+  // `"oauth"` rather than a new union member, for the same reason Devin reuses
+  // it: the credential really is a login-minted token on disk
+  // (`gcloud auth application-default login`), and `CredentialSource` is a WIRE
+  // CONTRACT read by claude-desktop-profiles — a new member costs a coordinated
+  // release. An env-supplied project falls through to the generic rules, which
+  // are already exactly right for it.
+  if (p.catalogName === "vertex") {
+    const origin = peekVertexProjectOrigin();
+    if (origin && origin.source !== "env") return "oauth";
   }
   // realValue() drops an unexpanded `${VAR}` placeholder — the literal string a
   // host passes through when the referenced shell variable is unset. Sign-time

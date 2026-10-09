@@ -1,17 +1,22 @@
 /**
- * Which providers collapse their roster, and which are 1:1.
+ * Which providers collapse their dynamic models catalog, and which are 1:1.
  *
  * Returning `undefined` is the DEFAULT and means identity — one picker row per
- * roster entry, `expand` returning the selection unchanged. That is correct for
+ * `ModelsCatalogEntry`, `expand` returning the selection unchanged. That is correct for
  * every provider whose live endpoint already lists exactly what a human would
- * choose (Ollama's tags, LM Studio's models, Kimi Coding's plan roster), so
+ * choose (Ollama's tags, LM Studio's models, Kimi Coding's dynamic models catalog), so
  * adding this seam changes nothing for them.
  *
  * Only a provider that encodes knobs INTO its model ids needs an entry here.
  */
 
 import { DevinModelResolver } from "./devin.js";
-import type { ExpandContext, ModelChoice, ProviderModelResolver, RosterEntry } from "./types.js";
+import type {
+  ExpandContext,
+  ModelChoice,
+  ModelsCatalogEntry,
+  ProviderModelResolver,
+} from "./types.js";
 
 /**
  * Antigravity is a deliberate NON-member for now. Its resolution rule grew a
@@ -31,15 +36,18 @@ export function getModelResolver(provider: string): ProviderModelResolver | unde
 }
 
 /**
- * Roster -> picker rows, falling back to 1:1 for providers with no resolver.
+ * Dynamic models catalog -> picker rows, falling back to 1:1 for providers with no resolver.
  *
  * Callers should use this rather than branching on `getModelResolver`, so the
  * identity path is written once instead of at every call site.
  */
-export function collapseRoster(provider: string, roster: RosterEntry[]): ModelChoice[] {
+export function collapseModelsCatalog(
+  provider: string,
+  modelsCatalog: ModelsCatalogEntry[]
+): ModelChoice[] {
   const resolver = getModelResolver(provider);
-  if (resolver) return resolver.collapse(roster);
-  return roster.map((entry) => ({
+  if (resolver) return resolver.collapse(modelsCatalog);
+  return modelsCatalog.map((entry) => ({
     id: entry.wireId,
     displayName: entry.displayName ?? entry.wireId,
     contextWindow: entry.contextWindow,
@@ -59,8 +67,8 @@ export function collapseRoster(provider: string, roster: RosterEntry[]): ModelCh
 export function expandSelection(
   provider: string,
   selection: string,
-  roster: RosterEntry[],
+  modelsCatalog: ModelsCatalogEntry[],
   ctx: ExpandContext = {}
 ): string {
-  return getModelResolver(provider)?.expand(selection, roster, ctx) ?? selection;
+  return getModelResolver(provider)?.expand(selection, modelsCatalog, ctx) ?? selection;
 }

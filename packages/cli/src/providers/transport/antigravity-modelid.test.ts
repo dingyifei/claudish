@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { resolveAntigravityModelId } from "./antigravity.js";
 
 /**
- * resolveAntigravityModelId operates ONLY on the LIVE served set (no hardcoded
+ * resolveAntigravityModelId operates ONLY on the account's dynamic models catalog (no hardcoded
  * model ids). Every case injects its own servedIds + defaultId, so the tests
- * carry no pinned roster and touch no network.
+ * carry no pinned model list and touch no network.
  */
 describe("resolveAntigravityModelId", () => {
   test("returns an exactly-served id untouched", () => {
@@ -81,7 +81,7 @@ describe("resolveAntigravityModelId", () => {
   test("passes an unknown family through unchanged (backend 404 → F1–F7 rewrite)", () => {
     const served = ["gemini-3.6-flash-high", "gemini-2.5-flash"];
     expect(resolveAntigravityModelId("gemini-9.9-ultra", served, null)).toBe("gemini-9.9-ultra");
-    // Empty served set (live fetch failed) → also passthrough.
+    // Empty dynamic models catalog (fetch failed) → also passthrough.
     expect(resolveAntigravityModelId("gemini-3.6-flash", [], null)).toBe("gemini-3.6-flash");
   });
 

@@ -91,7 +91,7 @@ export interface ProInjectionOptions {
   outputConfig?: { effort?: unknown; format?: unknown } | null;
   /** Test seam — defaults to the process-wide registry. */
   registry?: SessionEventRegistry;
-  /** Test seam — catalog cache path. Defaults to ~/.claudish/all-models.json. */
+  /** Test seam — catalog cache path. Defaults to ~/.claudish/cloud-models-catalog-v3.json. */
   cachePath?: string;
 }
 

@@ -100,7 +100,8 @@ import { loadConfig } from "../../profile-config.js";
 import { PROVIDER_TO_PREFIX } from "../../providers/auto-route.js";
 import { ensureCatalogReady } from "../../providers/catalog-client.js";
 import { ensureEndpointsRegistered } from "../../providers/endpoint-registration.js";
-import { MODEL_CHAIN_SEPARATOR, parseModelSpec } from "../../providers/model-parser.js";
+import { MODEL_CHAIN_SEPARATOR } from "../../providers/model-parser.js";
+import { proxyRouteDecision } from "../../providers/native-route.js";
 import { getOpFailures } from "../../providers/onepassword.js";
 import { validateApiKeysForModels } from "../../providers/provider-resolver.js";
 import type { Route, RoutePlan } from "../../providers/routing-rules.js";
@@ -227,9 +228,10 @@ async function pinRoutes(
 /**
  * Would the CHILD route this name at all?
  *
- * This mirrors the child's own gate (`proxy-server.ts` step 2c) exactly. Pinning
- * a name the child would not have routed does not just waste a `route()` call —
- * it CHANGES the child's behaviour, which the pin must never do:
+ * This asks the child's own gate (`proxy-server.ts` step 2c), `proxyRouteDecision`,
+ * so the two cannot drift: only a `bare` decision is routed. Pinning a name the
+ * child would not have routed does not just waste a `route()` call — it CHANGES
+ * the child's behaviour, which the pin must never do:
  *
  *   - **explicit spec** (`gc@glm-5`, `or@x/y`, `ollama@llama3.2:3`, a URL) —
  *     nothing to decide, the child already skips routing. Unconditional and
@@ -237,20 +239,19 @@ async function pinRoutes(
  *     STRIPS the `:3` off `ollama@llama3.2:3` (`model` comes back `"llama3.2"`),
  *     so a spec rebuilt from parsed parts would silently lose it. The early-out,
  *     NOT lossless round-tripping, is the guarantee.
- *   - **native-anthropic** (`opus`, `sonnet`, `claude-*`, and any unrecognised
- *     bare name with no `/`) — the child never routes these. `route()` would
- *     nonetheless answer `ok` for them, because `defaultProvider` is appended to
- *     EVERY bare-name chain, so an unguarded pin would spawn
- *     `--model or@opus` and send a native model through OpenRouter. `team`
- *     screens these out upstream in `setupSession`, but `create_session` does
- *     not.
- *   - **`poe:` models** — same gate, same reason (`isPoeModel` in
- *     proxy-server.ts is a local closure; the test is just the prefix).
+ *   - **native-anthropic** (Claude Code's own names: `opus`, `sonnet`,
+ *     `opusplan`, `claude-*`; see `isClaudeCodeModelName`) — the child never
+ *     routes these. `route()` would nonetheless answer `ok` for them, because
+ *     `defaultProvider` is appended to EVERY bare-name chain, so an unguarded pin
+ *     would spawn `--model or@opus` and send a native model through OpenRouter.
+ *     Both `team` and `create_session` run these as native slots (see "Native
+ *     Model Slots" in team-orchestrator.ts), so this check is what keeps them
+ *     bare. Any other bare name with no `/` (`o4-mini`, a typo) is `bare`: the
+ *     child routes it, so the parent pins its chain like any other.
+ *   - **`poe:` models** — same gate, same reason.
  */
 function isRoutablyPinnable(model: string): boolean {
-  if (model.startsWith("poe:")) return false;
-  const parsed = parseModelSpec(model);
-  return !parsed.isExplicitProvider && parsed.provider !== "native-anthropic";
+  return proxyRouteDecision(model).type === "bare";
 }
 
 /**
@@ -365,7 +366,9 @@ export function joinPinnedChain(routes: Route[]): string | null {
  *
  * i.e. handing that to `--model` produces a bare name again and the child
  * re-routes — the pin silently does nothing for every OpenRouter primary, which
- * is the most common primary in the default rules. Prefixing fixes it:
+ * a chain has whenever OpenRouter is its first credentialed hop (it is a
+ * gateway candidate for many catalog models and the default fallback hop).
+ * Prefixing fixes it:
  * `or@x-ai/grok-4.20` parses as provider "openrouter", explicit.
  *
  * The `?? r.provider` branch covers runtime-registered custom endpoints, which

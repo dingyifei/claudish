@@ -1,7 +1,7 @@
 /**
  * The one place endpoints get registered, and the one place that decides when.
  *
- * Six call sites need the provider roster to already contain the bundled
+ * Six call sites need the provider list to already contain the bundled
  * catalog — the interactive picker, `--probe`, the proxy, the parent-side
  * spawn pre-hydration, the config TUI and `serve` — and each of them reaches it
  * by a different path. A latch here means the answer does not depend on which

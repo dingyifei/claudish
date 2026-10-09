@@ -18,22 +18,29 @@ function servedModel(uid: string, family = "claude-opus-5"): DevinModelConfig {
   };
 }
 
-// Synthetic and injected: the resolver tests never fetch or pin a real roster.
-const effortRoster = (["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const).map(
-  (effort) => servedModel(`claude-opus-5-${effort}`)
-);
+// Synthetic and injected: the resolver tests never fetch or pin a real dynamic models catalog.
+const effortModelsCatalog = (
+  ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+).map((effort) => servedModel(`claude-opus-5-${effort}`));
 
 describe("resolveDevinModelUid", () => {
   test("passes an exact served uid through untouched", () => {
-    const roster = [servedModel("claude-opus-5-high"), servedModel("claude-opus-5-max-fast")];
-    expect(resolveDevinModelUid("claude-opus-5-high", "low", roster)).toBe("claude-opus-5-high");
-    expect(resolveDevinModelUid("claude-opus-5-max-fast", undefined, roster)).toBe(
+    const modelsCatalog = [
+      servedModel("claude-opus-5-high"),
+      servedModel("claude-opus-5-max-fast"),
+    ];
+    expect(resolveDevinModelUid("claude-opus-5-high", "low", modelsCatalog)).toBe(
+      "claude-opus-5-high"
+    );
+    expect(resolveDevinModelUid("claude-opus-5-max-fast", undefined, modelsCatalog)).toBe(
       "claude-opus-5-max-fast"
     );
   });
 
   test("resolves a family plus effort to the suffixed uid", () => {
-    expect(resolveDevinModelUid("claude-opus-5", "high", effortRoster)).toBe("claude-opus-5-high");
+    expect(resolveDevinModelUid("claude-opus-5", "high", effortModelsCatalog)).toBe(
+      "claude-opus-5-high"
+    );
   });
 
   for (const effort of [
@@ -46,20 +53,29 @@ describe("resolveDevinModelUid", () => {
     "max",
   ] satisfies EffortLevel[]) {
     test(`supports the ${effort} effort vocabulary`, () => {
-      expect(resolveDevinModelUid("claude-opus-5", effort, effortRoster)).toBe(
+      expect(resolveDevinModelUid("claude-opus-5", effort, effortModelsCatalog)).toBe(
         `claude-opus-5-${effort}`
       );
     });
   }
 
   test("never selects a fast variant implicitly", () => {
-    const roster = [servedModel("claude-opus-5-medium"), servedModel("claude-opus-5-max-fast")];
+    const modelsCatalog = [
+      servedModel("claude-opus-5-medium"),
+      servedModel("claude-opus-5-max-fast"),
+    ];
 
-    expect(resolveDevinModelUid("claude-opus-5", "max", roster)).toBe("claude-opus-5-medium");
-    expect(resolveDevinModelUid("claude-opus-5", undefined, roster)).toBe("claude-opus-5-medium");
+    expect(resolveDevinModelUid("claude-opus-5", "max", modelsCatalog)).toBe(
+      "claude-opus-5-medium"
+    );
+    expect(resolveDevinModelUid("claude-opus-5", undefined, modelsCatalog)).toBe(
+      "claude-opus-5-medium"
+    );
   });
 
   test("passes an unknown model through unchanged", () => {
-    expect(resolveDevinModelUid("unknown-model", "high", effortRoster)).toBe("unknown-model");
+    expect(resolveDevinModelUid("unknown-model", "high", effortModelsCatalog)).toBe(
+      "unknown-model"
+    );
   });
 });

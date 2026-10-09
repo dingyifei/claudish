@@ -20,13 +20,13 @@
  *   Layer 2 — `claudish --team … --mode json`: real interactive Claude Code
  *   sessions in a real magmux grid, `--batch` at a time. ~27k input tokens each
  *   (Claude Code's own system prompt), so ~$0.03 a model, ~$0.21 for the current
- *   roster. This is the layer that catches what a probe cannot: a translation
+ *   model list. This is the layer that catches what a probe cannot: a translation
  *   bug in tool-call or streaming shape that only appears once a real agent is
  *   driving the model.
  *
  * WHY THE MODEL LIST IS NOT PINNED: it is read from
  * ~/.claudish/recommended-models.json at run time. Pinning ids would turn this
- * into a snapshot of one afternoon's roster that goes red every time a vendor
+ * into a snapshot of one afternoon's model list that goes red every time a vendor
  * ships, for reasons that have nothing to do with claudish. Same argument as
  * madbench/types.ts. New models are picked up on the first run after they land,
  * and the report calls out which ones are new since the previous run.

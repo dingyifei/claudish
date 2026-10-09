@@ -1,0 +1,30 @@
+
+ ▐▛███▛█   Claude Code v2.1.272
+▝▜██████▀  recov@recov-model with xhigh effort · API Usage Billing
+  ▝▝ ▝▝    /…/tmp/claude-501/-Users-jack-mag-claudish/5ea44449-884c-45a6-99c5-67b0ee7d3998/scratchpad/postclose/work
+
+
+❯ Reply with exactly one word: banana
+
+
+
+
+
+
+
+
+✶ Effecting… (48s)
+                                                                                                              0 tokens
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────���─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  * recov@recov-model | $0.00 | 0s | 󰍛 280M | ░░░░░░ 0% • $0.000 • N/A
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents
+��──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ██ NETWORK · Recov refused
+  Cannot connect to Recov at http://127.0.0.1:49208/v1/chat/completions. Make sure the server is running.
+  host 127.0.0.1:49208 · ConnectionRefused · local
+  connecting to 127.0.0.1:49208… · attempt 7 · 46s in recovery
+  last: ok · 1 request held
+  click here or Ctrl-G Tab, then [r] try now · [q] give up
+

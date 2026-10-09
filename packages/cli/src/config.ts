@@ -14,7 +14,11 @@ export const ENV = {
   // CLAUDISH_TOKEN_FILE is running against a proxied, non-Anthropic account and
   // must not render Anthropic plan/rate-limit data.
   CLAUDISH_TOKEN_FILE: "CLAUDISH_TOKEN_FILE", // Absolute path to ~/.claudish/tokens-<port>.json for this session
-  CLAUDISH_PROVIDER_NAME: "CLAUDISH_PROVIDER_NAME", // Provider display name (e.g. "Qwen Plan"); UNSET when not known at spawn time
+  // The same path again, set ONLY by claude-runner when it publishes the session's own
+  // file to Claude Code. A claudish started from that session's Bash tool inherits both;
+  // equal values mean "a parent session's status-line file", never "your file".
+  CLAUDISH_PUBLISHED_TOKEN_FILE: "CLAUDISH_PUBLISHED_TOKEN_FILE",
+  CLAUDISH_PROVIDER_NAME: "CLAUDISH_PROVIDER_NAME", // Provider display name (e.g. "Alibaba Token Plan"); UNSET when not known at spawn time
   ANTHROPIC_MODEL: "ANTHROPIC_MODEL", // Claude Code standard env var for model selection
   ANTHROPIC_SMALL_FAST_MODEL: "ANTHROPIC_SMALL_FAST_MODEL", // Claude Code standard env var for fast model
   // Claudish model mapping overrides (highest priority)
@@ -61,6 +65,28 @@ export const ENV = {
   // Classifier passthrough (auto-mode permission classifier → native Anthropic)
   CLAUDISH_CLASSIFIER_PROVIDER: "CLAUDISH_CLASSIFIER_PROVIDER", // "anthropic" enables classifier passthrough
   CLAUDISH_CLASSIFIER_MODEL: "CLAUDISH_CLASSIFIER_MODEL", // native Claude model to rewrite the classifier onto (also enables)
+  // Connection-recovery switches. CLAUDISH_RECOVERY turns the retry ladder
+  // itself off (the CI / scripted `-p` escape: without it an unreachable
+  // endpoint is held for the whole tier-1 deadline instead of failing at once).
+  // CLAUDISH_RECOVERY_UI says whether claudish may own a surface on which the
+  // reason is legible. Both accept 1/true and 0/false, like CLAUDISH_DEBUG.
+  CLAUDISH_RECOVERY: "CLAUDISH_RECOVERY",
+  CLAUDISH_RECOVERY_UI: "CLAUDISH_RECOVERY_UI",
+  // Claude Code's own per-request client timeout. NOT claudish's variable — it
+  // is READ, never written, because it is the hard ceiling any in-request hold
+  // must land inside. See recovery/settings.ts's resolveTier1DeadlineMs.
+  API_TIMEOUT_MS: "API_TIMEOUT_MS",
+  // Internal markers of an MCP pane child: the claudish an MCP `team` slot or
+  // `create_session` starts inside a headless magmux pane. Set by the pane
+  // launcher, consumed by `pane/child-env.ts`, deleted from Claude Code's
+  // environment by claude-runner. Never set by a user.
+  CLAUDISH_PANE_CHILD: "CLAUDISH_PANE_CHILD", // "1" in a pane child, nowhere else
+  CLAUDISH_PANE_ENV: "CLAUDISH_PANE_ENV", // JSON snapshot of the MCP server's environment; re-applied, then deleted
+  CLAUDISH_PANE_CWD: "CLAUDISH_PANE_CWD", // realpath of the cwd the pane child must run in
+  // Where pane sockets, records and launcher dirs live (default /tmp/claudish-mux-<uid>).
+  // A location, like CLAUDISH_SESSIONS_DIR: test suites that start a real MCP server point
+  // it at their own root so the startup sweep and the pane limit stay inside the test.
+  CLAUDISH_PANE_ROOT: "CLAUDISH_PANE_ROOT",
 } as const;
 
 // OpenRouter API Configuration

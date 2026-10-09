@@ -1,3 +1,4 @@
+import { catalogRouteMatchesProvider } from "../providers/catalog-route-bindings.js";
 /**
  * Advisor-tool transformer for NativeHandler (monitor mode).
  *
@@ -1589,9 +1590,10 @@ export function advisorRouteFor(modelSpec: string, role: "panel" | "collector"):
  * OpenRouter's own catalog data.
  */
 function openRouterIdOf(entry: SlimModelEntry): string | null {
-  const fromAggregator = entry.aggregators?.find((a) => a.provider === "openrouter")?.externalId;
-  if (fromAggregator) return fromAggregator;
-  return entry.sources["openrouter-api"]?.externalId ?? null;
+  return (
+    entry.aggregators?.find((a) => catalogRouteMatchesProvider(a.route, "openrouter"))
+      ?.externalModelId ?? null
+  );
 }
 
 /**
@@ -1658,7 +1660,7 @@ function lookupOpenRouterId(name: string): OpenRouterIdLookup {
 /**
  * Is `vendor` a namespace OpenRouter actually publishes — the `x-ai` of
  * `x-ai/grok-4.6`? Answered from the LIVE catalog's own OpenRouter external
- * ids, never from a provider roster in this repo (a pinned roster is exactly
+ * ids, never from a provider's model list in this repo (a pinned model list is exactly
  * what goes stale, and CLAUDE.md forbids one).
  *
  * A namespace match rather than an exact-id match on purpose: a model released
@@ -1682,8 +1684,9 @@ function nativeVendorsForProvider(providerUid: string): string[] {
   const vendors = new Set<string>();
   try {
     for (const plan of readAllModelsCache()?.plans ?? []) {
-      if (plan.routing?.providerUid !== providerUid) continue;
-      for (const native of plan.routing.nativeModelProviders ?? []) vendors.add(native);
+      if (plan.routeStatus !== "supported" || !catalogRouteMatchesProvider(plan.route, providerUid))
+        continue;
+      if (plan.route?.routeId) vendors.add(plan.route.routeId);
     }
   } catch {
     // a cache that will not read is the cold case below
@@ -1880,8 +1883,8 @@ const ADVISOR_MAX_OUTPUT_TOKENS = 2048;
  *   is the existing per-format rule; its catalog lookup is the part that is
  *   right, and it is reused here rather than restated. Its private name-based
  *   fallback (`gpt-5`/`o1`/`o3`/`o4` → `max_completion_tokens`) is NOT copied —
- *   a second copy of a guess is exactly what CLAUDE.md's "no hardcoded roster"
- *   rule is about, and this endpoint has a better default (below).
+ *   a second copy of a guess is exactly what CLAUDE.md's "never hardcode a
+ *   provider's models" rule is about, and this endpoint has a better default (below).
  *
  * ONE endpoint-level correction on the catalog's answer: `max_output_tokens` is
  * the RESPONSES-API spelling. The catalog says exactly that for gpt-5.6-sol

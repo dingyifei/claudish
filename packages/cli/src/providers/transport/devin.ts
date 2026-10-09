@@ -22,15 +22,15 @@
  *
  * **2. The reasoning tier is part of the model id.** There is no effort
  * parameter — `claude-opus-5` + effort `high` must become the uid
- * `claude-opus-5-high`. Resolution runs against the LIVE roster
+ * `claude-opus-5-high`. Resolution runs against the dynamic models catalog
  * (`getServedDevinModels`), never a hardcoded table, so it tracks whatever this
  * subscription is entitled to today.
  *
  * **3. Errors arrive inside HTTP 200.** The status code alone never signals
  * failure, which is why ComposedHandler routes `connect-proto` through
- * `sniffDevinStreamHead` before returning a Response. The served-set-aware
- * rewrite below turns a terminal fault on an unserved uid into an actionable
- * message instead of an opaque backend string.
+ * `sniffDevinStreamHead` before returning a Response. The rewrite below checks
+ * the dynamic models catalog and turns a terminal fault on an unserved uid into
+ * an actionable message instead of an opaque backend string.
  */
 
 import type { DevinRequestPayload } from "../../adapters/devin-api-format.js";
@@ -61,7 +61,7 @@ export class DevinProviderTransport implements ProviderTransport {
   /** The delegated per-request auth artifact, populated by refreshAuth(). */
   private cachedAuth: RequestAuth | null = null;
 
-  /** The LIVE roster this subscription serves, refreshed per request (TTL-cached). */
+  /** The dynamic models catalog this subscription serves, refreshed per request (TTL-cached). */
   private served: DevinModelConfig[] = [];
 
   /** The uid actually sent in field 21, set by serializeBody(). */
@@ -69,7 +69,7 @@ export class DevinProviderTransport implements ProviderTransport {
 
   constructor(modelName: string) {
     this.modelName = modelName;
-    // Resolved against the live roster once refreshAuth() has run; until then
+    // Resolved against the dynamic models catalog once refreshAuth() has run; until then
     // the raw name is a safe placeholder (ComposedHandler always awaits
     // refreshAuth before any request).
     this.resolvedUid = modelName;
@@ -88,13 +88,13 @@ export class DevinProviderTransport implements ProviderTransport {
   }
 
   /**
-   * Resolve credentials and the live roster before each request.
+   * Resolve credentials and the dynamic models catalog before each request.
    *
    * A missing credential throws with `terminal = true`, so ComposedHandler
    * answers HTTP 400 (surfaced inline) rather than 401 — a 401 sends the client
    * into ~11 retries of a condition that cannot self-heal.
    *
-   * Roster discovery is fail-soft by contract (`getServedDevinModels` returns
+   * Model discovery is fail-soft by contract (`getServedDevinModels` returns
    * `[]` on any error), so a discovery outage degrades resolution to
    * pass-through instead of breaking the turn.
    */
@@ -102,7 +102,7 @@ export class DevinProviderTransport implements ProviderTransport {
     this.cachedAuth = await credentials.getRequestAuth("devin", { model: this.modelName });
     this.served = await getServedDevinModels();
     log(
-      `[Devin] auth refreshed, model: ${this.modelName}, served roster: ${this.served.length} models`
+      `[Devin] auth refreshed, model: ${this.modelName}, dynamic models catalog: ${this.served.length} models`
     );
   }
 
@@ -110,7 +110,7 @@ export class DevinProviderTransport implements ProviderTransport {
    * The logical request object → enveloped Connect-protobuf bytes.
    *
    * This is where the uid is finally resolved: `modelUid` + `effort` against the
-   * live roster. Effort rides the PAYLOAD rather than the transport because a
+   * dynamic models catalog. Effort rides the PAYLOAD rather than the transport because a
    * cached handler serves overlapping turns that may carry different levels.
    */
   serializeBody(payload: any): { body: SerializedBody; contentType: string } {
@@ -176,9 +176,9 @@ export class DevinProviderTransport implements ProviderTransport {
   }
 
   /**
-   * Pick a probe-friendly model from the live roster.
+   * Pick a probe-friendly model from the dynamic models catalog.
    *
-   * The cloud catalog cannot know a Devin roster — it is per-subscription — so
+   * The cloud catalog cannot know Devin's dynamic models catalog — it is per-subscription — so
    * the ranking is a RULE (widest context window first, ties alphabetical) and
    * never a pinned id. `getServedDevinModels` already drops rows with no context
    * window, which is what removes `adaptive`, the server-side router
@@ -211,11 +211,11 @@ export class DevinProviderTransport implements ProviderTransport {
   }
 
   /**
-   * Rewrite a TERMINAL in-stream error when the live roster proves the uid is
+   * Rewrite a TERMINAL in-stream error when the dynamic models catalog proves the uid is
    * not served. Follows Antigravity's `rewriteModelNotFound` doctrine exactly.
    *
-   * Only rewrites when the served set is non-empty AND does not contain the
-   * resolved uid. An empty set means discovery failed, and inventing a diagnosis
+   * Only rewrites when the dynamic models catalog is non-empty AND does not contain the
+   * resolved uid. An empty catalog means discovery failed, and inventing a diagnosis
    * on missing data is worse than passing the backend's own message through.
    *
    * Worth knowing when reading a live failure: an unserved uid comes back as
@@ -231,7 +231,7 @@ export class DevinProviderTransport implements ProviderTransport {
     const families = [...new Set(this.served.map((model) => model.family).filter(Boolean))].sort();
     // 167 models span ~40 families, and pasting all of them buries the one line
     // the user needs. Families sharing the request's leading token come first —
-    // someone who typed `claude-opus-99` wants the claude-opus rosters, not
+    // someone who typed `claude-opus-99` wants the claude-opus families, not
     // an alphabetical wall starting at `code-fast`.
     const stem = this.resolvedUid.split("-")[0]?.toLowerCase() ?? "";
     const related = families.filter((f) => f.toLowerCase().startsWith(stem));

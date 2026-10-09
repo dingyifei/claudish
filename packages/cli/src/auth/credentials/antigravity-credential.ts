@@ -31,7 +31,13 @@ import {
   getServedAntigravityModels,
   setupAntigravityUser,
 } from "../antigravity-user.js";
-import type { CredentialProvider, RequestAuth, RequestAuthContext } from "./types.js";
+import type {
+  CredentialProvider,
+  ReadinessResult,
+  RequestAuth,
+  RequestAuthContext,
+} from "./types.js";
+import { readinessDetail } from "./types.js";
 
 /** Generate a short random request ID (matches the Antigravity CLI activity logger). */
 function createActivityRequestId(): string {
@@ -42,22 +48,42 @@ export class AntigravityCredentialProvider implements CredentialProvider {
   readonly catalogName = "antigravity";
 
   /**
-   * Available when a shared Antigravity token exists in the keychain. Never
-   * throws (a non-macOS platform or an absent store resolves to false), matching
-   * the authority's "readiness never brings down the caller" contract.
+   * Available when a shared Antigravity token exists in the keychain.
+   *
+   * A non-macOS platform or an empty store is `absent` — the normal state for
+   * anyone not signed in to Antigravity. A store read that THREW is `failed`:
+   * nothing was learned, and reporting it as absence is what silently replaces
+   * a subscription with a metered provider.
+   *
+   * KNOWN RESIDUAL, declared rather than papered over: `defaultReadStore` in
+   * `auth/antigravity-token.ts` swallows its own `security` failure into `null`,
+   * so a LOCKED keychain still arrives here as `absent`. Closing that means
+   * changing the shared agy/claudish token path's contract — the same change
+   * `architecture/keychain.md` already parks as deserving its own commit. This
+   * method reports honestly for everything that reaches it; the gap is one
+   * level down, not here.
    */
-  async isAvailable(): Promise<boolean> {
+  async describeReadiness(): Promise<ReadinessResult> {
     try {
-      return readSharedAntigravityToken() !== null;
-    } catch {
-      return false;
+      return { readiness: readSharedAntigravityToken() !== null ? "present" : "absent" };
+    } catch (err) {
+      return {
+        readiness: "failed",
+        detail: `Antigravity token store could not be read: ${readinessDetail(err) ?? "unknown error"}`,
+      };
     }
+  }
+
+  /** Unchanged contract: the `=== "present"` projection of the above. */
+  async isAvailable(): Promise<boolean> {
+    return (await this.describeReadiness()).readiness === "present";
   }
 
   async getRequestAuth(ctx: RequestAuthContext): Promise<RequestAuth> {
     const token = await getValidAntigravityAccessToken();
     const { projectId, tierId } = await setupAntigravityUser(token);
-    // Resolve the requested id against the LIVE served set (fetchAvailableModels).
+    // Resolve the requested id against the account's dynamic models catalog
+    // (fetchAvailableModels).
     const { servedIds, defaultId } = await getServedAntigravityModels(token, projectId);
     const servedModel = resolveAntigravityModelId(
       ctx.model,

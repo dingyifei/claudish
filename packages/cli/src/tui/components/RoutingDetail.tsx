@@ -15,14 +15,16 @@ export function RoutingDetail({ probeMode, mergedRules }: RoutingDetailProps) {
     return null;
   }
 
-  const defaults = mergedRules.filter((r) => r.kind === "default").length;
-  const globalRules = mergedRules.filter((r) => r.kind === "global");
+  // Two kinds of row, because a row can only be one of the user's own rules
+  // now. The "built-in default" and "override of default" counts this panel
+  // used to carry were both about the shipped table of built-in rules, which
+  // was deleted when routing started gathering candidates from the cloud models
+  // catalog — they would now read 0 and 0 forever.
+  const globalCustom = mergedRules.filter((r) => r.kind === "global").length;
   const projectRules = mergedRules.filter((r) => r.kind === "project");
-  // Among global rules, how many override a built-in default? (Project rules
-  // get the ▴ marker regardless, so their override status doesn't change
-  // the count.)
-  const globalOverrides = globalRules.filter((r) => r.overridesDefault).length;
-  const globalCustom = globalRules.length - globalOverrides;
+  // A "*" rule matches everything no other rule does, so with one nothing
+  // reaches the catalog (the header above says the same).
+  const hasCatchAll = mergedRules.some((r) => r.pattern === "*");
 
   // Format counts with a fixed-width number column so the labels line up
   // even when counts grow into double digits.
@@ -45,36 +47,12 @@ export function RoutingDetail({ probeMode, mergedRules }: RoutingDetailProps) {
       <box height={1} flexDirection="row">
         <box width={32}>
           <text>
-            <span fg={C.dim} attributes={A.bold}>
-              {" ·  "}
-            </span>
-            <span fg={C.fgMuted}>{"built-in default     "}</span>
-            <span fg={C.cyan} attributes={A.bold}>
-              {fmtCount(defaults)}
-            </span>
-          </text>
-        </box>
-        <box>
-          <text>
             <span fg={C.green} attributes={A.bold}>
-              {"  •  "}
+              {" •  "}
             </span>
-            <span fg={C.fgMuted}>{"global custom        "}</span>
+            <span fg={C.fgMuted}>{"global rule          "}</span>
             <span fg={C.green} attributes={A.bold}>
               {fmtCount(globalCustom)}
-            </span>
-          </text>
-        </box>
-      </box>
-      <box height={1} flexDirection="row">
-        <box width={32}>
-          <text>
-            <span fg={C.yellow} attributes={A.bold}>
-              {" ★  "}
-            </span>
-            <span fg={C.fgMuted}>{"override of default  "}</span>
-            <span fg={C.yellow} attributes={A.bold}>
-              {fmtCount(globalOverrides)}
             </span>
           </text>
         </box>
@@ -86,6 +64,17 @@ export function RoutingDetail({ probeMode, mergedRules }: RoutingDetailProps) {
             <span fg={C.fgMuted}>{"project rule         "}</span>
             <span fg={C.cyan} attributes={A.bold}>
               {fmtCount(projectRules.length)}
+            </span>
+          </text>
+        </box>
+      </box>
+      <box height={1} flexDirection="row">
+        <box>
+          <text>
+            <span fg={C.fgMuted}>
+              {hasCatchAll
+                ? ' The "*" rule takes every model no other rule here matches.'
+                : " Anything with no rule here is routed from the cloud models catalog."}
             </span>
           </text>
         </box>

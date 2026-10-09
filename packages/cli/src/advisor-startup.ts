@@ -234,7 +234,7 @@ export interface ToolSchemaConverter {
  * `[]`), so an advisor tool can never reach the model.
  *
  * Fails OPEN on a throw: a probe that breaks must not block every launch on
- * that path — the same trade `agent-availability.ts` makes.
+ * that path.
  */
 export function formatCarriesTools(format: ToolSchemaConverter): boolean {
   try {
@@ -307,8 +307,10 @@ export function resolveMainModelFact(model: string): MainModelFact {
   const format = definition
     ? pinnedFormatForTransport(definition.transport, resolution.modelName)
     : null;
+  // `auto-route` is a bare name route() decides on the first request, so no
+  // provider is known yet; `unknown` is a `vendor/` with no known vendor.
   const providerName =
-    resolution.category === "unknown"
+    resolution.category === "unknown" || resolution.category === "auto-route"
       ? "unresolved (routed on the first request)"
       : definition?.displayName || resolution.providerName;
   return {

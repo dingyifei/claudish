@@ -21,7 +21,7 @@ interface OAuthProviderDescriptor {
  *   - ollamacloud   (OLLAMA_API_KEY) - API key only
  *   - z-ai          (ZAI_API_KEY) - API key only
  *   - litellm       (LITELLM_API_KEY) - API key only
- *   - vertex        (VERTEX_API_KEY / VERTEX_PROJECT) - uses ADC / service account
+ *   - vertex        (VERTEX_PROJECT, or the ADC / gcloud project) - uses ADC / service account
  *
  * These providers are covered by the direct API-key step (Step 3) in the
  * auto-routing priority chain.  OAuth entries can be added here in future

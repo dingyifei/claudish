@@ -25,7 +25,7 @@ export class DeepSeekModelDialect extends BaseAPIFormat {
    * V4 controls, or strip on legacy models (which reason by model name only).
    *
    * Not called on the Anthropic wire. Measured 2026-08-02 against Alibaba's
-   * Qwen Plan endpoint (which serves deepseek-v4-*): a top-level
+   * Alibaba Token Plan endpoint (which serves deepseek-v4-*): a top-level
    * `reasoning_effort` is accepted with ANY value, including `"banana"` → 200,
    * i.e. it is not read at all there. BaseAPIFormat.applyAnthropicWireReasoning()
    * emits `output_config.effort` instead, clamped to the catalog's advertised
@@ -36,9 +36,20 @@ export class DeepSeekModelDialect extends BaseAPIFormat {
     const effort = this.resolveEffortLevel(originalRequest);
 
     if (effort && this.acceptsReasoningControls()) {
-      if (effort === "none" || effort === "minimal") {
+      // Same rule as every other wire: `minimal` is the lowest rung where one
+      // exists, and a model the catalog marks `mandatory` is never sent an
+      // off-switch. See BaseAPIFormat.meansReasoningOff.
+      if (this.meansReasoningOff(effort, this.lookupReasoningCapability())) {
         // Disable thinking on V4+.
         request.thinking = { type: "disabled" };
+        // Never leave a depth knob contradicting the off-switch — the same rule
+        // GLM's dialect already applies. `OpenAIAPIFormat` runs first and had
+        // already set `reasoning_effort` (minimal clamps to "low" against the
+        // catalog's ladder), so the pair went out together and OpenCode Zen
+        // answered `400 "thinking.type='disabled' conflicts with a non-'none'
+        // reasoning_effort"` for deepseek-v4.1-flash (measured 2026-09-19; the
+        // same request with effort "low" returns 200).
+        if (request.reasoning_effort !== undefined) delete request.reasoning_effort;
         log(
           `[DeepSeekModelDialect] effort ${effort} -> thinking.type: disabled for ${this.modelId}`
         );

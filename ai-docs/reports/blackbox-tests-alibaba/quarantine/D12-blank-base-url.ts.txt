@@ -1,0 +1,21 @@
+// QUARANTINED BLACK-BOX TEST — D12, as the blind writer produced it, with only
+// mechanical rewires applied: the discovery entry point renamed to
+// `discoverDynamicCatalog`, the `cachePath` option removed with the store deleted
+// in fe8722e, and (ported 2026-09-19) HEAD's variable name and wording.
+// `discoverDynamicCatalog` does not exist at HEAD, whose equivalent check is
+// `discoverProviderModels` + `getDiscoveryFailure`. The finding still holds there:
+// a blank override counts as unset.
+//
+// It FAILS, and the test is right. Not repaired, not skipped in the suite, not
+// deleted. See ../blackbox-results.md, the D12 finding.
+//
+// Kept as .ts.txt so no test runner ever collects it.
+
+test("D12 a blank Token Plan endpoint is a failure, not an absent subscription list", async () => {
+  process.env.QWEN_TOKEN_PLAN_BASE_URL = "";
+  const result = await discoverDynamicCatalog(provider);
+  expect(result.status).toBe("failed");
+  expect(result.models).toEqual([]);
+  expect(result.failure?.kind).toBe("unreachable");
+  expect(result.failure?.detail).toContain("QWEN_TOKEN_PLAN_BASE_URL");
+});

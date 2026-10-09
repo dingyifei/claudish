@@ -173,9 +173,9 @@ function hasAnyCredentials(): boolean {
 // ---------------------------------------------------------------------------
 // (Group 1 — unit tests of getFallbackChain — removed in commit 5 of the
 // model-catalog and routing redesign. The fallback chain construction logic
-// moved from auto-route.ts (now ~50 lines) into routing-rules.ts route()
-// + DEFAULT_ROUTING_RULES. Equivalent matrix coverage lives in
-// providers/routing-rules.test.ts and providers/default-routing-rules.test.ts.)
+// moved from auto-route.ts (now ~50 lines) into routing-rules.ts route().
+// Equivalent matrix coverage lives in providers/routing-rules.test.ts and
+// providers/route-candidates.test.ts.)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -359,7 +359,12 @@ describe("Group 5: isRetryableError — unit tests via FallbackHandler behavior"
   // whether FallbackHandler tries the next candidate or stops.
 
   const { Hono } = require("hono");
-  const { FallbackHandler, isProvider, isRetryableError } = require("./fallback-handler.js");
+  const {
+    FallbackHandler,
+    exhaustedChainStatus,
+    isProvider,
+    isRetryableError,
+  } = require("./fallback-handler.js");
   const { extractUpstreamStatus } = require("./shared/anthropic-error.js");
 
   function remappedErrorBody(upstreamStatus?: unknown): string {
@@ -485,9 +490,108 @@ describe("Group 5: isRetryableError — unit tests via FallbackHandler behavior"
     expect(result.usedFallback).toBe(true);
   });
 
-  test("503 service unavailable is NOT retryable — stops immediately", async () => {
+  test("503 service unavailable advances to the next candidate", async () => {
     const result = await runFallback(503, '{"error":"service unavailable"}');
-    expect(result.usedFallback).toBe(false);
+    expect(result.usedFallback).toBe(true);
+  });
+
+  describe("an unavailable endpoint advances the chain", () => {
+    for (const status of [502, 503, 504]) {
+      test(`HTTP ${status} with a plain body is retryable`, () => {
+        expect(isRetryableError(status, "{}")).toBe(true);
+      });
+    }
+
+    test("plain HTTP 500 remains non-retryable", () => {
+      expect(isRetryableError(500, '{"error":"internal server error"}')).toBe(false);
+    });
+
+    test("OpenCode Zen Go endpoint-unavailable 503 reaches the second candidate", async () => {
+      const result = await runFallbackForProvider(
+        "OpenCode Zen Go",
+        503,
+        '{"type":"error","error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}'
+      );
+      expect(result.usedFallback).toBe(true);
+      expect(result.status).toBe(200);
+    });
+
+    test("502 then 504 reaches 200 and calls each candidate exactly once", async () => {
+      const calls = [0, 0, 0];
+      const handler = new FallbackHandler(
+        [502, 504, 200].map((status, index) => {
+          const candidate = mockHandler(status, "{}");
+          return {
+            name: `provider-${index}`,
+            handler: {
+              ...candidate,
+              handle: async () => {
+                calls[index]++;
+                return candidate.handle();
+              },
+            },
+          };
+        })
+      );
+      const app = new Hono();
+      app.post("/test", async (c: any) => handler.handle(c, { model: "test-model" }));
+      const response = await app.request("/test", { method: "POST", body: "{}" });
+      expect(response.status).toBe(200);
+      expect(calls).toEqual([1, 1, 1]);
+    });
+
+    test("all candidates unavailable: 502 then 504 ends with HTTP 503", async () => {
+      const handler = new FallbackHandler([
+        { name: "a", handler: mockHandler(502, "{}") },
+        { name: "b", handler: mockHandler(504, "{}") },
+      ]);
+      const app = new Hono();
+      app.post("/test", async (c: any) => handler.handle(c, { model: "test-model" }));
+      const response = await app.request("/test", { method: "POST", body: "{}" });
+      expect(response.status).toBe(503);
+    });
+  });
+
+  describe("exhaustedChainStatus counts 502 and 504 as transient", () => {
+    test("502 and 504 exhaust to 503", () => {
+      expect(
+        exhaustedChainStatus([
+          { provider: "a", status: 502, message: "{}" },
+          { provider: "b", status: 504, message: "{}" },
+        ])
+      ).toBe(503);
+    });
+
+    for (const upstreamStatus of [502, 504]) {
+      test(`remapped 400 with upstream_status ${upstreamStatus} and 503 exhaust to 503`, () => {
+        expect(
+          exhaustedChainStatus([
+            {
+              provider: "a",
+              status: 400,
+              message: JSON.stringify({
+                type: "error",
+                error: {
+                  type: "invalid_request_error",
+                  message: "x",
+                  upstream_status: upstreamStatus,
+                },
+              }),
+            },
+            { provider: "b", status: 503, message: "{}" },
+          ])
+        ).toBe(503);
+      });
+    }
+
+    test("terminal 401 mixed with 502 exhausts to 400", () => {
+      expect(
+        exhaustedChainStatus([
+          { provider: "a", status: 401, message: "{}" },
+          { provider: "b", status: 502, message: "{}" },
+        ])
+      ).toBe(400);
+    });
   });
 
   test("401 authentication_error (refreshAuth failure) is retryable — falls through to next provider", async () => {

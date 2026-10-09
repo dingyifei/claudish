@@ -19,6 +19,8 @@ import { type IncomingMessage, type ServerResponse, createServer } from "node:ht
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { markOwnTimeout } from "../handlers/shared/connection-error.js";
+import { TOKEN_REFRESH_TIMEOUT_MS } from "../handlers/shared/transient-retry.js";
 import { log } from "../logger.js";
 
 const execAsync = promisify(exec);
@@ -244,8 +246,24 @@ export class CodexOAuth {
 
     log("[CodexOAuth] Refreshing access token");
 
+    // THE FETCH ITSELF THROWING MEANS THE NETWORK, NOT THE CREDENTIAL. This used
+    // to share one `catch` with the HTTP-rejection path below, which rewrapped
+    // every failure as "OAuth credentials invalid. Please run `claudish login
+    // codex` again" with no `cause` — so an `auth.openai.com` outage told the
+    // user to log in again, and named no host. It still classified, but only by
+    // `classifyConnectionError`'s MESSAGE fallback matching Bun's text embedded
+    // after "Details:" — a wording match that covers Bun's refused and DNS
+    // phrasings and nothing else. (The billing defect was the other half:
+    // `openai-codex.ts` swallowed this throw and sent the request to the
+    // METERED `api.openai.com` path mid-outage.)
+    //
+    // `{ cause }` makes classification structural: the classifier walks the
+    // cause chain for the code, whatever the message says. `claudishEndpoint`
+    // names the host that actually failed; without it the handler reports the
+    // model host. The same shape as `grok-credentials.ts` and `vertex-oauth.ts`.
+    let response: Response;
     try {
-      const response = await fetch(OAUTH_CONFIG.tokenUrl, {
+      response = await fetch(OAUTH_CONFIG.tokenUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -255,8 +273,26 @@ export class CodexOAuth {
           refresh_token: this.credentials.refresh_token,
           client_id: OAUTH_CONFIG.clientId,
         }),
+        // Bounds `refreshPromise`'s single-flight latch — see
+        // TOKEN_REFRESH_TIMEOUT_MS.
+        signal: AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
       });
+    } catch (e) {
+      log(`[CodexOAuth] Could not reach ${OAUTH_CONFIG.tokenUrl}: ${(e as Error).message}`);
+      // `markOwnTimeout`: the ceiling above is ours, so its `TimeoutError` is a
+      // reachability fact. Untagged it would go unclassified, and
+      // `openai-codex.ts` would read it as a rejected refresh and fall back to
+      // the METERED api-key path — the bug this function was just fixed for.
+      throw Object.assign(
+        new Error(
+          `Could not reach ${OAUTH_CONFIG.tokenUrl} to refresh the Codex token: ${(e as Error).message}`,
+          { cause: markOwnTimeout(e) }
+        ),
+        { claudishEndpoint: OAUTH_CONFIG.tokenUrl }
+      );
+    }
 
+    try {
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Token refresh failed: ${response.status} - ${errorText}`);
@@ -287,8 +323,11 @@ export class CodexOAuth {
       return updatedCredentials.access_token;
     } catch (e: any) {
       log(`[CodexOAuth] Refresh failed: ${e.message}`);
+      // `{ cause }` here too: a connection reset while reading the response body
+      // is a network fault that arrives after the fetch resolved.
       throw new Error(
-        `OAuth credentials invalid. Please run \`claudish login codex\` again.\n\nDetails: ${e.message}`
+        `OAuth credentials invalid. Please run \`claudish login codex\` again.\n\nDetails: ${e.message}`,
+        { cause: e }
       );
     }
   }

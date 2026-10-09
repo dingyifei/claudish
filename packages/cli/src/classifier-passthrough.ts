@@ -110,7 +110,9 @@ export function resolveClassifierModel(
   try {
     const lookupAlias = deps.lookupAlias ?? findEntryByAlias;
     const latest = lookupAlias(SONNET_LATEST_ALIAS)?.modelId;
-    if (latest) return latest;
+    // The pointer can name an aggregator route (e.g. `openrouter-router-claude-sonnet-latest`),
+    // which api.anthropic.com rejects; only a native Claude id is usable here.
+    if (isNativeClaudeModelId(latest)) return latest;
   } catch {
     // fall through
   }

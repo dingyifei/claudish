@@ -49,7 +49,7 @@ export function getProviderPrefixes(): Array<{
 }
 
 /**
- * Chain selector — same roster as the prefix picker, so the two never disagree
+ * Chain selector — same provider list as the prefix picker, so the two never disagree
  * about which providers exist. A function for the same reason
  * `getProviderPrefixes()` is: a const would freeze the list before runtime
  * registration.

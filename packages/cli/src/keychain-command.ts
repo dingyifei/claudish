@@ -94,7 +94,7 @@ function requireKeychain(): boolean {
  * Every API-key env var claudish knows about, primary names and aliases alike.
  *
  * Built LIVE from the provider catalog rather than a hand-written list —
- * a second roster would drift the moment a provider was added, and this repo
+ * a second list would drift the moment a provider was added, and this repo
  * has already paid for that once (the config TUI's own provider array went
  * stale and made two working providers invisible).
  */

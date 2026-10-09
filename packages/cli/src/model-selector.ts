@@ -1,3 +1,4 @@
+import { catalogRouteMatchesProvider } from "./providers/catalog-route-bindings.js";
 /**
  * Model Selector with Fuzzy Search
  *
@@ -17,6 +18,7 @@ import { confirm, input, search, select } from "@inquirer/prompts";
 import { lookupModel, lookupModelCapabilities } from "./adapters/model-catalog.js";
 import { credentials } from "./auth/credentials/authority.js";
 import { isSubscriptionProvider } from "./handlers/shared/remote-provider-types.js";
+import { log } from "./logger.js";
 import {
   type AggregatorEntry,
   type ModelDoc,
@@ -31,14 +33,16 @@ import {
 } from "./providers/model-catalog.js";
 import {
   type DiscoveredModel,
+  type DiscoveryFailure,
+  type ModelsCatalogOutcome,
   describeDiscoveryFailure,
-  discoverProviderModels,
+  discoverProviderModelsCatalog,
   getDiscoveryFailure,
   rankDiscoveredModels,
-  toRosterEntry,
+  toModelsCatalogEntry,
 } from "./providers/model-discovery.js";
 import { compareByReleaseDateDesc } from "./providers/model-ordering.js";
-import { collapseRoster } from "./providers/model-resolvers/registry.js";
+import { collapseModelsCatalog } from "./providers/model-resolvers/registry.js";
 import { type ModelOffer, offerIsLive } from "./providers/model-resolvers/types.js";
 import { PROVIDER_FILTER_ALIAS_EXTRA } from "./providers/picker-alias-extra.js";
 import {
@@ -48,7 +52,14 @@ import {
   getProviderByName,
 } from "./providers/provider-definitions.js";
 import { getRuntimeProviders } from "./providers/runtime-providers.js";
-import { isChatCapable } from "./providers/transport/probe-discovery.js";
+import { isChatCapable, isReportedChatCapable } from "./providers/transport/probe-discovery.js";
+// STATIC, and safe: both are true leaves with ZERO imports of their own
+// (`picker/import-direction.test.ts` asserts exactly that, by name). A static
+// import of the picker ITSELF would pull a renderer into this module's graph and
+// from there into the MCP stdio path — which is why `selectModelInteractive`
+// reaches it by `await import()` instead.
+import { canDrawTui } from "./tui/runtime/can-draw-tui.js";
+import { NoTtyError, PickerCancelled } from "./tui/runtime/picker-cancelled.js";
 
 /**
  * Model data structure
@@ -120,7 +131,7 @@ export const pickerProviderToFirebaseSlug: Record<string, string> = {
   "opencode-zen": "opencode-zen",
   "opencode-zen-go": "opencode-zen-go",
   ollamacloud: "ollamacloud",
-  // NOTE: "qwen-cloud" is deliberately absent. `selectModelFromProvider` tries
+  // NOTE: "qwen-token-plan" is deliberately absent. `selectModelFromProvider` tries
   // `modelDiscovery` BEFORE this map, and the plan's /compatible-mode/v1/models
   // endpoint is authenticated — it answers with exactly what the subscription
   // is entitled to. The catalog's "qwen" vendor would be a bad fall-through
@@ -128,7 +139,7 @@ export const pickerProviderToFirebaseSlug: Record<string, string> = {
   // plan host does not serve. Adding it would also poison
   // `firebaseSlugToProviderName`, whose reverse lookup takes the FIRST picker
   // value for a slug — with no canonical `qwen` entry above it, every plain
-  // catalog Qwen model would render as "Qwen Plan". Discovery failure
+  // catalog Qwen model would render as "Alibaba Token Plan". Discovery failure
   // already degrades to the free-text prompt below, which is the right answer.
 };
 
@@ -146,14 +157,14 @@ const LOCAL_OR_USER_DEPLOYED = new Set<string>(["litellm", "ollama", "lmstudio"]
  * RUNTIME-registered provider — a user's `customEndpoints` entry, a bundled
  * catalog row — belongs in the same class and is recognised by derivation
  * rather than by being listed, because the whole point of those is that
- * claudish does not know their rosters.
+ * claudish does not know their models.
  *
  * That is not just "no data": for a name that happens to match a models-index
  * VENDOR slug, `modelsByVendor` answers with ids from the CREATOR namespace,
  * and the picker would then emit `vendor@<models-index id>` — an id the
  * vendor's own endpoint is not guaranteed to accept. Failing after the user
  * commits is worse than asking them to type a model name, and R7 forbids
- * shipping a roster to check against.
+ * shipping a model list to check against.
  */
 export function isUserDeployedProvider(value: string): boolean {
   return LOCAL_OR_USER_DEPLOYED.has(value) || getRuntimeProviders().has(value);
@@ -296,7 +307,7 @@ const SUBSCRIPTION_PRICING: ModelInfo["pricing"] = {
  * THIS subscription, so it beats any catalog (Kimi Coding reports it; Qwen
  * Plan does not). On a miss, fall back to the Firebase slim catalog, which
  * already knows most of these models — that is a read of the local
- * `~/.claudish/all-models.json`, never a network call, so the picker never
+ * `~/.claudish/cloud-models-catalog-v3.json`, never a network call, so the picker never
  * blocks on it. Still-unknown stays 0 and renders as "N/A": there is no
  * per-model cloud lookup, because a window the slim catalog lacks is a
  * models-index gap, not something N extra round-trips can discover.
@@ -316,15 +327,16 @@ function resolveDiscoveredContextLength(m: DiscoveredModel): number {
  * Release date for a live-discovered model row, catalog first.
  *
  * The Firebase slim catalog carries curated RELEASE dates, so it wins wherever
- * it has an entry. The endpoint's date is a roster-added timestamp, which is
+ * it has an entry. The endpoint's date is a date-added timestamp, which is
  * the only signal available for the models the slim catalog never listed —
  * `qwen3.8-max-preview` is exactly that, and without the fallback one of the
  * newest models on the plan would sort to the very bottom as undated.
  */
 function resolveDiscoveredReleaseDate(m: DiscoveredModel): string | undefined {
-  // A roster of variants the catalog does not list gets NO catalog date: the
-  // catalog would be dating a different (older, base) model, and a partially
-  // dated roster sorts its undated — newest — half to the bottom.
+  // A dynamic models catalog of variants the cloud models catalog does not list
+  // gets NO catalog date: the catalog would be dating a different (older, base)
+  // model, and a partially dated dynamic models catalog sorts its undated —
+  // newest — half to the bottom.
   if (m.ignoreCatalogReleaseDate) return m.releaseDate;
   try {
     const catalogDate = lookupModel(m.id)?.releaseDate;
@@ -360,7 +372,8 @@ function catalogModelToModelInfo(model: CatalogModel): ModelInfo {
   // Catalog models from the slim cache don't carry the owner provider — fall
   // back to the first aggregator's name so the picker still shows something
   // useful in the column.
-  const ownerOrFirstAggregator = model.provider || model.aggregators?.[0]?.provider || "unknown";
+  const ownerOrFirstAggregator =
+    model.provider || model.aggregators?.[0]?.sourceProviderId || "unknown";
   const providerLabel = formatFirebaseProviderLabel(ownerOrFirstAggregator);
   const contextLength = model.contextWindow || 0;
 
@@ -434,6 +447,69 @@ export { compareByReleaseDateDesc };
 
 function sortModelsNewestFirst(models: ModelInfo[]): ModelInfo[] {
   return [...models].sort(compareByReleaseDateDesc);
+}
+
+/**
+ * Catalog models → picker rows: drop what cannot serve a chat completion, then
+ * dedupe, then order newest-first.
+ *
+ * **A chokepoint, not a site fix.** Pressing Enter twice at launch selected
+ * `gpt-image-2.5-flare`, an image-generation model: `isChatCapable` was applied
+ * inside `buildDiscoveredModelOutcome` and nowhere else, so every catalog path —
+ * `searchModels`, `modelsByVendor`, the top-100 default list — applied no
+ * capability filter at all. The same class of leak has been patched
+ * twice before at the site where it was noticed (`probe-discovery.ts:498`, then
+ * `pplx-embed`, then `bge`), and recurred each time, because a list is made in
+ * more than one place. Every list either UI can render now returns through here.
+ *
+ * The rule is evidence, never a name: a row is kept only when the cloud models
+ * catalog publishes it as a chat model — text among its inputs AND among its
+ * outputs, with any other modalities alongside. A row the catalog does not
+ * describe is `unknown` and dropped. `gemini-3.5-transcribe` (`in: ["audio"]`)
+ * is out by its input list. `gpt-realtime-2` (`in: [audio,image,text]`,
+ * `out: [audio,text]`) is IN, by decision: the name patterns that used to hide
+ * the realtime family went with the name-based fallback, and a model that
+ * accepts text and writes text is a chat model.
+ *
+ * What is left to watch is the catalog being WRONG, so a row that survives but
+ * whose name reads like a generator family (seedance, flux, veo, imagen) is
+ * named ONCE per process in the debug log. It decides nothing. Measured on
+ * 2026-09-23, 3 of the 53 such rows publish `in: ["text"]`, `out: ["text"]`
+ * (`flux-dev-finetuner`, `flux-fill`, `seedance-2.5-el`) — models-index rows
+ * that need correcting, which is what this line is for.
+ */
+export function toPickerRows(models: ModelInfo[]): ModelInfo[] {
+  const kept = sortModelsNewestFirst(dedupeModels(models.filter((m) => isChatCapable(m.id))));
+  logModalityGapOnce(kept);
+  return kept;
+}
+
+/** Generator families whose rows, if the catalog calls them chat, are worth a second look. */
+const UNINFERABLE_NON_CHAT = [/\bseedance\b/i, /\bflux\b/i, /\bveo\b/i, /\bimagen\b/i];
+
+let _modalityGapLogged = false;
+
+/**
+ * Say in the log which rows the catalog kept as chat although their family
+ * generates images or video — a catalog row to check, not a filter to add here.
+ *
+ * ONCE per process: `toPickerRows` is the chokepoint for every list either UI
+ * renders, so a per-call line would be dozens of identical lines per picker open.
+ * It never writes to a terminal — `log()` goes to the debug file — because the
+ * renderer owns the terminal while the picker is up.
+ */
+function logModalityGapOnce(kept: ModelInfo[]): void {
+  if (_modalityGapLogged) return;
+  const suspect = kept.filter((m) => UNINFERABLE_NON_CHAT.some((re) => re.test(m.id)));
+  if (suspect.length === 0) return;
+  _modalityGapLogged = true;
+  log(
+    `[Models] ${suspect.length} row(s) the catalog publishes as chat, from a generator family: ` +
+      `${suspect
+        .slice(0, 8)
+        .map((m) => m.id)
+        .join(", ")}. If one is not a chat model, its models-index row is wrong.`
+  );
 }
 
 /**
@@ -528,7 +604,7 @@ function formatModelChoiceAsSpec(model: ModelInfo, spec: string, priceStr: strin
  * model vendors.
  *
  * Derived, because the hand-written version was the same opt-in table the
- * provider roster used to be: `devin` and `antigravity` were both missing from
+ * provider list used to be: `devin` and `antigravity` were both missing from
  * it, so `@dv` silently matched nothing.
  *
  * Rebuilt per call — see the note above on why it is not memoized.
@@ -633,7 +709,7 @@ async function fetchPickerModels(
     const vendorModels = await catalog.modelsByVendor(firebaseSlug);
     const infos = dedupeByProviderSpec(
       providerSlug,
-      sortModelsNewestFirst(dedupeModels(vendorModels.map(catalogModelToModelInfo)))
+      toPickerRows(vendorModels.map(catalogModelToModelInfo))
     );
     if (!searchTerm) return infos;
     const needle = searchTerm.toLowerCase();
@@ -642,16 +718,107 @@ async function fetchPickerModels(
 
   if (searchTerm) {
     const found = await catalog.searchModels(searchTerm, 100);
-    return sortModelsNewestFirst(dedupeModels(found.map(catalogModelToModelInfo)));
+    return toPickerRows(found.map(catalogModelToModelInfo));
   }
 
-  return defaultModels;
+  // The default list too, and this is the branch F1 actually observed: two
+  // Enters at launch is "All providers" with no term, which lands here.
+  return toPickerRows(defaultModels);
 }
 
 /**
- * Select a model interactively with fuzzy search
+ * The cross-vendor catalog load — the picker's A2, as one awaitable.
+ *
+ * Extracted from `selectModelClassic`'s body so the OpenTUI picker runs the SAME two
+ * fetches in the same way rather than a second approximation of them. `allSettled`,
+ * not `all`: a failed top-100 fetch degrades to the recommended list, and a failed
+ * recommended fetch degrades to nothing — neither is allowed to take the picker down,
+ * because the rail is derived from provider definitions and stays usable with no
+ * catalog at all.
+ */
+export async function loadPickerCatalog(
+  options: { recommended?: boolean; forceUpdate?: boolean } = {}
+): Promise<{ top: ModelInfo[]; recommended: ModelInfo[] }> {
+  const { recommended = true, forceUpdate = false } = options;
+  const [top100Result, recommendedResult] = await Promise.allSettled([
+    getTop100Models(),
+    recommended ? loadRecommendedModels(forceUpdate) : Promise.resolve([]),
+  ]);
+  return {
+    top:
+      top100Result.status === "fulfilled"
+        ? sortModelsNewestFirst(dedupeModels(top100Result.value.models.map(modelDocToModelInfo)))
+        : [],
+    recommended: recommendedResult.status === "fulfilled" ? recommendedResult.value : [],
+  };
+}
+
+/**
+ * The interactive model picker's public entry point — UNCHANGED SIGNATURE.
+ *
+ * Resolves to a model spec string exactly as it always has, through the same
+ * `buildExplicitModelSpec` / `pickerModelPrefix` / `resolveProviderExternalId`
+ * functions. What changed is the cancel path: declining to choose used to call
+ * `process.exit(0)` from inside this library, and now throws `PickerCancelled`, which
+ * the caller's already-attached `handlePromptExit` turns into the same blank line and
+ * the same exit 0. Because that handler is attached at all three entry points
+ * (`index.ts:428`, `:432`, `:804`), ZERO call sites change and the user-visible
+ * result is byte-identical.
  */
 export async function selectModel(options: ModelSelectorOptions = {}): Promise<string> {
+  const outcome = await selectModelInteractive(options);
+  if (outcome.model === null) throw new PickerCancelled();
+  return outcome.model;
+}
+
+/** What the picker resolves to. `null` ⟺ the user declined to choose. */
+export interface PickerOutcome {
+  model: string | null;
+}
+
+/**
+ * The picker, as a function that RETURNS the user's decision instead of exiting.
+ *
+ * Three gates, in this order, and the order is the design:
+ *
+ * 1. **No TTY → `NoTtyError`, never a fallback to inquirer.** Falling back would be
+ *    falling back to a hang: inquirer in a non-TTY draws into a stream nothing is
+ *    reading and then waits for a keypress that cannot arrive. `index.ts` cannot reach
+ *    this branch (its own gate closed it), but `profile-commands.ts:559` can, and
+ *    `grep isTTY profile-commands.ts` returns nothing. So `claudish profile edit` under
+ *    a pipe now fails fast with four actionable pointers instead of hanging forever.
+ *
+ * 2. **`CLAUDISH_PICKER=classic` → the inquirer implementation.** Rollback is an env
+ *    var rather than a revert, which matters because this screen is on every user's
+ *    startup path and NO test drives the flow being replaced. The removal trigger is
+ *    recorded in `ROADMAP.md`.
+ *
+ * 3. **`--free` keeps its current behaviour — the throw.** `getFreeModels()` is a
+ *    documented stub returning `[]`, so `--free` has been unreachable since the Zen
+ *    removal. Routing it to the classic path preserves the exact exception rather than
+ *    inventing a UI nobody specified for a flag nobody can use.
+ *
+ * The picker itself is reached by DYNAMIC import, which is what keeps OpenTUI off the
+ * cold-start path and out of the MCP stdio path (§9.2).
+ */
+export async function selectModelInteractive(
+  options: ModelSelectorOptions = {}
+): Promise<PickerOutcome> {
+  if (!canDrawTui()) throw new NoTtyError();
+  if (options.freeOnly || process.env.CLAUDISH_PICKER === "classic") {
+    return { model: await selectModelClassic(options) };
+  }
+  const { runModelPicker } = await import("./picker/model-picker-run.js");
+  return runModelPicker(options);
+}
+
+/**
+ * The inquirer implementation, verbatim — still the picker under
+ * `CLAUDISH_PICKER=classic`, and still the machine behind `selectModelsForProfile`,
+ * which is not being ported in this change and calls `selectModelFromProvider`
+ * directly. It is not dead code kept "just in case": it has a live caller.
+ */
+async function selectModelClassic(options: ModelSelectorOptions = {}): Promise<string> {
   const { freeOnly = false, recommended = true, message, forceUpdate = false } = options;
   const catalog = createCatalogClient();
 
@@ -673,18 +840,11 @@ export async function selectModel(options: ModelSelectorOptions = {}): Promise<s
       throw new Error("No free models available");
     }
   } else {
-    const [top100Result, recommendedResult] = await Promise.allSettled([
-      getTop100Models(),
-      recommended ? loadRecommendedModels(forceUpdate) : Promise.resolve([]),
-    ]);
-
-    const topModels =
-      top100Result.status === "fulfilled"
-        ? sortModelsNewestFirst(dedupeModels(top100Result.value.models.map(modelDocToModelInfo)))
-        : [];
-    recommendedModels = recommendedResult.status === "fulfilled" ? recommendedResult.value : [];
-
-    models = topModels.length > 0 ? topModels : recommendedModels;
+    // Shared with the OpenTUI picker through `loadPickerCatalog`, so the two UIs
+    // cannot drift into fetching different things.
+    const loaded = await loadPickerCatalog({ recommended, forceUpdate });
+    recommendedModels = loaded.recommended;
+    models = loaded.top.length > 0 ? loaded.top : recommendedModels;
 
     interactiveProviderChoices = await getInteractiveProviderChoices();
     pickerProviders = toPickerProviders(interactiveProviderChoices);
@@ -827,7 +987,14 @@ export async function selectModel(options: ModelSelectorOptions = {}): Promise<s
   }
 }
 
-interface ProviderChoice {
+/**
+ * One row of the picker's provider list.
+ *
+ * EXPORTED because it is already the return type of the exported
+ * `buildProviderChoices`, so the name was public in everything but spelling — and
+ * the OpenTUI picker's data source needs to name it.
+ */
+export interface ProviderChoice {
   name: string;
   value: string;
   description: string;
@@ -837,7 +1004,7 @@ interface ProviderChoice {
 /**
  * Editorial overlay for the picker's provider rows — NOT a membership list.
  *
- * The roster itself is DERIVED from `getAllProviders()` (see
+ * The provider list itself is DERIVED from `getAllProviders()` (see
  * `buildProviderChoices`). This map only overrides copy where the picker's
  * wording beats the definition's `description`, which is written for the config
  * TUI's denser layout. A provider absent from this map still appears; it just
@@ -860,8 +1027,12 @@ const PICKER_COPY: Record<string, { name?: string; description?: string }> = {
   "minimax-coding": { name: "MiniMax Coding", description: "Coding subscription" },
   kimi: { name: "Kimi / Moonshot", description: "Direct API" },
   "kimi-coding": { name: "Kimi Coding", description: "Coding subscription" },
-  "qwen-cloud": { name: "Qwen Plan", description: "Alibaba Model Studio subscription" },
-  "qwen-payg": { name: "Qwen API", description: "Alibaba Model Studio pay-as-you-go" },
+  "qwen-token-plan": {
+    name: "Alibaba Token Plan",
+    description: "Model Studio subscription credits",
+  },
+  "qwen-coding": { name: "Alibaba Coding Plan", description: "Model Studio subscription requests" },
+  "qwen-payg": { name: "Alibaba PAYG", description: "Model Studio pay-as-you-go tokens" },
   glm: { name: "GLM / Zhipu", description: "Direct API" },
   "glm-coding": { name: "GLM Coding Plan", description: "Coding subscription" },
   "z-ai": { name: "Z.AI", description: "Direct API" },
@@ -896,7 +1067,8 @@ const PICKER_ORDER = [
   "minimax-coding",
   "kimi",
   "kimi-coding",
-  "qwen-cloud",
+  "qwen-token-plan",
+  "qwen-coding",
   "qwen-payg",
   "glm",
   "glm-coding",
@@ -925,7 +1097,7 @@ const PICKER_ORDER = [
  * request time) and are both pickable. Everything else is offerable, and the
  * credential authority decides whether THIS user sees it.
  *
- * A rule, not a roster — which is the point. The old hand-written
+ * A rule, not a list — which is the point. The old hand-written
  * ALL_PROVIDER_CHOICES array made membership opt-in, so `devin` and
  * `antigravity` were both invisible here while working everywhere else
  * (the config TUI derives its list from the same definitions).
@@ -1016,7 +1188,7 @@ async function getProviderChoices() {
  * this provider. The four provider rows here are longer aliases that are
  * equally valid and read better on a command line the user may copy —
  * `google@gemini-3-pro` over
- * `g@gemini-3-pro`. `zen` is a legacy picker VALUE (the roster now uses the
+ * `g@gemini-3-pro`. `zen` is a legacy picker VALUE (the provider list now uses the
  * definition name `opencode-zen`); kept so an old caller still resolves.
  *
  * Do NOT add a row here just because a provider is new — the derived path
@@ -1101,7 +1273,7 @@ export function buildExplicitModelSpec(provider: string, modelId: string): strin
  */
 export function resolveProviderExternalId(provider: string, model: ModelInfo): string {
   const match = resolveProviderAggregatorEntry(provider, model);
-  if (match?.externalId) return match.externalId;
+  if (match?.externalModelId) return match.externalModelId;
   return model.id;
 }
 
@@ -1119,9 +1291,10 @@ function resolveProviderAggregatorEntry(
   // actually holds. Without this, removing an alias silently degrades the row
   // to the catalog id — `kc@kimi-k2.7-code` instead of the wire id
   // `kc@kimi-for-coding` — and drops the per-aggregator price with it.
-  const firebaseSlug = pickerProviderToFirebaseSlug[provider] ?? provider;
   if (!model.aggregators) return undefined;
-  return model.aggregators.find((a) => a.provider.toLowerCase() === firebaseSlug.toLowerCase());
+  return model.aggregators.find(
+    (a) => a.routeStatus === "mapped" && catalogRouteMatchesProvider(a.route, provider)
+  );
 }
 
 /**
@@ -1163,7 +1336,7 @@ function getPickerDisplayName(providerValue: string): string {
 /**
  * Load models for a specific picker provider value via the CatalogClient.
  */
-async function loadModelsForPickerProvider(
+export async function loadModelsForPickerProvider(
   providerValue: string,
   catalog: CatalogClient
 ): Promise<ModelInfo[]> {
@@ -1173,11 +1346,58 @@ async function loadModelsForPickerProvider(
     const vendorModels = await catalog.modelsByVendor(firebaseSlug);
     return dedupeByProviderSpec(
       providerValue,
-      sortModelsNewestFirst(dedupeModels(vendorModels.map(catalogModelToModelInfo)))
+      toPickerRows(vendorModels.map(catalogModelToModelInfo))
     );
   } catch {
     return [];
   }
+}
+
+/**
+ * The models a picker provider SERVES, from the catalog's local served-by index.
+ *
+ * The synchronous twin of `loadModelsForPickerProvider`, and the source of the
+ * OpenTUI picker's ONE flat cross-provider list. It answers the same question
+ * through the same two chokepoints (`toPickerRows`, `dedupeByProviderSpec`) and
+ * differs in exactly one way: it never leaves the machine. That matters because
+ * the flat list asks about every provider at once, and 22 concurrent
+ * `?provider=` queries were measured taking 10 s and returning zero rows —
+ * "this provider has no models", which is the defect this whole feature exists
+ * to remove, manufactured by the fix for it.
+ *
+ * `servedByVendor` records why the served-by index is not a second authority.
+ */
+export function servedModelsForProvider(
+  providerValue: string,
+  catalog: CatalogClient
+): ModelInfo[] {
+  const firebaseSlug = pickerProviderToFirebaseSlug[providerValue] ?? providerValue;
+  return dedupeByProviderSpec(
+    providerValue,
+    toPickerRows(catalog.servedByVendor(firebaseSlug).map(catalogModelToModelInfo))
+  );
+}
+
+/**
+ * The `provider@` shortcut a picker row prints in its provider column — `or@`,
+ * `cx@`, `kc@`, `gk@`.
+ *
+ * DERIVED FROM THE DEFINITION, never a table. It is the SHORTEST spelling that
+ * parses back to this provider, which is what makes the column double as a
+ * lesson in the `provider@model` syntax the CLI already takes on argv, and what
+ * makes it collision-proof where the old provider rail was not (the rail
+ * truncated two different providers to the same `opencod…`).
+ *
+ * DELIBERATELY NOT `pickerModelPrefix`. That one applies the readability
+ * OVERRIDES (`google@`, `openrouter@`) because it builds the spec the user will
+ * copy off their screen; a fixed-width column wants the short form, and the full
+ * spec is on the detail line one row below. Both derive from the same definition,
+ * so neither can name a provider the other cannot.
+ */
+export function providerShortcut(providerValue: string): string {
+  const def = getProviderByName(providerValue);
+  const prefix = def?.shortestPrefix || def?.shortcuts?.[0];
+  return prefix ? `${prefix}@` : `${providerValue}@`;
 }
 
 async function searchModelsForPickerProvider(
@@ -1252,7 +1472,8 @@ async function pickModelFromList(
  *  - **Not everything served is chat.** Alibaba's plan host answers with image
  *    and TTS models alongside chat ones. Filtered with the SAME predicate the
  *    probe path uses, so the picker and `--probe` agree on what is chat-capable
- *    — a name-based rule, never a model-id skip list. An all-non-chat roster
+ *    — evidence from the provider's own listing or the catalog's modalities,
+ *    never a name rule or a model-id skip list. An all-non-chat dynamic models catalog
  *    returns [] so the caller falls through to the catalog / free-text path
  *    instead of showing an empty list.
  *  - **Neither price nor (always) context is reported.** Context comes from the
@@ -1267,7 +1488,7 @@ async function pickModelFromList(
  * A live offer as a short badge, or undefined when there is nothing to say.
  *
  * Evaluated against the clock on every render, never cached: two of the four
- * promos on the measured Devin roster expired within days of being observed,
+ * promos in the measured Devin dynamic models catalog expired within days of being observed,
  * and a stale "FREE" badge is a wrong-price bug — strictly worse than no badge.
  */
 function describeOffer(offer: ModelOffer | undefined): string | undefined {
@@ -1281,6 +1502,65 @@ function describeOffer(offer: ModelOffer | undefined): string | undefined {
 }
 
 /**
+ * Which list the user is about to be shown instead of the dynamic models catalog.
+ *
+ * The caller that writes the notice is not always the caller that knows this.
+ * `warnDiscoveryFailure` runs at the point discovery fails, BEFORE the
+ * catalog/free-text decision is taken further down `selectModelFromProvider`,
+ * so it can only state the default. A renderer that resolves both legs before
+ * drawing anything knows the real answer and says it.
+ *
+ * `"unknown"` emits no provenance line at all, which is the honest output when
+ * nothing has decided yet — better than naming a fallback that may not happen.
+ */
+export type FallbackTaken = "manual-entry" | "catalog" | "unknown";
+
+/**
+ * A discovery failure as the lines a presenter should show, newest line last.
+ *
+ * Pure: no I/O, no read of the module-global failure map. Split out of
+ * `warnDiscoveryFailure` so the same words can go to stderr (the classic
+ * inquirer path) and into render state (the OpenTUI picker, which must not
+ * write to a terminal it is drawing on). The wording is deliberately unchanged —
+ * it was measured against a real 401 and found to be complete; what was wrong
+ * was its presentation, not its content.
+ *
+ * Each string carries its own newlines, so a presenter that writes them
+ * verbatim reproduces today's stderr byte for byte.
+ */
+export function formatDiscoveryFailureNotice(
+  displayName: string,
+  failure: DiscoveryFailure,
+  def: Pick<ProviderDefinition, "apiKeyEnvVar" | "apiKeyUrl">,
+  fallback: FallbackTaken = "manual-entry"
+): string[] {
+  const lines = [
+    `\n⚠ ${displayName} could not list its models: ${describeDiscoveryFailure(failure)}\n`,
+  ];
+
+  // A credential problem is the one case with a concrete next step, so name the
+  // exact env var and where a key comes from. Naming the variable matters more
+  // than it looks: a provider's key is frequently shadowed by a stale value in
+  // the shell, and "check your API key" gives no clue which name to inspect.
+  if (failure.kind === "unauthorized" || failure.kind === "no-credentials") {
+    if (def.apiKeyEnvVar) {
+      lines.push(
+        `  Check ${def.apiKeyEnvVar} (a value in your shell overrides stored credentials).\n`
+      );
+    }
+    if (def.apiKeyUrl) lines.push(`  Get a key: ${def.apiKeyUrl}\n`);
+  }
+
+  if (fallback === "manual-entry") lines.push("  Falling back to manual model entry.\n\n");
+  else if (fallback === "catalog") {
+    lines.push(
+      `  Showing ${displayName}'s cloud-catalog entries below — not its live model list.\n\n`
+    );
+  }
+  return lines;
+}
+
+/**
  * Tell the user why a discovery provider offered no list, on stderr, before the
  * picker degrades to the catalog / free-text path.
  *
@@ -1288,9 +1568,15 @@ function describeOffer(offer: ModelOffer | undefined): string | undefined {
  * inquirer on stdout, and a model spec is what this module ultimately RETURNS
  * — a notice must not be capturable as part of a piped answer.
  *
- * `empty-roster` is deliberately silent: an endpoint that answers correctly
+ * `empty-models-catalog` is deliberately silent: an endpoint that answers correctly
  * with nothing chat-capable is not an error, and the free-text prompt that
  * follows is the right affordance for it. Only actionable failures are named.
+ * (That judgement is right for stderr, where a notice scrolls past; a rendered
+ * panel can afford to say it in one dim row, and the picker does.)
+ *
+ * Reads the module-global failure map rather than taking a failure, because its
+ * call site has already thrown the outcome away. New callers should prefer
+ * `buildDiscoveredModelOutcome`, which carries the failure with it.
  *
  * Exported for unit tests.
  */
@@ -1300,62 +1586,210 @@ export function warnDiscoveryFailure(
   def: Pick<ProviderDefinition, "apiKeyEnvVar" | "apiKeyUrl">
 ): void {
   const failure = getDiscoveryFailure(provider);
-  if (!failure || failure.kind === "empty-roster") return;
+  if (!failure || failure.kind === "empty-models-catalog") return;
 
-  process.stderr.write(
-    `\n⚠ ${displayName} could not list its models: ${describeDiscoveryFailure(failure)}\n`
-  );
-
-  // A credential problem is the one case with a concrete next step, so name the
-  // exact env var and where a key comes from. Naming the variable matters more
-  // than it looks: a provider's key is frequently shadowed by a stale value in
-  // the shell, and "check your API key" gives no clue which name to inspect.
-  if (failure.kind === "unauthorized" || failure.kind === "no-credentials") {
-    if (def.apiKeyEnvVar) {
-      process.stderr.write(
-        `  Check ${def.apiKeyEnvVar} (a value in your shell overrides stored credentials).\n`
-      );
-    }
-    if (def.apiKeyUrl) process.stderr.write(`  Get a key: ${def.apiKeyUrl}\n`);
+  // Default `fallback`, i.e. "Falling back to manual model entry." — which is
+  // not always what happens next (the catalog usually answers), but this call
+  // site runs before that is decided and cannot know. Correcting the string is
+  // a follow-up with a named trigger: when `selectModelClassic` is deleted,
+  // this function and the assertion on that sentence go with it.
+  for (const line of formatDiscoveryFailureNotice(displayName, failure, def)) {
+    process.stderr.write(line);
   }
-  process.stderr.write("  Falling back to manual model entry.\n\n");
 }
 
+/**
+ * Dynamic models catalog → picker rows, as an injectable step.
+ *
+ * A seam, not a design: `collapseModelsCatalog` folding a non-empty dynamic models catalog to `[]` is
+ * the one state behind `PickerDiscoveryOutcome.collapsed-empty`, and the single
+ * shipped resolver cannot produce it (every entry lands in a group and every
+ * group yields a choice), so the variant is otherwise untestable. The
+ * alternative, `mock.module()` on the resolver registry, bleeds into sibling Bun
+ * test files and is banned here. Replace the property in a test and restore it;
+ * the same shape the discovery tests already use on `credentials.getRequestAuth`.
+ */
+export const _modelsCatalogCollapse = { collapse: collapseModelsCatalog };
+
+/**
+ * What one discovery provider's model list actually is — all five states that
+ * used to be the same empty array, plus the one where nothing was attempted.
+ *
+ * `buildDiscoveredModelRows` returned `[]` for a rejected API key, an
+ * unreachable endpoint, a genuinely empty dynamic models catalog, a dynamic models catalog where nothing was
+ * chat-capable, and a dynamic models catalog that collapsed to nothing — and its caller fell
+ * through to the cloud catalog for all of them, silently. The user's report was
+ * *"it just shows fewer model names, like the provider does not have any
+ * models"*: information destroyed at a return statement, which no amount of UI
+ * can recover. Hence a discriminated union produced where the information still
+ * exists.
+ *
+ * - `rows` is **non-empty by construction** — the type says so, and the three
+ *   empty cases below exist precisely so it can.
+ * - `servedCount` / `chatCount` make a PARTIAL filter visible too: today the
+ *   difference between "served 40" and "40 of which 12 are chat models" is
+ *   discarded.
+ * - `fallbackRows` rides along on the four recoverable variants, resolved
+ *   CONCURRENTLY with discovery rather than after it (§3.6 of the design): a
+ *   serial second fetch would put the feature's worst latency on exactly the
+ *   path the complaint is about. Empty when the catalog has nothing either, in
+ *   which case the only remaining affordance is free-text entry.
+ * - `unsupported` is not a failure. ~25 pickable providers declare no
+ *   `modelDiscovery`; for them the catalog list is the normal, correct UI and a
+ *   notice would be noise on the majority case.
+ */
+export type PickerDiscoveryOutcome =
+  | { kind: "rows"; rows: [ModelInfo, ...ModelInfo[]]; servedCount: number; chatCount: number }
+  | { kind: "all-filtered"; servedCount: number; sampleIds: string[]; fallbackRows: ModelInfo[] }
+  | { kind: "collapsed-empty"; servedCount: number; chatCount: number; fallbackRows: ModelInfo[] }
+  | { kind: "empty-models-catalog"; failure: DiscoveryFailure; fallbackRows: ModelInfo[] }
+  | { kind: "failed"; failure: DiscoveryFailure; notice: string[]; fallbackRows: ModelInfo[] }
+  | { kind: "unsupported"; reason: "no-descriptor" | "no-fetcher" };
+
+/**
+ * One discovery provider's list, with the reason when there isn't one.
+ *
+ * Starts both legs at once — the dynamic models catalog and the cloud-catalog fallback —
+ * and returns one settled answer, so a view has one state and one affordance per
+ * provider instead of two spinners to reconcile. The catalog leg costs a lookup
+ * a healthy dynamic models catalog does not need; that is cheaper than doubling the wait on the
+ * failure path, and `catalog.modelsByVendor` caches.
+ */
+export async function buildDiscoveredModelOutcome(
+  provider: string,
+  displayName: string,
+  catalog: CatalogClient
+): Promise<PickerDiscoveryOutcome> {
+  const [modelsCatalogResult, fallbackResult] = await Promise.allSettled([
+    discoverProviderModelsCatalog(provider),
+    loadModelsForPickerProvider(provider, catalog),
+  ]);
+
+  const fallbackRows = fallbackResult.status === "fulfilled" ? fallbackResult.value : [];
+  // `discoverProviderModelsCatalog` never rejects by contract, but a contract is not a
+  // type: honour it rather than asserting it, so a future regression there shows
+  // up as a named failure instead of an unhandled rejection behind a renderer.
+  const modelsCatalog: ModelsCatalogOutcome =
+    modelsCatalogResult.status === "fulfilled"
+      ? modelsCatalogResult.value
+      : {
+          kind: "failed",
+          failure: {
+            kind: "unreachable",
+            provider,
+            detail: String(
+              (modelsCatalogResult.reason as Error)?.message ?? modelsCatalogResult.reason
+            ),
+          },
+        };
+
+  if (modelsCatalog.kind === "unsupported")
+    return { kind: "unsupported", reason: modelsCatalog.reason };
+
+  if (modelsCatalog.kind === "failed") {
+    const { failure } = modelsCatalog;
+    // `empty-models-catalog` is its own variant rather than a `failed` with a kind to
+    // switch on, because it is not an error: the endpoint answered. It renders
+    // in the NOTICE tier, visibly distinct from a rejected key.
+    if (failure.kind === "empty-models-catalog") {
+      return { kind: "empty-models-catalog", failure, fallbackRows };
+    }
+    const def = getProviderByName(provider);
+    const notice = formatDiscoveryFailureNotice(
+      displayName,
+      failure,
+      // A runtime custom endpoint may not be in the definition table at all;
+      // empty strings suppress the two guidance lines, which is right — there is
+      // no env var or key URL to name.
+      def ?? { apiKeyEnvVar: "", apiKeyUrl: "" },
+      fallbackRows.length > 0 ? "catalog" : "manual-entry"
+    );
+    return { kind: "failed", failure, notice, fallbackRows };
+  }
+
+  const served = rankDiscoveredModels(modelsCatalog.models);
+  const servedCount = served.length;
+  // `m.reported` carries the provider's own chat/not-chat statement. Judging the
+  // bare `m.id` alone discarded it, and once `unknown` stopped counting as chat
+  // that emptied the picker for every provider whose ids the cloud catalog does
+  // not list verbatim: Ollama 19 → 1, Devin 247 → 3, Antigravity 21 → 7.
+  const discovered = served.filter((m) => isReportedChatCapable(m.id, m.reported));
+  const chatCount = discovered.length;
+  if (chatCount === 0) {
+    // Served N, none of them chat-capable. Invisible today, and self-explaining
+    // only if the ids come with it — they are usually embeddings or wildcard
+    // routes, which a reader recognises at a glance.
+    return {
+      kind: "all-filtered",
+      servedCount,
+      sampleIds: served
+        .filter((m) => !isReportedChatCapable(m.id, m.reported))
+        .slice(0, 3)
+        .map((m) => m.id),
+      fallbackRows,
+    };
+  }
+
+  const [head, ...tail] = buildRowsFromDiscovered(provider, displayName, discovered, fallbackRows);
+  if (head === undefined) {
+    // Unreachable through the one shipped resolver, and deliberately still
+    // modelled: `{kind:"rows", rows: []}` would be an empty panel with no
+    // explanation, which is the exact defect class this type removes. Destructured
+    // rather than length-checked so the non-empty tuple needs no cast to assert.
+    return { kind: "collapsed-empty", servedCount, chatCount, fallbackRows };
+  }
+  return { kind: "rows", rows: [head, ...tail], servedCount, chatCount };
+}
+
+/**
+ * The picker rows for a provider's dynamic models catalog, or `[]` for any of the six
+ * reasons there isn't one.
+ *
+ * A wrapper over {@link buildDiscoveredModelOutcome} since the outcome type
+ * landed. The classic inquirer path keeps using it and keeps asking
+ * `warnDiscoveryFailure` why the list was empty afterwards — which still works,
+ * because every failure is still recorded in `model-discovery.ts`'s map.
+ */
 export async function buildDiscoveredModelRows(
   provider: string,
   displayName: string,
   catalog: CatalogClient
 ): Promise<ModelInfo[]> {
-  const discovered = rankDiscoveredModels(await discoverProviderModels(provider)).filter((m) =>
-    isChatCapable(m.id)
-  );
-  if (discovered.length === 0) return [];
+  const outcome = await buildDiscoveredModelOutcome(provider, displayName, catalog);
+  return outcome.kind === "rows" ? outcome.rows : [];
+}
 
+/**
+ * Chat-capable discovered models → picker rows. Pure; no I/O.
+ *
+ * `catalogRows` is the vendor catalog's list for this provider, already fetched
+ * by the caller. A per-token discovery provider should show the real rate, and
+ * neither the live endpoint nor the slim catalog reports one — so the price
+ * comes from there. Flat-rate providers (every discovery provider today) ignore
+ * it entirely.
+ */
+function buildRowsFromDiscovered(
+  provider: string,
+  displayName: string,
+  discovered: DiscoveredModel[],
+  catalogRows: ModelInfo[]
+): ModelInfo[] {
   const subscription = isSubscriptionProvider(provider);
   const local = getProviderByName(provider)?.isLocal === true;
   // Neither a flat-rate plan nor a local daemon charges per token, and the
   // vendor catalog has nothing to say about either — Firebase does not list a
   // model someone pulled onto their own machine.
   const flatRate = subscription || local;
-  // A per-token discovery provider should show the real rate; the live endpoint
-  // doesn't report one and the slim catalog carries no prices, so ask the
-  // vendor catalog. Skipped for flat-rate providers, which is every discovery
-  // provider today, so nothing pays for this lookup.
   const pricingById = flatRate
     ? new Map<string, ModelInfo["pricing"]>()
-    : new Map(
-        (await loadModelsForPickerProvider(provider, catalog)).map((m) => [
-          m.id.toLowerCase(),
-          m.pricing,
-        ])
-      );
+    : new Map(catalogRows.map((m) => [m.id.toLowerCase(), m.pricing]));
 
   // Fold variant explosions into the rows a human actually picks. Identity for
   // every provider without a resolver, so this is a no-op except for Devin,
   // where 167 served uids are ~39 real choices multiplied out by reasoning tier
   // and speed premium. The chosen id is always a real wire id, so it still
   // round-trips through buildExplicitModelSpec and argv unchanged.
-  const choices = collapseRoster(provider, discovered.map(toRosterEntry));
+  const choices = _modelsCatalogCollapse.collapse(provider, discovered.map(toModelsCatalogEntry));
   const discoveredById = new Map(discovered.map((m) => [m.id, m]));
 
   // The live endpoint decides WHICH models appear (entitlement) and overrides
@@ -1372,7 +1806,12 @@ export async function buildDiscoveredModelRows(
 
     // Order: what it is · how big · what it costs · whether it is on offer.
     const parts = [c.displayName];
-    if (contextLength) parts.push(`${Math.round(contextLength / 1024)}K context`);
+    // ONE FORMATTER, ONE NUMBER. This line used to divide by 1024 while `context`
+    // (three lines down, and what every list row prints) divides by 1000, so a single
+    // frame showed the same model as `250K` in its row and `244K context` in its
+    // description — measured in the picker's first capture, and reported before that
+    // from the old picker's detail line. Neither number was wrong; having two was.
+    if (contextLength) parts.push(`${formatContextLength(contextLength)} context`);
     // A relative multiplier is only meaningful on a plan that bills in credits;
     // for a per-token provider the real rate is already in `pricing`.
     if (subscription && c.costFactor !== undefined) parts.push(`×${c.costFactor}`);
@@ -1403,7 +1842,7 @@ export async function buildDiscoveredModelRows(
   // Present newest-first, with the SAME comparator the catalog path uses, so
   // every picker in claudish orders identically. `rankDiscoveredModels` above
   // is only a stable, deterministic input order — its widest-window-first rule
-  // is meaningful for probe candidates, but for a plan whose entire roster is
+  // is meaningful for probe candidates, but for a plan whose entire dynamic models catalog is
   // 1M it collapses to alphabetical, which is what made the picker look unsorted.
   return sortModelsNewestFirst(rows);
 }
@@ -1424,7 +1863,7 @@ async function selectModelFromProvider(
   const prefix = pickerModelPrefix(provider) ?? `${provider}@`;
   const displayName = getPickerDisplayName(provider);
 
-  // Subscription providers (e.g. Kimi Coding) serve a roster that only their
+  // Subscription providers (e.g. Kimi Coding) serve a dynamic models catalog that only their
   // own authenticated endpoint knows — the owner's public catalog lists models
   // the subscription can't serve, and the per-tier context windows aren't in it
   // at all. Ask the endpoint, and offer exactly what this user's plan allows.
@@ -1441,7 +1880,7 @@ async function selectModelFromProvider(
       //
       // The fall-through itself is correct and deliberate; what was wrong was
       // doing it silently. A rejected API key and a provider that publishes no
-      // roster both ended up as the same free-text prompt, so a credential
+      // dynamic models catalog both ended up as the same free-text prompt, so a credential
       // error was indistinguishable from normal behaviour.
       warnDiscoveryFailure(provider, displayName, def);
     }
@@ -1450,7 +1889,7 @@ async function selectModelFromProvider(
   // Ollama and LM Studio used to be handled here, each its own way — Ollama by
   // an inline `/api/tags` branch, LM Studio not at all (free-text only). Both
   // now declare `modelDiscovery`, so the block above lists them like every
-  // other provider that knows its own roster. A local daemon is not a different
+  // other provider that knows its own dynamic models catalog. A local daemon is not a different
   // KIND of thing; it is a provider whose endpoint happens to be on localhost.
 
   // Local / user-deployed providers: Firebase has no catalog, free-text only.
@@ -1666,23 +2105,10 @@ export async function promptForProfileDescription(): Promise<string> {
   return description.trim();
 }
 
-/**
- * Select from existing profiles
- */
-export async function selectProfile(
-  profiles: { name: string; description?: string; isDefault?: boolean }[]
-): Promise<string> {
-  const selected = await select({
-    message: "Select a profile:",
-    choices: profiles.map((p) => ({
-      name: p.isDefault ? `${p.name} (default)` : p.name,
-      value: p.name,
-      description: p.description,
-    })),
-  });
-
-  return selected;
-}
+// `selectProfile` was DELETED here. It had zero importers anywhere in the repo,
+// tests included — the profile commands build their own `select` — so it was an
+// exported surface that nothing could regress and nothing could exercise. Removed
+// with the picker rewrite rather than left for the next reader to re-litigate.
 
 /**
  * Confirm action

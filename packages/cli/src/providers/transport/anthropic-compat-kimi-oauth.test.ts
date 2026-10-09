@@ -16,12 +16,19 @@
  * It also pins that NON-OAuth providers (MiniMax / Z.AI) are unaffected — they keep
  * their plain x-api-key / Bearer + anthropic-version + provider.headers path.
  *
- * Hermetic strategy: we mock the credential authority's getRequestAuth (the single
- * dispatch point the transport now calls) so no real OAuth file / SDK is touched.
+ * Hermetic strategy: fake credentials registered on the REAL authority (the single
+ * dispatch point the transport now calls) delegate to `getRequestAuthMock`, so no
+ * real OAuth file / SDK is touched. The real credentials are re-registered in
+ * afterAll. Never `mock.module()` the authority: Bun keeps that replacement for
+ * the rest of the process, and every later file that imports `credentials` got a
+ * fake with no `register`.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { credentials } from "../../auth/credentials/authority.js";
+import type { CredentialProvider } from "../../auth/credentials/types.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
+import { AnthropicProviderTransport } from "./anthropic-compat.js";
 
 const FAKE_TOKEN = "kimi-oauth-token-xyz";
 
@@ -46,16 +53,47 @@ const KIMI_OAUTH_AUTH = {
   },
 };
 
-// ── Mock the authority's getRequestAuth (the new delegation target) ───────────
+// ── Fake the authority's credentials (the new delegation target) ──────────────
 let getRequestAuthMock = mock(async (_name: string, _ctx: any) => KIMI_OAUTH_AUTH as any);
 
-mock.module("../../auth/credentials/authority.js", () => ({
-  credentials: {
-    getRequestAuth: (name: string, ctx: any) => getRequestAuthMock(name, ctx),
-  },
-}));
+// Every name this file's transports could sign under. "kimi-coding" is the
+// delegation under test. "minimax" and "z-ai" are faked too so the "no authority
+// call" assertions can still fail: without a fake, a call under either name
+// would reach the real api-key provider and never touch the mock.
+const FAKED_NAMES = ["kimi-coding", "minimax", "z-ai"] as const;
 
-const { AnthropicProviderTransport } = await import("./anthropic-compat.js");
+/** Answers under `name` only, and passes that name on (the authority consumes it). */
+function fakeCredential(name: string): CredentialProvider {
+  return {
+    catalogName: name,
+    isAvailable: async () => true,
+    describeReadiness: async () => ({ readiness: "present" }),
+    getRequestAuth: (ctx) => getRequestAuthMock(name, ctx),
+  };
+}
+
+const realCredentials = new Map<string, CredentialProvider>();
+
+beforeAll(() => {
+  for (const name of FAKED_NAMES) {
+    const real = credentials.get(name);
+    if (!real) {
+      throw new Error(`the authority has no ${name} credential to restore after this file`);
+    }
+    realCredentials.set(name, real);
+    credentials.register(fakeCredential(name), [name]);
+    credentials.invalidate(name);
+  }
+});
+
+afterAll(() => {
+  // Put the real credentials back so no later file in the Bun run signs with a fake.
+  for (const [name, real] of realCredentials) {
+    credentials.register(real, [name]);
+    credentials.invalidate(name);
+  }
+  realCredentials.clear();
+});
 
 beforeEach(() => {
   getRequestAuthMock = mock(async (_name: string, _ctx: any) => KIMI_OAUTH_AUTH as any);

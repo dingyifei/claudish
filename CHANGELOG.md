@@ -2,6 +2,382 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [10.4.0] - 2026-10-06
+
+### ⚠ BREAKING CHANGES
+
+- create_session, send_input, cancel_session, *(mcp)* ([`352e1ee`](https://github.com/MadAppGang/claudish/commit/352e1ee15350e3784675df84a3997f9175e02c1f))
+- MCP `team` and CLI `claudish team` / `--team --mode *(mcp)* ([`7a22c84`](https://github.com/MadAppGang/claudish/commit/7a22c8447009513c98f2547a8251cca47b6b5c8e))
+
+### Bug Fixes
+
+- refuse a non-boolean include_completed or spans argument *(mcp)* ([`3fe6bc2`](https://github.com/MadAppGang/claudish/commit/3fe6bc2c4db2fc8ada44581f99a5bad75ab52cd3))
+- check team verb argument types before resolving the run *(mcp)* ([`856e2d5`](https://github.com/MadAppGang/claudish/commit/856e2d5bac19df6b0016103bfce50420ab36715c))
+- accept /compact at its typed record, not after compaction *(mcp)* ([`4311d6f`](https://github.com/MadAppGang/claudish/commit/4311d6f45b50401e6a949fe12c815d82d8ccc75c))
+- keep a pane's escaped background shell after its parent dies *(mcp)* ([`70c0f11`](https://github.com/MadAppGang/claudish/commit/70c0f11a552bea88fb8a223861d0b68c3e7d6132))
+- give a settled disk-read run a finished_at without completedAt *(team)* ([`fb27b07`](https://github.com/MadAppGang/claudish/commit/fb27b07e4f47fd8f78c6b99f1ed388510b2d8647))
+- map legacy models[slot].state into the closed SlotState set *(team)* ([`bb276f1`](https://github.com/MadAppGang/claudish/commit/bb276f1af8d32c1508e7ea875088e9d8ea9dcecd))
+- leave nothing behind when pane-drive is interrupted *(scripts)* ([`a700335`](https://github.com/MadAppGang/claudish/commit/a7003352d5a144e60f1313f6aab336a33683a69d))
+- write a session's meta.json atomically *(mcp)* ([`9aef742`](https://github.com/MadAppGang/claudish/commit/9aef742c0344ed6bad23559a5ec9e659abe572f0))
+- name the final screen, not stderr, in the failed-frame hint *(mcp)* ([`f791b44`](https://github.com/MadAppGang/claudish/commit/f791b44f6f3622976962f4426db56ad6d73eec1e))
+- answer an invalid_args create_session without the report hint *(mcp)* ([`6d7ec7f`](https://github.com/MadAppGang/claudish/commit/6d7ec7fcb6a1745129e20a106829f725c9b9b77f))
+- refuse to judge a team run that is still ACTIVE *(team)* ([`780cb66`](https://github.com/MadAppGang/claudish/commit/780cb66cb6af42181b0c42f3e606d7dff86e19b1))
+- write a slot's terminal row even when its response file fails *(team)* ([`511b122`](https://github.com/MadAppGang/claudish/commit/511b1227dbf0077f0f18f1ee8f6c6e5d9c6c62aa))
+- refuse an invalid require_pattern before writing the session *(team)* ([`dd5abb7`](https://github.com/MadAppGang/claudish/commit/dd5abb70a0b474271c317f560dccc663020929a3))
+- run the magmux --version probe without blocking the event loop *(mcp)* ([`cab1585`](https://github.com/MadAppGang/claudish/commit/cab15850bc7b2ec50d7621724ef0b3a8e95a1fa2))
+- treat a code-less exit after a delivered /exit as clean *(mcp)* ([`d02be60`](https://github.com/MadAppGang/claudish/commit/d02be60fb9667950f1519d8b88f0cb9cd7a13fda))
+- end a pane whose watcher or record could not be created *(mcp)* ([`8c08a61`](https://github.com/MadAppGang/claudish/commit/8c08a61de74e471b4c2c3ecbc403c86e161819ff))
+- refuse a claude_flags value after a Claude Code boolean flag *(mcp)* ([`3541459`](https://github.com/MadAppGang/claudish/commit/3541459b9de12f18c209e2d9e82baebfa1b30b54))
+- keep a nested claudish off its parent session's token file *(statusline)* ([`ca64ba8`](https://github.com/MadAppGang/claudish/commit/ca64ba8505cfcf0d02f1afd7cf3e1cb9366bec8b))
+- write the token file at the path its readers resolve *(statusline)* ([`0295054`](https://github.com/MadAppGang/claudish/commit/0295054afb4c714c12a31e8732e055016de422e0))
+- redact a pane's failure detail before any owner records it *(mcp)* ([`8358698`](https://github.com/MadAppGang/claudish/commit/83586981361bee7394df105a87c968915c37ef9a))
+- end every run's record before shutdownAllTeamRuns resolves *(team)* ([`f34725a`](https://github.com/MadAppGang/claudish/commit/f34725adc869a76df49339708bfa6e3f053e5e58))
+- show turn_end_record_missing in slot rows only while it holds *(team)* ([`6b51920`](https://github.com/MadAppGang/claudish/commit/6b51920472be19bbb9f1ef0bded06ad97b7d9b6e))
+- signal a pane's background shells that left its process group *(mcp)* ([`b7c6901`](https://github.com/MadAppGang/claudish/commit/b7c6901b783fbc076b98faabf1f358bfacf281bd))
+- read the input box before retyping a send whose reply was lost *(mcp)* ([`5330afe`](https://github.com/MadAppGang/claudish/commit/5330afe6a31505583a9b5a7cf65ceccf75b68d06))
+- keep only the newest turn's state in the transcript follower *(mcp)* ([`606187e`](https://github.com/MadAppGang/claudish/commit/606187ecaf941e0c159dd1abedaad978653303fd))
+- drop dead members from a pane's group snapshot on refresh *(mcp)* ([`47d5780`](https://github.com/MadAppGang/claudish/commit/47d5780cb309a995a785ae1d907dee9d3946ef56))
+- report a command turn's unread file as unverified, not failed *(mcp)* ([`2f1fcc2`](https://github.com/MadAppGang/claudish/commit/2f1fcc27c3c8581bee719a2cbad252d9cccb8dab))
+- reject a pane record whose paneId is not its own filename *(mcp)* ([`bc0bebb`](https://github.com/MadAppGang/claudish/commit/bc0bebb04cd91c50d80b6100894328dcf6cfef62))
+- resolve CLAUDISH_PANE_ROOT before comparing pane paths to it *(mcp)* ([`8f6ff7e`](https://github.com/MadAppGang/claudish/commit/8f6ff7ebf15962d5d50bfe664ea682990cbc2910))
+- decide a turn settled inside send_input as interactive *(mcp)* ([`75f7f0a`](https://github.com/MadAppGang/claudish/commit/75f7f0a6e4a144f29ef36f733fbd8967eeb4ecf1))
+- end a panel command's admission without a turn after Esc *(mcp)* ([`581042f`](https://github.com/MadAppGang/claudish/commit/581042fa2906f54b0dd119e1f0c709b634c90b3f))
+- accept a system/local_command record as a command witness *(mcp)* ([`9e79bc8`](https://github.com/MadAppGang/claudish/commit/9e79bc8d7e3905c17bfc4d6e840d1dccc9e35dc1))
+- settle a local slash-command turn on its local-command-stdout *(mcp)* ([`d0f59a1`](https://github.com/MadAppGang/claudish/commit/d0f59a1f9f852b10997ed1ae82aaaff70abd6b6c))
+- end a pane session COMPLETED on /exit after a settled turn *(mcp)* ([`58284ee`](https://github.com/MadAppGang/claudish/commit/58284eea0a648a6554b179190ad59d2509a3b60f))
+- truncate project-dir names over 200 characters with a hash *(session)* ([`2ec4d8d`](https://github.com/MadAppGang/claudish/commit/2ec4d8d8cd143c439c1e314eab540d04f05deb76))
+- decode transcript lines only once their newline has arrived *(mcp)* ([`b9c238f`](https://github.com/MadAppGang/claudish/commit/b9c238fff5645fa83a3da15fb149cd07f0318136))
+- attach the magmux dial's error listener before connect *(mcp)* ([`bd49e68`](https://github.com/MadAppGang/claudish/commit/bd49e683f64cab44194a60471530194ad071fa49))
+- end session and team records before exiting on SIGTERM *(mcp)* ([`6a71068`](https://github.com/MadAppGang/claudish/commit/6a710686177abd7ff787fb33a463b069ce45b011))
+- use up a held pane reservation when startPaneSession throws *(mcp)* ([`8213dd2`](https://github.com/MadAppGang/claudish/commit/8213dd29edb72834b5365ad1b25e2722fc47ae82))
+- drop the retry watchdog in MCP pane children *(recovery)* ([`f38c7e9`](https://github.com/MadAppGang/claudish/commit/f38c7e94b4b01d2493e5e535b0cc56ac003a71d9))
+- map the awaiting_permission channel event to input_required *(mcp)* ([`415b76b`](https://github.com/MadAppGang/claudish/commit/415b76b29dcde7c2532c607d6fdae2e03d0ce365))
+- strip CLAUDE_CODE_CHILD_SESSION from interactive Claude Code *(runner)* ([`3bb5fee`](https://github.com/MadAppGang/claudish/commit/3bb5fee5d3021b451572dd11241c6a64b9e5950a))
+- read an inherited CLAUDISH_TOKEN_FILE in the status line *(statusline)* ([`e6309f0`](https://github.com/MadAppGang/claudish/commit/e6309f0df63b2f72bf0bc324bad2f05dcc1e7c82))
+- read CLAUDE_CONFIG_DIR for the transcript projects dir *(session)* ([`980964b`](https://github.com/MadAppGang/claudish/commit/980964b840f324326280e6b1d1b1fe8d6134ee6b))
+- slug every non-alphanumeric cwd character in transcriptPathFor *(session)* ([`31c908d`](https://github.com/MadAppGang/claudish/commit/31c908d5a22c3f2308feb51a15f9f3274bf60dbc))
+- poll the transcript for 2 s to prove parentClaudeSessionId *(mcp)* ([`51104c7`](https://github.com/MadAppGang/claudish/commit/51104c769b58c64985b41a34750613847d6cfebf))
+- round and clamp timeout_seconds to 1-3600 in createSession *(channel)* ([`9d511f4`](https://github.com/MadAppGang/claudish/commit/9d511f4c9bed3b8579b58ea6dd8ddfa4fdd57ab4))
+- keep a team run record open when its meta.json write fails *(team)* ([`d3bb554`](https://github.com/MadAppGang/claudish/commit/d3bb55405e82dc59fc607db33f71fe996dc07a7c))
+- send SIGKILL to spawned slots when the spawn loop throws *(team)* ([`a63d517`](https://github.com/MadAppGang/claudish/commit/a63d51723ab2908d29fc8f33104fef631ded7840))
+- cache only a verified parent-proof project directory *(channel)* ([`6527d4e`](https://github.com/MadAppGang/claudish/commit/6527d4ea3e7d7dfed3c71777b8f6dad5de4c7045))
+- resolve the sessions directory from $HOME before homedir *(channel)* ([`1d87bfd`](https://github.com/MadAppGang/claudish/commit/1d87bfd7296de65658e0d4d036d793b8822a369e))
+- report waiting_for_input only while stdin stays open *(channel)* ([`c315ebc`](https://github.com/MadAppGang/claudish/commit/c315ebc522964fe14371dc9a7ec9c08f41e765d6))
+
+### Documentation
+
+- record the live validation of pane-based team and sessions *(mcp)* ([`907c63a`](https://github.com/MadAppGang/claudish/commit/907c63adb11336f24ec85f7036b6df207ab1c286))
+- add the 2.1.291 code-review captures to the capture report *(mcp)* ([`f2b83ca`](https://github.com/MadAppGang/claudish/commit/f2b83ca783848927cbd26d023c1248d603bdbd20))
+- say that a value after a Claude Code switch is refused *(mcp)* ([`b28cae7`](https://github.com/MadAppGang/claudish/commit/b28cae7fb9cc0d73a3a4147e60ab2ad955e147db))
+- describe the one token-file rule and the published marker *(statusline)* ([`88a91a4`](https://github.com/MadAppGang/claudish/commit/88a91a4b3d4c896c4fede7acb41cbeec7ab88916))
+- record the 2.1.291 captures behind the pane review fixes *(mcp)* ([`12f0635`](https://github.com/MadAppGang/claudish/commit/12f063548ef4a58ed87eebdd47c4b83460aa5500))
+- record the bun 1.3.10 socket ENOENT that a 1.4.0 run hid *(test)* ([`54d99ae`](https://github.com/MadAppGang/claudish/commit/54d99ae43f2ebb3718771b6884ee13bd27eb547f))
+- document the magmux 0.14.0 requirement and the capture verbs *(mcp)* ([`3c249b1`](https://github.com/MadAppGang/claudish/commit/3c249b1378b3675e78fb5df5900580112ff20c04))
+- document hermetic pane tests and the opt-in live tests *(test)* ([`e4c5aea`](https://github.com/MadAppGang/claudish/commit/e4c5aea7cdeb7a3fce048a034a05922266b47445))
+- record why a pane child exports no retry watchdog *(recovery)* ([`281b65f`](https://github.com/MadAppGang/claudish/commit/281b65f787b28bb4bacfd9673e3953026566c439))
+- point headless-vs-interactive.md at the pane driver *(mcp)* ([`74852e7`](https://github.com/MadAppGang/claudish/commit/74852e7bb7d202cff83e421872c420c5e494a7ce))
+- describe team slots as panes in team-lifecycle and capture *(team)* ([`d4a4eb3`](https://github.com/MadAppGang/claudish/commit/d4a4eb3975ea31e198e45a1b33f320a06bca0d14))
+- rewrite mcp-channel.md for channel sessions in panes *(mcp)* ([`00e1c3f`](https://github.com/MadAppGang/claudish/commit/00e1c3f30eebe69fd4313e4c4e6c18420a7f2548))
+- add pane-session.md, the rationale of the headless pane driver *(mcp)* ([`1365e84`](https://github.com/MadAppGang/claudish/commit/1365e84a6114248bbb1ddf7f1d6f92235eb2d1eb))
+- record the phase-2 Claude Code captures *(mcp)* ([`441c98e`](https://github.com/MadAppGang/claudish/commit/441c98efebab357449fedb83e42e111d53f93b48))
+- poll npm for 15 minutes before calling a package missing *(release)* ([`fbf759a`](https://github.com/MadAppGang/claudish/commit/fbf759a36beec9b9f3a95dec90d061b9e3e4ae02))
+- require a typecheck after the last test file lands *(release)* ([`0d4bfe9`](https://github.com/MadAppGang/claudish/commit/0d4bfe92453f0706df57723a9a286eb8cf509a3d))
+- check the merge tree against the tested PR merge *(release)* ([`4cfb678`](https://github.com/MadAppGang/claudish/commit/4cfb67839dbbf37d13ac235f48db11bb2dbdc77e))
+- mark the playbook verified by the 10.3.0 release *(release)* ([`610402f`](https://github.com/MadAppGang/claudish/commit/610402f3bfce21957ea8fad73a4b9bd42945a03e))
+- update CHANGELOG.md for v10.3.0([`fa8d630`](https://github.com/MadAppGang/claudish/commit/fa8d63041ad124454981db61c702989b659d19a5))
+
+### New Features
+
+- run create_session as an interactive pane in headless magmux *(mcp)* ([`352e1ee`](https://github.com/MadAppGang/claudish/commit/352e1ee15350e3784675df84a3997f9175e02c1f))
+- expose assistant message ids and pane diagnostics on PaneSession *(mcp)* ([`20a0104`](https://github.com/MadAppGang/claudish/commit/20a01049e5ae05efb3205defa91f23990246579e))
+- run team slots as interactive panes in headless magmux *(mcp)* ([`7a22c84`](https://github.com/MadAppGang/claudish/commit/7a22c8447009513c98f2547a8251cca47b6b5c8e))
+- export deliveryRefusal and ContractErrorException from pane/ *(mcp)* ([`3833e61`](https://github.com/MadAppGang/claudish/commit/3833e618f0955da540d6b0e2f6ae13d6ac68709d))
+- replace magmux-drive-session.ts with pane-drive.ts *(scripts)* ([`750b7a2`](https://github.com/MadAppGang/claudish/commit/750b7a21ae2f286da0c6ec4a73e9a99446c48280))
+- add PaneSession, the live interactive pane, and pane/index.ts *(mcp)* ([`3cc4820`](https://github.com/MadAppGang/claudish/commit/3cc48205d13fd1f4cf01e165488bd9f7c220bcaa))
+- add the pane registry: records, sweep, limit, shutdown hooks *(mcp)* ([`9a56240`](https://github.com/MadAppGang/claudish/commit/9a56240617fbe093af4efd3cb4459131c038071e))
+- add pane launch: env snapshot, sh shim, launcher, flag check *(mcp)* ([`1789253`](https://github.com/MadAppGang/claudish/commit/1789253a9efb71ea086af3d5b506c9ce0c4425e5))
+- add the magmux socket client for pane sessions *(mcp)* ([`7525976`](https://github.com/MadAppGang/claudish/commit/75259760ed252dabb048078d4c7b5b05b554ce51))
+- add pane process identity and the generated pane watcher *(mcp)* ([`08ba88d`](https://github.com/MadAppGang/claudish/commit/08ba88d6eeab1bcbb46c2821b5f80ff8618a9a48))
+- build contract slot rows from pane accounting *(mcp)* ([`c454a44`](https://github.com/MadAppGang/claudish/commit/c454a44da2bdf51edea673c166d640c030bf02a5))
+- read billed_input_tokens from the proxy token file *(team)* ([`98e6d15`](https://github.com/MadAppGang/claudish/commit/98e6d15988c51777c38c2ea9e525d602c02a595e))
+- add pane prompt delivery for typed, command and file turns *(mcp)* ([`ccc8f34`](https://github.com/MadAppGang/claudish/commit/ccc8f34f5a66bd57a1e72ab20357ac43ec63af33))
+- add the pane transcript follower and settle rule *(mcp)* ([`2132e5c`](https://github.com/MadAppGang/claudish/commit/2132e5c173336258827f62d20a8df225f38c25b4))
+- add the pane screen model and screen classifier *(mcp)* ([`fb10f8f`](https://github.com/MadAppGang/claudish/commit/fb10f8f6c131e305f4aaa6cc6149d51887f07a7f))
+- add the pane contract types and slot lifecycle table *(mcp)* ([`ac17b1c`](https://github.com/MadAppGang/claudish/commit/ac17b1c86467eb06cc96bc43a3963336b126be04))
+- strip the CLAUDISH_PANE_* markers from Claude Code's env *(mcp)* ([`5c6b397`](https://github.com/MadAppGang/claudish/commit/5c6b3974747977ce29e7d76cab9ca5c7430a98ec))
+- set skipDangerousModePermissionPrompt in a pane child overlay *(mcp)* ([`cc1e41d`](https://github.com/MadAppGang/claudish/commit/cc1e41de9ed3826e1369c52c220e59a4c93140f7))
+- apply the CLAUDISH_PANE_ENV snapshot in a pane child claudish *(mcp)* ([`aa9c5a2`](https://github.com/MadAppGang/claudish/commit/aa9c5a22ba2e40928674c56979ad6691d31d7f92))
+- write a sessions-directory record for each team run *(team)* ([`0558546`](https://github.com/MadAppGang/claudish/commit/0558546e6eec093660db452a178b31e34312b46d))
+- record the calling Claude Code session in spawn.json *(channel)* ([`011fffb`](https://github.com/MadAppGang/claudish/commit/011fffb0441a9af2b25677f090d0eb8cb2298bfd))
+
+### Other Changes
+
+- remove references to the deleted reducer and agent probe *(mcp)* ([`e1e40cf`](https://github.com/MadAppGang/claudish/commit/e1e40cfa720561414b6b79dc7708113dd62767da))
+- pin the bundled magmux to v0.14.0 and verify it *(release)* ([`7563ab2`](https://github.com/MadAppGang/claudish/commit/7563ab213eb3da39373762cbe5ede20715bf5ce7))
+- sort the channel/types import in mcp-server.ts *(mcp)* ([`c13addb`](https://github.com/MadAppGang/claudish/commit/c13addb063f9104b219e0d6f4f03b3bfc3c847de))
+- set the version to 10.4.0 for the session records *(release)* ([`a1edfd7`](https://github.com/MadAppGang/claudish/commit/a1edfd74e7bbf0b6d2f7c97574c76d5cd91410d3))
+
+### Performance
+
+- run the startup pane sweep once per root through ensureSwept *(mcp)* ([`b0c9b9a`](https://github.com/MadAppGang/claudish/commit/b0c9b9ae5a233e5e3064b4daf9650f6e269653eb))
+- cache the magmux version check per binary path *(mcp)* ([`113c558`](https://github.com/MadAppGang/claudish/commit/113c5585ec9d427932fcacd0e43f58265f447c4c))
+
+### Refactoring
+
+- extract parseArgs's token rule as classifyPassthroughTokens *(cli)* ([`d4179ed`](https://github.com/MadAppGang/claudish/commit/d4179ed573a62bc3d461ea156b1e6aae138a27f0))
+- read magmuxPaneCapability in the ambient UI branch *(recovery)* ([`3863ddf`](https://github.com/MadAppGang/claudish/commit/3863ddf048907ad57612595d6db542da747301bd))
+
+## [10.3.0] - 2026-09-24
+
+### Bug Fixes
+
+- hold the chain when a stream retry cannot reach the provider *(routing)* ([`0f2c5e1`](https://github.com/MadAppGang/claudish/commit/0f2c5e14e93cdd3a249890cf2d2982adc402b86e))
+- put a vendor's own dynamic subscription first in its band *(routing)* ([`c327eb0`](https://github.com/MadAppGang/claudish/commit/c327eb0c57f7bb5bba69b63be2c1a895accce41f))
+- advance the chain on an upstream 502, 503 or 504 *(routing)* ([`5e839b5`](https://github.com/MadAppGang/claudish/commit/5e839b511c784e7302ca20e8df81114cb39894cf))
+- list every provider shortcut in --help from the definitions *(cli)* ([`6324876`](https://github.com/MadAppGang/claudish/commit/6324876e91fecf4da586330f581c03d401c148c2))
+- stop describing a dropped fallback as "fallback only" *(routing)* ([`5459e7c`](https://github.com/MadAppGang/claudish/commit/5459e7c2d3e5d7a84c7f79ecf8340b10bf09f083))
+- use the shared NATIVE_NOT_PROBED note in the route probe *(tui)* ([`047bed2`](https://github.com/MadAppGang/claudish/commit/047bed2557a6d56aff3669e6a7e80c84fe7ee8f8))
+- show the calculated route in the grid pane header *(team)* ([`fdadea7`](https://github.com/MadAppGang/claudish/commit/fdadea7fe8cfbd250eaf85a5231d76489c554675))
+- describe unmapped profile roles as calculated routing *(tui)* ([`83ce97a`](https://github.com/MadAppGang/claudish/commit/83ce97afe4d5aa85f1494a6a87ad8c4d2fdadaeb))
+- remove hard-coded example model names from the route probe *(tui)* ([`4b25690`](https://github.com/MadAppGang/claudish/commit/4b25690b618046d023564776394bdf023d5cc9a6))
+- show the resolved fallback hop in the Routing tab header *(tui)* ([`ba60e9d`](https://github.com/MadAppGang/claudish/commit/ba60e9d127fad600efbf018463e577e38106b5e1))
+- show the user's "*" rule in the Routing tab header *(tui)* ([`9b4342a`](https://github.com/MadAppGang/claudish/commit/9b4342a915a229ffe05c3f5fff6c35598f65d653))
+- label route probe hops by tier, not a provider map *(tui)* ([`72ae5e6`](https://github.com/MadAppGang/claudish/commit/72ae5e654cc87c2c91eb913d7271b123fe1c5739))
+- render the route probe from explainRoute *(tui)* ([`e71aafb`](https://github.com/MadAppGang/claudish/commit/e71aafb371cfc286eca12ee0fc3ae2ce57818b6b))
+- show the chain route() calculates, with dropped candidates *(probe)* ([`d28cb1c`](https://github.com/MadAppGang/claudish/commit/d28cb1c116848d18bf153c72072ab344b83082ec))
+- return rule warnings instead of printing them to stderr *(routing)* ([`5af1bf3`](https://github.com/MadAppGang/claudish/commit/5af1bf3f719d16500fb8a8d33e7c9559d267b890))
+- show qpay@ for Qwen rows in the recommended-models list *(catalog)* ([`df70aea`](https://github.com/MadAppGang/claudish/commit/df70aea2b156d3c694ff69cb7e54ec4688cb44a4))
+- use claudish provider names in the cold-start slug seeds *(catalog)* ([`d479013`](https://github.com/MadAppGang/claudish/commit/d479013ad9339e03cb8f854ac4e5de9f9062162f))
+- key the probe map under every provider bound to a route *(routing)* ([`4d5478f`](https://github.com/MadAppGang/claudish/commit/4d5478f92dd58263f318e4c788023595ba3bb40c))
+- split lookup-only names out of CATALOG_ROUTE_BINDINGS *(routing)* ([`21496c1`](https://github.com/MadAppGang/claudish/commit/21496c14119322a08a74a75b67baa250ea01c950))
+- make --default-provider reach the proxy and child sessions *(cli)* ([`9be012f`](https://github.com/MadAppGang/claudish/commit/9be012fc6e2dc6cd3b869b2d8282d296c048108b))
+- apply defaultProvider in the proxy's bare-name routing *(routing)* ([`9f8364f`](https://github.com/MadAppGang/claudish/commit/9f8364f5c028418e9080b3935d916790a8ea34c3))
+- honour CLAUDISH_DEFAULT_PROVIDER in route() *(routing)* ([`8eb8897`](https://github.com/MadAppGang/claudish/commit/8eb8897940f0e9469d77fc3bfd2edad25e0beb7b))
+- treat defaultProvider "" in env or config as no fallback *(routing)* ([`dd22847`](https://github.com/MadAppGang/claudish/commit/dd22847f46fde4f2eb545b58d282fd8c245fbbe7))
+- send bare non-Claude names to route(), not to Anthropic *(routing)* ([`16b92cc`](https://github.com/MadAppGang/claudish/commit/16b92ccaa01ad69fb7a042cb955aeb0d79a94e05))
+- restore CLAUDISH_DISABLE_KEYCHAIN instead of deleting it *(test)* ([`5729c28`](https://github.com/MadAppGang/claudish/commit/5729c2879ca5e25a4328c6d5597ac03c8bbcedf8))
+
+### Documentation
+
+- add the --probe explicit-target defect to the open list *(reports)* ([`5e5e7f6`](https://github.com/MadAppGang/claudish/commit/5e5e7f685ad0b07beb53ad8e37d0c618c1b10104))
+- record what calculated routing shipped and what is open *(reports)* ([`60fbf7e`](https://github.com/MadAppGang/claudish/commit/60fbf7e9271090f7bde9c1e88a3cd0dbb82c3ba6))
+- correct two stale routing comments in proxy and resolver *(routing)* ([`e2c5b57`](https://github.com/MadAppGang/claudish/commit/e2c5b57bafb6bdd55f83b0849a46921abbf469e0))
+- replace the ModelCatalogResolver section of routing.md *(routing)* ([`ad6ebea`](https://github.com/MadAppGang/claudish/commit/ad6ebea46fedf112f23fb923a2002f6393afbb10))
+- describe calculated routing in parser and hint comments *(routing)* ([`7a6cc48`](https://github.com/MadAppGang/claudish/commit/7a6cc48a6a5802e459f2bd00570bde7a108d6722))
+- state that project rules override global per pattern *(routing)* ([`e17a776`](https://github.com/MadAppGang/claudish/commit/e17a77688399b17e72ba18d3d540de9269ac55cd))
+- remove DEFAULT_ROUTING_RULES from code comments *(routing)* ([`c78b57e`](https://github.com/MadAppGang/claudish/commit/c78b57e37589abd66f5b3742777b029d7cf114f6))
+- use <model> placeholders in --help model examples *(cli)* ([`ae8547e`](https://github.com/MadAppGang/claudish/commit/ae8547e91b5ad62ff16c2d2737fbb0cf40875fb6))
+- replace the static routing table in --help *(cli)* ([`4946520`](https://github.com/MadAppGang/claudish/commit/494652058828ec63479d7f19dd90bad6ea4ad52a))
+- document defaultProvider sources and the empty value *(routing)* ([`2f6f903`](https://github.com/MadAppGang/claudish/commit/2f6f903a0fa3bbdc89d58318cddff326fd5bc1dc))
+- add the commit message rule *(claude)* ([`a4e17c2`](https://github.com/MadAppGang/claudish/commit/a4e17c2826bc9e849646c4f75ef553ea6e3b041f))
+- update CHANGELOG.md for v10.2.0([`e1191e2`](https://github.com/MadAppGang/claudish/commit/e1191e2b95a4f21761c2e32e6d973c764a3b502b))
+
+### New Features
+
+- warn when a routing rule names an unknown provider *(routing)* ([`8a23cf3`](https://github.com/MadAppGang/claudish/commit/8a23cf3e890f272d3c703185db93f2b00295b413))
+
+### Other Changes
+
+- record the resolved defaultProvider in the route gate *(routing)* ([`4c00bb0`](https://github.com/MadAppGang/claudish/commit/4c00bb0bb80b326677dc9454ec5d3266c5d946eb))
+- record the proxy decision per row in the route gate *(routing)* ([`56fe2fb`](https://github.com/MadAppGang/claudish/commit/56fe2fbcff85a905ffd9d84598e2da5d79b8aa41))
+- add a --strict mode to the route-table gate diff *(routing)* ([`d876de2`](https://github.com/MadAppGang/claudish/commit/d876de26b3adb1539b83838f434610b09d5fec23))
+
+### Refactoring
+
+- export hopLabel and drop its two copies *(routing)* ([`e0d32d4`](https://github.com/MadAppGang/claudish/commit/e0d32d4b064d03445b53cbd52329c6efc28a0dc4))
+- add explainRoute and derive route() from it *(routing)* ([`1b76309`](https://github.com/MadAppGang/claudish/commit/1b7630931ba7a8879c0a7b4390e491bee71636d3))
+- add matchRoutingRuleKey beside matchRoutingRule *(routing)* ([`a244bf2`](https://github.com/MadAppGang/claudish/commit/a244bf2aaab0179a49d22a5ab09781787e567941))
+- remove the unused DefaultProviderSchema *(config)* ([`c881569`](https://github.com/MadAppGang/claudish/commit/c88156908c8dabbb43f33a44f95c41b0e3941032))
+- remove the dead LiteLLM auto-promotion hint *(cli)* ([`e326fa9`](https://github.com/MadAppGang/claudish/commit/e326fa90fce833acd42e7987dfad9d2def1aeeb7))
+- add isClaudeCodeModelName to claude-code-aliases *(routing)* ([`d91d355`](https://github.com/MadAppGang/claudish/commit/d91d355d5b5eb13da68d90122c9ceaeb37987714))
+- extract proxyRouteDecision from the proxy gate *(routing)* ([`123be2b`](https://github.com/MadAppGang/claudish/commit/123be2bf6f391dd44b66b6d5a64357b7c4dde2b8))
+- replace the retired term "served set" *(discovery)* ([`ad1fcf6`](https://github.com/MadAppGang/claudish/commit/ad1fcf6ab829098e8cdc96a67bbc56a8ac3b1407))
+
+## [10.2.0] - 2026-09-23
+
+### Bug Fixes
+
+- a hung token refresh no longer wedges the single-flight latch *(recovery)* ([`e20b408`](https://github.com/MadAppGang/claudish/commit/e20b4083c6d0a07133749d584b311bc987681c56))
+- a nested claudish drops the retry watchdog its parent exported *(recovery)* ([`e1d771b`](https://github.com/MadAppGang/claudish/commit/e1d771b363ac956a393fdd0c4b125b11ccf2ba25))
+- a short API_TIMEOUT_MS no longer silently disables auth-path recovery *(recovery)* ([`453040b`](https://github.com/MadAppGang/claudish/commit/453040bfc338ceee0b2cca87a29b9d9a5840efea))
+- an unreachable token host no longer bills the subscriber metered *(codex)* ([`3a50e60`](https://github.com/MadAppGang/claudish/commit/3a50e60c232651a093bbc31e8a6e509c2fbdae99))
+- a late acknowledgement no longer revives a closed episode's lease *(recovery)* ([`1f63010`](https://github.com/MadAppGang/claudish/commit/1f6301009d777efcb6c933a6def6be57660c1f79))
+- draw the banner with magmux's overlay, not a pane that wedges Claude Code *(recovery)* ([`a261140`](https://github.com/MadAppGang/claudish/commit/a261140ead16b4db5bdc415a81044ccf54cd020b))
+- stop --no-recovery paying for a pane it can never open *(recovery)* ([`4a88047`](https://github.com/MadAppGang/claudish/commit/4a88047ff8a90fd082fcb96d484cef9da6fafdf1))
+- make the budget, the chain guard and the log real in the arm nobody tested *(recovery)* ([`09eb4de`](https://github.com/MadAppGang/claudish/commit/09eb4deb75d20a321364d66213c9923d770ecf78))
+- stop the ladder faking attempts, billing latency, and ignoring [q] *(recovery)* ([`4e45c0c`](https://github.com/MadAppGang/claudish/commit/4e45c0cdb4c0b12e3760296b98802cc3062ca7a3))
+- stop a network outage from advancing the fallback chain *(handlers)* ([`da0cd5b`](https://github.com/MadAppGang/claudish/commit/da0cd5bc7a7a35cf81ab2b531300a19a15d7e786))
+
+### Documentation
+
+- update CHANGELOG.md for v10.1.1([`9833607`](https://github.com/MadAppGang/claudish/commit/98336077c1a1c8e652fbde10a67dd91f82bd7d22))
+- retire "roster" from the magmux binary resolver's header *(recovery)* ([`7029467`](https://github.com/MadAppGang/claudish/commit/70294679e34b6288bd3b61f3567ef9f745c8633c))
+- record the overlay banner, verified live through teardown *(recovery)* ([`f3e262e`](https://github.com/MadAppGang/claudish/commit/f3e262eca64f7c511710aa0a043115b56517ea7d))
+- closing the pane wedges the host TUI, and magmux already had the surface *(recovery)* ([`3586b8b`](https://github.com/MadAppGang/claudish/commit/3586b8b6dcf1689c45332834a524565cc9aca816))
+- the build report — what shipped, what the process caught *(recovery)* ([`1460d93`](https://github.com/MadAppGang/claudish/commit/1460d9369133267f5cb75aa07d4a4d3e200a9169))
+
+### New Features
+
+- count the outages, and write down why the shape is what it is *(recovery)* ([`ca5b4eb`](https://github.com/MadAppGang/claudish/commit/ca5b4eb92a1506a8c7555c371c83769a05a81f86))
+- hand the retry back to the client when the reason is legible *(recovery)* ([`7a9f4c5`](https://github.com/MadAppGang/claudish/commit/7a9f4c5b1a25df4b321fd6eb4bdeb7a7cd26d45f))
+- give the retry ladder a face — the magmux recovery pane *(recovery)* ([`fce758e`](https://github.com/MadAppGang/claudish/commit/fce758eab2ca73033a7751520460269d5b52dc00))
+
+### Other Changes
+
+- restore the exit hook that only the recovery pane changed *(recovery)* ([`2a7da9a`](https://github.com/MadAppGang/claudish/commit/2a7da9a4fa6bd40c984627a9ba25a71e0df25bfb))
+
+## [10.1.1] - 2026-09-23
+
+### Bug Fixes
+
+- ask an older Ollama daemon for capabilities it lists only in /api/show([`50c7f0e`](https://github.com/MadAppGang/claudish/commit/50c7f0ed71ab6cf0f79ca8669e36949bb7ef1929))
+- keep what a provider says about its own models, and three release-review findings([`7981787`](https://github.com/MadAppGang/claudish/commit/79817872238b3a4103b56f63d56666134d91a2a6))
+- ask Devin about swe-1.7 in Devin's own spelling([`d408ac9`](https://github.com/MadAppGang/claudish/commit/d408ac96ee56868b71b5fa0e5421edf8b0c4eca7))
+- a model is offered when something says it works, never when nothing does([`4c48c63`](https://github.com/MadAppGang/claudish/commit/4c48c63fe3072d3163d1945bb32e835932efda1c))
+- minimal effort is the lowest rung, not the off switch([`90ac5cb`](https://github.com/MadAppGang/claudish/commit/90ac5cb66a3fee9bf9be7a2384e25903c421d966))
+- show the provider's own error, not claudish's guess about it([`196e6f8`](https://github.com/MadAppGang/claudish/commit/196e6f8f8caa38ea783f1b6bd1c9331c7b40d936))
+- stop the probe tearing its own rows, and drop a hop no key can satisfy([`406461c`](https://github.com/MadAppGang/claudish/commit/406461c8b5d3be213cd0e2b1251949de6476d009))
+
+### Documentation
+
+- park two release-review findings, and report three catalog rows([`1f2fed5`](https://github.com/MadAppGang/claudish/commit/1f2fed5ef53440fe83d33b9fc67498e3c530f54e))
+- record the availability spelling rule and the route-table gate's blind spots([`8dfcfb7`](https://github.com/MadAppGang/claudish/commit/8dfcfb79646eb53e8d81027a465b0091b76badb7))
+- withdraw the wrong list of models to restore([`8580fa9`](https://github.com/MadAppGang/claudish/commit/8580fa9f87631a47a511938c99e60ff9ce92c986))
+- verify claudish against models-index v1.4.14([`38139d4`](https://github.com/MadAppGang/claudish/commit/38139d4df0f0ef598bb08ed95d454f6f08f6a0d1))
+- correct four claims the review of #263 disproved([`87289bb`](https://github.com/MadAppGang/claudish/commit/87289bb6340707dad74da3a3ea006e6e3c674f57))
+- record why stop_sequences has no effect on gk@ *(grok)* ([`96776b4`](https://github.com/MadAppGang/claudish/commit/96776b408863326ca1fcbddf7e4dc2c8964e7dc3))
+- record the free-claude-code translation findings *(reports)* ([`5084905`](https://github.com/MadAppGang/claudish/commit/5084905bc6eb806b3ca8d3cbee6191946f9bb0a0))
+- stamp the playbook verified at v10.1.0 *(release)* ([`c568a6a`](https://github.com/MadAppGang/claudish/commit/c568a6a447aca7481d795d29088f0894a2c3725d))
+- update CHANGELOG.md for v10.1.0([`7b2d493`](https://github.com/MadAppGang/claudish/commit/7b2d4938d06d985fbe37cb76e820f6a52f53e358))
+
+## [10.1.0] - 2026-09-23
+
+### Bug Fixes
+
+- read v3 reasoning.supported, not the field's presence *(catalog)* ([`2247340`](https://github.com/MadAppGang/claudish/commit/224734090e4c1bbc8bb4dcdf7611ef912312755c))
+- keep a load that lands after the user steps back *(picker)* ([`101933e`](https://github.com/MadAppGang/claudish/commit/101933ea2464f8bb238d54e51173f9726b0f839f))
+- memoize the model list on the ready set's membership, not its identity *(picker)* ([`1979800`](https://github.com/MadAppGang/claudish/commit/19798009d24ada192fcfb36f570d60374c34b43c))
+- never open the model picker without a terminal *(picker)* ([`c0951e7`](https://github.com/MadAppGang/claudish/commit/c0951e75a95a8c15c49e1412eb314f3f920a8850))
+
+### Documentation
+
+- record the review findings that did not ship fixed *(picker)* ([`c61b4f1`](https://github.com/MadAppGang/claudish/commit/c61b4f1232ffb93344da82a190e5aaf6e5ad6d4f))
+- record why the picker is shaped as it is, and what is still open *(picker)* ([`ad6137b`](https://github.com/MadAppGang/claudish/commit/ad6137b4f60820e45d09843cad1029b354514d0b))
+- update CHANGELOG.md for v10.0.1([`7059910`](https://github.com/MadAppGang/claudish/commit/70599108f57bea66de7ea22298c0f85e89ffd307))
+
+### New Features
+
+- $$$ in a cost colour, and a filter on the provider list *(picker)* ([`41e5244`](https://github.com/MadAppGang/claudish/commit/41e52443907b07012d3b65e18a334d3347103f29))
+- build chips per palette — tint on light, saturated on dark *(picker)* ([`1dc7559`](https://github.com/MadAppGang/claudish/commit/1dc7559f701aae7b251fce18e2b41dc45887aa67))
+- soften the SUB fill and chip `$` at the same width *(picker)* ([`f4b428b`](https://github.com/MadAppGang/claudish/commit/f4b428b4c8ce8cb6db04e2d683dcf1fc7f11d4f3))
+- fill the notable state only, and measure every chip against both terminals *(picker)* ([`f1f09a3`](https://github.com/MadAppGang/claudish/commit/f1f09a3532817f95e061ae86269737420889ae58))
+- the provider list is the default screen, and nothing is prefetched *(picker)* ([`ff00f56`](https://github.com/MadAppGang/claudish/commit/ff00f56c7b7c529eb3c77f8f754b35156e649073))
+- a compact inline dialog, because the dashboard was the defect *(picker)* ([`43218b4`](https://github.com/MadAppGang/claudish/commit/43218b4d0aa245dcc64e63ff8d72fd1efde43c49))
+- an OpenTUI model picker that says what it is showing you *(picker)* ([`cec6017`](https://github.com/MadAppGang/claudish/commit/cec60172ca4a2a9ecdffc8700c79aed9853322dc))
+- a discovery OUTCOME, so an empty list can say why *(picker)* ([`c626866`](https://github.com/MadAppGang/claudish/commit/c6268660434bcd975beb7c99ad222c6f50283288))
+- shared components and leaves for the OpenTUI model picker *(tui)* ([`4100454`](https://github.com/MadAppGang/claudish/commit/4100454fbc620c64f6e8cefd04751b51d65c0aed))
+
+### Other Changes
+
+- v10.1.0 *(release)* ([`037b7a2`](https://github.com/MadAppGang/claudish/commit/037b7a2c19b660a7a20c930dda333d5187a96819))
+
+### Refactoring
+
+- retire "roster" in the picker, for the thesaurus terms *(picker)* ([`444ee60`](https://github.com/MadAppGang/claudish/commit/444ee60f5eb3c90ce08c1d8e052ff6463c61b33c))
+
+## [10.0.1] - 2026-09-21
+
+### Bug Fixes
+
+- never ask a GLM model to stop thinking([`974de4a`](https://github.com/MadAppGang/claudish/commit/974de4a0457d493293aaac5f58e3415f6df24118))
+
+### Documentation
+
+- record the v10.0.0 release and what was deferred from it([`addc0f8`](https://github.com/MadAppGang/claudish/commit/addc0f8fb28daa8dae0e592fc22b3dc96c8c282c))
+- update CHANGELOG.md for v10.0.0([`570b75f`](https://github.com/MadAppGang/claudish/commit/570b75f4e0b0f7d4918dbbb245b8638eead392ed))
+
+## [10.0.0] - 2026-09-21
+
+### Bug Fixes
+
+- redact key-shaped text from a credential failure line([`0c5920f`](https://github.com/MadAppGang/claudish/commit/0c5920f5d60feda513316f5ece99110ffe1ab8cc))
+- a metered price of zero is missing data, not free([`9bedcf7`](https://github.com/MadAppGang/claudish/commit/9bedcf7ba84b91012d4dd1818ae8df8e7c71e6ab))
+- offer the newest model, not the alphabetically first *(discovery)* ([`b4110d3`](https://github.com/MadAppGang/claudish/commit/b4110d3a05a2a34478f430ba5cf432ce51db68d5))
+- say which auth problem a local server has, and keep walking on a denied model *(probe)* ([`aac36ee`](https://github.com/MadAppGang/claudish/commit/aac36ee54f204ee1169845f6a5c1060d90f7207b))
+- drop the effort knob when thinking is disabled *(deepseek)* ([`19cdaa6`](https://github.com/MadAppGang/claudish/commit/19cdaa6fd0583e99361fe6f00a9d80eb7e211573))
+- a probe pick for Poe, retries for a slow list, and a 403 that is not the key *(probe)* ([`1512d66`](https://github.com/MadAppGang/claudish/commit/1512d665cc49bf00b345fe258f793c1d8776c617))
+- Gemini's effort, a parameter mistaken for a model, and Mistral's list *(probe)* ([`7d89795`](https://github.com/MadAppGang/claudish/commit/7d89795c91bd5e106acf6d191fc94bfa99f5f74d))
+- send metered keys to the international host by default *(minimax)* ([`0177ca9`](https://github.com/MadAppGang/claudish/commit/0177ca9b4531d701ef94ed9b889b7c637a2f813a))
+- name qwen-coding and qwen-payg in every hand-written table *(alibaba)* ([`8691eed`](https://github.com/MadAppGang/claudish/commit/8691eedcdcf8ea27281e2753411989fbe66fa782))
+- an incomplete model list cannot deny, a missing base URL is a failure *(discovery)* ([`28fc06d`](https://github.com/MadAppGang/claudish/commit/28fc06d8c741afecd71522dc7229eb70150c9469))
+- name an unsupported model and a wrong-plan key in the hint *(errors)* ([`fa09cb7`](https://github.com/MadAppGang/claudish/commit/fa09cb7eb85bf455b77e439a9d4cffbd70b5aec1))
+- read readiness once per candidate and say when a subscription credential failed *(routing)* ([`4362311`](https://github.com/MadAppGang/claudish/commit/4362311272dc374d683e2650c144b181581d90fa))
+- print the dropped-subscription notice with one prefix *(routing)* ([`eceab30`](https://github.com/MadAppGang/claudish/commit/eceab3067a4c102a830d352b4bc546b90bdbe393))
+- keep a Claude model's thinking budget below max_tokens *(gemini)* ([`5fc423c`](https://github.com/MadAppGang/claudish/commit/5fc423c1039df411c125f3a2eec4376eabfab7ba))
+- Antigravity picks its probe model from the account's own list *(probe)* ([`4128e07`](https://github.com/MadAppGang/claudish/commit/4128e07f331c140ddfd16e9b6d2a4294efd6fb82))
+- give the v3 cache its own file, and the OpenRouter list another *(catalog)* ([`af02ca3`](https://github.com/MadAppGang/claudish/commit/af02ca359203c80a5d9e68619efa88212a8075ea))
+- decide chat capability from the catalog's videoOutput *(catalog)* ([`492b0e4`](https://github.com/MadAppGang/claudish/commit/492b0e4c33c9a6f3af47e67dbb9e57352a2d5686))
+- send the exact wire id, and fetch route variants *(catalog)* ([`30f70d4`](https://github.com/MadAppGang/claudish/commit/30f70d4df701681ad5d99f26821b2fa672ef0b9b))
+
+### Documentation
+
+- the backend feedback doc now carries the full route census([`b4ac4ae`](https://github.com/MadAppGang/claudish/commit/b4ac4ae6e5e3161eb3fdb7e5f7d17c8d0e31c296))
+- retire roster, and rebuild a safety argument on its new premise([`e95b8a5`](https://github.com/MadAppGang/claudish/commit/e95b8a51a5520efba5e95262a2512b975671abba))
+- note that Phase 2 landed behind its gate([`d0c0da8`](https://github.com/MadAppGang/claudish/commit/d0c0da88f1443c1d5b34cf1120a0ecdfa643e513))
+- the routing index no longer points at a deleted table([`7727f99`](https://github.com/MadAppGang/claudish/commit/7727f997e9850ff5d122e3b8f502220fb29dbb28))
+- name the routing redesign's three new concepts in the thesaurus([`e030823`](https://github.com/MadAppGang/claudish/commit/e0308236466a2f22898bfc1de1a08ad5402900ad))
+- revision 3 of the remaining-work plan([`1a6817c`](https://github.com/MadAppGang/claudish/commit/1a6817cc45bc3f1a2fdccdffe09784dc87e0edfc))
+- revision 2 of the remaining-work plan([`1d468b8`](https://github.com/MadAppGang/claudish/commit/1d468b8ae59341c1303e5ff511e485aeffb96005))
+- the reply to send to models-index([`d9c1791`](https://github.com/MadAppGang/claudish/commit/d9c1791da9e1721f8c33bd89cd6c2cda2c43d56d))
+- the discriminator is called type, and ask the backend to rename shape([`18b4bf3`](https://github.com/MadAppGang/claudish/commit/18b4bf3741f67b718e43ad5a18c6fe7dcb85bbe3))
+- validate the backend delivery on generation g-20260920154425586([`fdf237a`](https://github.com/MadAppGang/claudish/commit/fdf237a31638f6062caa516f88d81e7f529acb53))
+- fold Jack's answers into the backend reply and the work plan([`b41efe8`](https://github.com/MadAppGang/claudish/commit/b41efe87d4a21165d5fa2770d72fd6cb587d737c))
+- record Jack's decisions on Vertex, routing and the fallback([`2e5cd1d`](https://github.com/MadAppGang/claudish/commit/2e5cd1dd4491b46cdd75bbdef2a992a1c197eac8))
+- the remaining claudish work, with decisions and open questions([`f24a841`](https://github.com/MadAppGang/claudish/commit/f24a8413ed30403315caf73af7194a93f723a073))
+- evaluate the Vertex ADC work, and name the real blocker *(plan)* ([`12154e4`](https://github.com/MadAppGang/claudish/commit/12154e40e69eba58a9e5ec98f977091afd97d3a8))
+- answer the backend's re-review of the task list([`fd075e0`](https://github.com/MadAppGang/claudish/commit/fd075e0e7d56231fc6952ea81920cd655c4da83e))
+- Ollama Cloud keeps one route, classified metered *(plan)* ([`a9effb0`](https://github.com/MadAppGang/claudish/commit/a9effb0ef5509912a27af1bc2980051197c150c4))
+- six validated tasks for models-index([`7df52b8`](https://github.com/MadAppGang/claudish/commit/7df52b8d775cba884f3296ce3ca3bfa7e0812f2f))
+- the routing redesign is decided *(plan)* ([`d60c064`](https://github.com/MadAppGang/claudish/commit/d60c06421b3c8d2b442178649da7f6d100a51cd2))
+- MiniMax metered is a claudish host bug; PAYG and oMLX findings *(plan)* ([`3f50158`](https://github.com/MadAppGang/claudish/commit/3f50158fa5baa61c1e7fd634aa83bfd86e290078))
+- Test All with every key set, and moving Vertex to ADC *(plan)* ([`4ad7ff2`](https://github.com/MadAppGang/claudish/commit/4ad7ff294f4aa23719dcfc273a861330c93625bc))
+- record the ports from the old Alibaba branch, and why group D stays out([`70f2e07`](https://github.com/MadAppGang/claudish/commit/70f2e076a4e3659dfb6c845e7b8bcf55a198c7c9))
+- carry the Alibaba billing-products and black-box reports *(reports)* ([`9d0e2fa`](https://github.com/MadAppGang/claudish/commit/9d0e2faf6e75b84f276037e39dcbf69ce81ad610))
+- record the Alibaba measurements and which catalog may deny *(architecture)* ([`ab7d0f5`](https://github.com/MadAppGang/claudish/commit/ab7d0f55cf63707a59a14df7323b53883115fa3d))
+- document the three Alibaba products and fix the qwen* row *(settings)* ([`cc55c1b`](https://github.com/MadAppGang/claudish/commit/cc55c1baac32e9530cb180d7c80c93f982091ddf))
+- record the reader-gap fixes and their live evidence([`0e048a7`](https://github.com/MadAppGang/claudish/commit/0e048a7b30e58fd83ff11cd0f8b7780eb07a2a46))
+- ask the backend for input and output modalities on every projection([`f16ab83`](https://github.com/MadAppGang/claudish/commit/f16ab837083e3878e9335cc671a45d0121ccaff1))
+- a project thesaurus in CLAUDE.md, with the words never to write([`774eafc`](https://github.com/MadAppGang/claudish/commit/774eafc52565e3854daa58d265b9130a89b89685))
+- give every agent one vocabulary, and retire "roster"([`0b6cc3c`](https://github.com/MadAppGang/claudish/commit/0b6cc3cd21e4c2810290bb2f67f4b9ec46d68873))
+- validate PR #266 and the 1.2.90 backend against live v3([`b30c4b5`](https://github.com/MadAppGang/claudish/commit/b30c4b531c1fc41c62cfc1d4b305df6ac3f1df82))
+- measure claudish's catalog functions against the live v3([`330abd2`](https://github.com/MadAppGang/claudish/commit/330abd2982757c94935013024bb4bbe1187f08b4))
+- verify the shared Alibaba contract live and request retiring "roster"([`5a5d19d`](https://github.com/MadAppGang/claudish/commit/5a5d19d4fbb5b86e237064e483b3f5769be3a176))
+- take the Alibaba identities from the backend contract, with no aliases([`843dd5a`](https://github.com/MadAppGang/claudish/commit/843dd5a1cd8eca6bfef6f35d6feee2ed6ee247e6))
+- reconcile the qwen-token-plan work and flag the Alibaba contract conflict([`fc1a52e`](https://github.com/MadAppGang/claudish/commit/fc1a52e1ef540a5eeef6810d4a2cadbf78d79a91))
+- plan the catalog v3 reader([`1856c4a`](https://github.com/MadAppGang/claudish/commit/1856c4ad0b066483080c542a7a9d7b185cef08a0))
+- rename the Token Plan key and deprecate QWEN_CLOUD_PLAN_API_KEY([`d89633b`](https://github.com/MadAppGang/claudish/commit/d89633b9037aaf4fea099be4107fd1f51656f649))
+- record the v3 reader decisions and the requests to the backend([`63168b5`](https://github.com/MadAppGang/claudish/commit/63168b571f866832c223e6c49e1fc7cdf8c435cd))
+- verify the models-index v3 reader handoff against the live catalog([`d0d2f2c`](https://github.com/MadAppGang/claudish/commit/d0d2f2ce900815f659559e5a05b5a93166479c67))
+- update CHANGELOG.md for v9.7.1([`b6201e9`](https://github.com/MadAppGang/claudish/commit/b6201e91f79af9e426f92ac988b3fdd331cd7c39))
+
+### New Features
+
+- routing gathers candidates from the catalog; Vertex discovers its own models([`af98f4f`](https://github.com/MadAppGang/claudish/commit/af98f4f232ab4c2e173c506c62f78d95b8d700fb))
+- gather routing candidates from the catalog (not wired in)([`4f4f765`](https://github.com/MadAppGang/claudish/commit/4f4f765b4c4608f70310b70213ffe8224c1ed180))
+- Vertex AI runs on Application Default Credentials; Express is deleted([`ae78527`](https://github.com/MadAppGang/claudish/commit/ae785275889fc49cca6bb3fe05705cde0ce6b638))
+- the catalog decides chat capability and carries comparable prices([`7fce457`](https://github.com/MadAppGang/claudish/commit/7fce457ab72390174b92a45b7a32aa94591398cc))
+- validate an Alibaba PAYG key outside claudish *(scripts)* ([`11e8b48`](https://github.com/MadAppGang/claudish/commit/11e8b48aa5f4223b7c54da529bb8911f7400cb50))
+- tell a credential that failed apart from one that is absent *(credentials)* ([`7127287`](https://github.com/MadAppGang/claudish/commit/712728762ccae4ad5b36abb554b3bdefae8adea5))
+- consume catalog v3 and separate Alibaba products([`9a1206e`](https://github.com/MadAppGang/claudish/commit/9a1206e5695248b7e03e1fc0bdbb539148179890))
+
+### Other Changes
+
+- release 10.0.0([`0716ba9`](https://github.com/MadAppGang/claudish/commit/0716ba935784ec60d530c08b40f2f02821b45c6f))
+
+### Refactoring
+
+- retire "roster" for the thesaurus terms([`ab1fc09`](https://github.com/MadAppGang/claudish/commit/ab1fc0953ed4761913d803593345d1ff7998db47))
+
 ## [9.7.1] - 2026-09-18
 
 ### Bug Fixes

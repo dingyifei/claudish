@@ -45,8 +45,6 @@ export interface ClaudishConfig {
    */
   skipModelsUpdate?: boolean;
   profile?: string; // Profile name to use for model mapping
-  /** --default-provider <name> CLI flag (Phase 1 of LiteLLM-demotion refactor) */
-  defaultProvider?: string;
   /**
    * --anthropic-api-billing: opt IN to using a real ANTHROPIC_API_KEY for native
    * Claude models, accepting metered API billing. Default (false) hides the key
@@ -62,8 +60,6 @@ export interface ClaudishConfig {
    * stray --op never leaks to Claude Code as a passthrough arg).
    */
   opImport?: string;
-  /** Resolved default provider (computed via resolveDefaultProvider() after argv parsing) */
-  resolvedDefaultProvider?: import("./default-provider.js").ResolvedDefaultProvider;
   claudeArgs: string[];
   _hasPositionalPrompt?: boolean; // Internal: true when a positional prompt arg was found (not a flag value)
   _hasPrintFlag?: boolean; // Internal: true when a passthrough -p/--print flag was found (implies single-shot, not interactive)

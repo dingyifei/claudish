@@ -37,7 +37,9 @@
 | **MiniMax** | `claudish --model mm@minimax-m2.1` |
 | **OllamaCloud** | `claudish --model oc@qwen3-next` |
 | **OpenCode Zen Go** | `claudish --model zgo@glm-5` |
-| **Qwen Plan** | `claudish --model qc@qwen3.7-plus` |
+| **Alibaba Coding Plan** | `claudish --model qcode@qwen3.7-plus` |
+| **Alibaba Token Plan** | `claudish --model qtoken@qwen3.7-plus` |
+| **Alibaba PAYG** | `claudish --model qpay@qwen3.7-plus` |
 
 **100% Offline Option — Your code never leaves your machine:**
 ```bash
@@ -358,14 +360,15 @@ Claudish automatically loads `.env` from the current directory at startup. For t
 | `ZAI_API_KEY` | Z.AI (`zai@`) | |
 | `SAKANA_API_KEY` | Sakana Fugu (`sakana@`, `fugu@`) | |
 | `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` |
-| `QWEN_CLOUD_PLAN_API_KEY` | Qwen Plan (`qc@`) — Alibaba Cloud Model Studio | _(none — billing mode is fixed when the key is minted)_ |
+| `QWEN_CODING_PLAN_API_KEY` | Alibaba Coding Plan (`qcode@`) | _(separate key and host)_ |
+| `QWEN_TOKEN_PLAN_API_KEY` | Alibaba Token Plan (`qtoken@`) | _(separate key and host)_ |
+| `DASHSCOPE_API_KEY` | Alibaba PAYG (`qpay@`) | _(separate key and host)_ |
 | `OLLAMA_API_KEY` | OllamaCloud (`oc@`) | |
 | `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) | |
-| `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`) | _(none — the Zen key is a different plan and is not accepted)_ |
+| `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`) | _(separate from the metered Zen credential)_ |
 | `LITELLM_API_KEY` | LiteLLM (`ll@`) — requires `LITELLM_BASE_URL` | |
 | `POE_API_KEY` | Poe (`poe@`) | |
-| `VERTEX_API_KEY` | Vertex AI Express (`v@`) | |
-| `VERTEX_PROJECT` | Vertex AI OAuth mode (`v@`) | `GOOGLE_CLOUD_PROJECT` |
+| `VERTEX_PROJECT` | Vertex AI (`v@`) — optional; the ADC quota project or `gcloud config get project` is used otherwise | `GOOGLE_CLOUD_PROJECT` |
 | `ANTHROPIC_API_KEY` | Placeholder (suppresses Claude Code dialog) | |
 
 #### Bundled Endpoint Catalog
@@ -443,11 +446,13 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 |----------|----------|---------|
 | `GEMINI_BASE_URL` | Gemini API | `https://generativelanguage.googleapis.com` |
 | `OPENAI_BASE_URL` | OpenAI/Azure | `https://api.openai.com` |
-| `MINIMAX_BASE_URL` | MiniMax | `https://api.minimaxi.com` |
+| `MINIMAX_BASE_URL` | MiniMax | `https://api.minimax.io` (China-platform keys: `https://api.minimaxi.com`) |
 | `MOONSHOT_BASE_URL` | Kimi/Moonshot | `https://api.moonshot.ai` |
 | `ZHIPU_BASE_URL` | GLM/Zhipu | `https://open.bigmodel.cn` |
 | `ZAI_BASE_URL` | Z.AI | `https://api.z.ai` |
-| `QWEN_CLOUD_PLAN_BASE_URL` | Qwen Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com` |
+| `QWEN_CODING_PLAN_BASE_URL` | Alibaba Coding Plan | `https://coding-intl.dashscope.aliyuncs.com` |
+| `QWEN_TOKEN_PLAN_BASE_URL` | Alibaba Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com` |
+| `DASHSCOPE_BASE_URL` | Alibaba PAYG | `https://dashscope-intl.aliyuncs.com` |
 | `OLLAMACLOUD_BASE_URL` | OllamaCloud | `https://ollama.com` |
 | `OPENCODE_BASE_URL` | OpenCode Zen | `https://opencode.ai/zen` |
 | `LITELLM_BASE_URL` | LiteLLM proxy server | _(required with LITELLM_API_KEY)_ |
@@ -633,12 +638,14 @@ claudish --model ollama@llama3.2:3 "code review"  # 3 concurrent requests
 | `mistral@` | Mistral | `MISTRAL_API_KEY` | `mistral@mistral-large-2512` |
 | `sakana@`, `fugu@` | Sakana Fugu | `SAKANA_API_KEY` | `fugu@fugu-ultra` |
 | `sc@` | Sakana Fugu Subscription | `SAKANA_CODING_API_KEY` | `sc@fugu-ultra` |
-| `qc@` | Qwen Plan | `QWEN_CLOUD_PLAN_API_KEY` | `qc@qwen3.7-plus` |
+| `qcode@` | Alibaba Coding Plan | `QWEN_CODING_PLAN_API_KEY` | `qcode@qwen3.7-plus` |
+| `qtoken@` | Alibaba Token Plan | `QWEN_TOKEN_PLAN_API_KEY` | `qtoken@qwen3.7-plus` |
+| `qpay@` | Alibaba PAYG | `DASHSCOPE_API_KEY` | `qpay@qwen3.7-plus` |
 | `llama@`, `lc@`, `meta@` | OllamaCloud | `OLLAMA_API_KEY` | `llama@llama-3.1-70b` |
 | `oc@` | OllamaCloud | `OLLAMA_API_KEY` | `oc@llama-3.1-70b` |
 | `zen@` | OpenCode Zen | `OPENCODE_API_KEY` | `zen@gpt-5-nano` |
 | `zgo@`, `zengo@` | OpenCode Zen Go plan | `OPENCODE_GO_API_KEY` | `zgo@glm-5` |
-| `v@`, `vertex@` | Vertex AI | `VERTEX_API_KEY` | `v@gemini-2.5-flash` |
+| `v@`, `vertex@` | Vertex AI | _(Application Default Credentials; `VERTEX_PROJECT` optional)_ | `v@gemini-2.5-flash` |
 | `ag@`, `antigravity@` | Antigravity (Gemini subscription) | _(OAuth via `claudish login antigravity`)_ | `ag@gemini-3.6-flash` |
 | `go@` | _deprecated alias → `ag@`_ | _(OAuth)_ | `go@gemini-2.5-flash` |
 | `poe@` | Poe | `POE_API_KEY` | `poe@GPT-4o` |
@@ -660,12 +667,12 @@ When no provider is specified, Claudish auto-detects from model name:
 | `kimi-*`, `moonshot-*` | Kimi Direct | `kimi-k2` |
 | `glm-*`, `zhipu/*` | GLM Direct | `glm-4` |
 | `fugu-*`, `sakana/*` | Sakana Fugu | `fugu-ultra` |
-| `qwen3.*` (dotted Model Studio names) | Qwen Plan, then OpenRouter | `qwen3.7-plus` |
+| `qwen3.*`, `qwen3-*` | Alibaba subscriptions, OpenCode Go, PAYG, then OpenRouter | `qwen3.7-plus` |
 | `poe:*` | Poe | `poe:GPT-4o` |
 | `claude-*`, `anthropic/*` | Native Anthropic | `claude-sonnet-4` |
 | **Unknown `vendor/model`** | **Error** | Use `openrouter@vendor/model` |
 
-**Qwen Plan roster**: discovered live from the plan's own model endpoint, never hardcoded — Alibaba's published docs both deny that endpoint exists and name models the host does not serve, and entitlement differs per subscription. The plan also serves `glm-5.2` and `deepseek-v4-*`, reachable only as an explicit `qc@glm-5.2`; bare `glm-*` / `deepseek-*` names keep their existing routing.
+**Alibaba product rosters**: Coding Plan, Token Plan, and PAYG use separate credentials and endpoints. The catalog supplies each product's route and model wire ID; account discovery narrows the models actually available to your key. Cross-vendor models on an Alibaba plan can be selected explicitly, for example `qtoken@glm-5.2`.
 
 ### Examples
 
@@ -684,14 +691,16 @@ claudish --model openrouter@deepseek/deepseek-r1 "deep analysis"
 claudish --model llama@llama-3.1-70b "code review"
 claudish --model oc@llama-3.2-vision "analyze image"
 
-# Vertex AI - Google Cloud
-VERTEX_API_KEY=... claudish --model v@gemini-2.5-flash "task"
-VERTEX_PROJECT=my-project claudish --model vertex@gemini-2.5-flash "OAuth mode"
+# Vertex AI - Google Cloud (Application Default Credentials)
+gcloud auth application-default login                # once
+claudish --model v@gemini-2.5-flash "task"           # project from ADC / gcloud config
+VERTEX_PROJECT=my-project claudish --model vertex@gemini-2.5-flash "explicit project"
 
-# Qwen Plan - Alibaba Cloud Model Studio subscription
-claudish --model qc@qwen3.7-plus "implement feature"
-claudish --model qwen3.7-plus "implement feature"   # bare dotted qwen3.* routes here
-claudish --model qc@glm-5.2 "review"                # plan also serves GLM/DeepSeek, explicit qc@ only
+# Alibaba Cloud Model Studio products
+claudish --model qcode@qwen3.7-plus "implement feature"
+claudish --model qtoken@qwen3.7-plus "implement feature"
+claudish --model qpay@qwen3.7-plus "implement feature"
+claudish --model qtoken@glm-5.2 "review"
 
 # Local models with concurrency control
 claudish --model ollama@llama3.2:3 "review"     # 3 concurrent requests

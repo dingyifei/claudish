@@ -39,7 +39,8 @@ import type { ModelHandler } from "../handlers/types.js";
 import type { ClaudishProfileConfig } from "../profile-config.js";
 import { clearEndpointUnavailable, recordEndpointUnavailable } from "./endpoint-diagnostics.js";
 import {
-  type ProviderDefinition,
+  type RouteTier,
+  type TieredProviderDefinition,
   type TransportType,
   baseUrlOverrideCandidates,
   runtimeHandler,
@@ -108,7 +109,7 @@ export interface EndpointDefinitionOverrides {
   apiKeyUrl?: string;
   /** Credential label shown in the TUI. Default: `<name> (custom endpoint)`. */
   apiKeyDescription?: string;
-  /** Roster/TUI description. Default: `Custom endpoint: <name>`. */
+  /** Picker/TUI description. Default: `Custom endpoint: <name>`. */
   description?: string;
 }
 
@@ -230,6 +231,27 @@ export function loadCustomEndpoints(config: ClaudishProfileConfig): LoadResult {
 }
 
 /**
+ * The routing tier of EVERY endpoint that arrives from config — user-authored or
+ * bundled.
+ *
+ * `gateway`, and deliberately the weakest true thing claudish can say. A row
+ * carries CONNECTION FACTS ONLY (see predefined-endpoint-schema.ts): a URL, a
+ * path, a wire format and the vendor's env var. Nothing in it distinguishes
+ * Together AI reselling forty vendors from Cohere serving its own models, so
+ * classifying one as `native` would be a guess, and guessing UPWARDS would sort a
+ * third-party endpoint ahead of the vendor's own. `gateway` is the last tier
+ * before the fallback, so an endpoint claudish cannot classify sorts last among
+ * the ones it can — which is the recoverable direction.
+ *
+ * Not `fallback`: that tier is a POSITION held by whichever provider
+ * `defaultProvider` names, and no definition may claim it.
+ *
+ * Exported for the route-binding guard: a bundled row gets a definition only when
+ * it registers, which needs its key, so a hermetic test reads the tier here.
+ */
+export const CUSTOM_ENDPOINT_TIER: RouteTier = "gateway";
+
+/**
  * Build a ProviderDefinition for a custom endpoint so it appears in lookups
  * (getProviderByName, getAllProviders, etc.). The definition is minimal —
  * real handler construction happens in the profile.
@@ -241,7 +263,7 @@ function buildProviderDefinition(
   name: string,
   ep: CustomEndpoint,
   ovr?: EndpointDefinitionOverrides
-): ProviderDefinition {
+): TieredProviderDefinition {
   const apiKeyEnvVar = ovr?.apiKeyEnvVar ?? customEndpointKeyEnvVar(name);
   const apiKeyAliases = ovr?.apiKeyAliases;
   const baseUrlEnvVars = ovr?.baseUrlEnvVars;
@@ -250,6 +272,7 @@ function buildProviderDefinition(
   if (ep.kind === "simple") {
     return {
       createHandler: runtimeHandler(name),
+      tier: CUSTOM_ENDPOINT_TIER,
       name,
       displayName: name,
       transport: ep.format as TransportType,
@@ -275,6 +298,7 @@ function buildProviderDefinition(
 
   return {
     createHandler: runtimeHandler(name),
+    tier: CUSTOM_ENDPOINT_TIER,
     name,
     displayName: ep.displayName,
     transport: ep.transport as TransportType,

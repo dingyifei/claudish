@@ -74,7 +74,7 @@ function md5(p: string): string {
 /**
  * The task. Deliberately shaped so every assertion is model-agnostic:
  *
- *  - The model roster is NOT pinned. Claude Code is told to consult claudish's
+ *  - The model list is NOT pinned. Claude Code is told to consult claudish's
  *    live catalog and pick the newest itself, so the benchmark keeps working
  *    when vendors ship. What is checked is that it picked N distinct REAL ones.
  *  - The question has exactly one correct answer, expressible as digits, so

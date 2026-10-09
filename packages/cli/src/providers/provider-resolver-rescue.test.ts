@@ -3,7 +3,9 @@ import { describe, expect, test } from "bun:test";
 import {
   type ProviderResolution,
   type RouteOracle,
+  getMissingKeyResolutions,
   rescueRoutableResolutions,
+  resolveModelProvider,
 } from "./provider-resolver.js";
 
 function makeResolution(overrides: Partial<ProviderResolution> = {}): ProviderResolution {
@@ -34,6 +36,25 @@ const routable: RouteOracle = async () => ({
 const notRoutable: RouteOracle = async () => ({
   kind: "no-route",
   reason: "No credentialed provider in the routing chain",
+});
+
+describe("resolveModelProvider", () => {
+  test("classifies a bare non-Claude name as auto-route without requiring a key", () => {
+    const resolution = resolveModelProvider("o4-mini");
+
+    expect(resolution).toEqual(
+      expect.objectContaining({
+        category: "auto-route",
+        catalogName: null,
+        providerName: "unresolved (routed on the first request)",
+        modelName: "o4-mini",
+        fullModelId: "o4-mini",
+        requiredApiKeyEnvVar: null,
+        apiKeyAvailable: true,
+      })
+    );
+    expect(getMissingKeyResolutions([resolution])).toEqual([]);
+  });
 });
 
 describe("rescueRoutableResolutions", () => {

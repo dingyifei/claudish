@@ -132,7 +132,7 @@ export function ProfilesContent({
   // aligns cleanly even for long prefixes like "gemini-codeassist@".
   // One call, two uses. `getProviderPrefixes()` builds a fresh array per call
   // (deliberately — see its doc), so asking twice per render allocates twice and,
-  // worse, would let the width be computed from a different roster than the rows
+  // worse, would let the width be computed from a different prefix list than the rows
   // if a provider were ever registered between the two calls.
   const prefixes = getProviderPrefixes();
   const prefixColW = prefixes.reduce((max, p) => Math.max(max, p.prefix.length), 0) + 2;
@@ -386,7 +386,7 @@ export function ProfilesContent({
                   <span fg={C.yellow} attributes={A.bold}>
                     auto-route{" "}
                   </span>
-                  <span fg={C.fgMuted}>— uses routing table · </span>
+                  <span fg={C.fgMuted}>— calculated per model (Routing → p) · </span>
                   <span fg={C.green} attributes={A.bold}>
                     ⏎{" "}
                   </span>

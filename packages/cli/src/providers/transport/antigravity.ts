@@ -5,8 +5,9 @@
  * Adapted from the since-removed providers/transport/gemini-codeassist.ts. It keeps ALL of that
  * transport's hardening — the 429 classification (RATE_LIMIT_EXCEEDED retry /
  * MODEL_CAPACITY_EXHAUSTED fallback / QUOTA_EXHAUSTED terminal), the live
- * served-set discovery, the capacity fallback chain, and the served-set-aware
- * 404 rewrite (F1–F7) — and differs only in identity and model handling:
+ * discovery of the account's dynamic models catalog, the capacity fallback chain,
+ * and the 404 rewrite that checks that catalog (F1–F7) — and differs only in
+ * identity and model handling:
  *
  * - Auth token comes from getValidAntigravityAccessToken() (the shared agy
  *   keychain item, self-refreshed), NOT the gemini-cli login token.
@@ -45,6 +46,8 @@ import { credentials } from "../../auth/credentials/authority.js";
 import type { RequestAuth } from "../../auth/credentials/types.js";
 import { GeminiRequestQueue } from "../../handlers/shared/gemini-queue.js";
 import { log, logStderr } from "../../logger.js";
+import type { DiscoveryOutcome } from "./probe-discovery.js";
+import { discoverProviderProbeModel } from "./provider-model-discovery.js";
 import type { ProviderTransport, StreamFormat } from "./types.js";
 
 // The backend host comes from `antigravityHost()` — ONE source, shared with the
@@ -83,7 +86,7 @@ const UNATTRIBUTED_RETRY_DELAY_MS = 1_000;
 const QUOTA_CHECK_TIMEOUT_MS = 3000;
 
 // ---------------------------------------------------------------------------
-// Model-id resolution (live served set — NO hardcoded model ids)
+// Model-id resolution (dynamic models catalog — NO hardcoded model ids)
 // ---------------------------------------------------------------------------
 
 /**
@@ -130,8 +133,9 @@ export function rankAntigravityModel(modelId: string): number {
 
 /**
  * Resolve a user-supplied model id to the id the Antigravity backend serves,
- * using ONLY the LIVE served set (from fetchAvailableModels). No pinned model
- * ids — the served ids and the default come from the account's own subscription.
+ * using ONLY the account's dynamic models catalog (from fetchAvailableModels). No
+ * pinned model ids — the served ids and the default come from the account's own
+ * subscription.
  *
  * Rules (pure, exported for testing):
  *  1. Exact hit — `servedIds` contains `requested` → return it.
@@ -146,7 +150,8 @@ export function rankAntigravityModel(modelId: string): number {
  *       - if the backend `defaultId` is one of them → return `defaultId`;
  *       - else the strongest reasoning tier by suffix RANK.
  *  4. Otherwise — return `requested` unchanged and let the backend 404, which
- *     the served-set-aware 404 rewrite (F1–F7) turns into an actionable error.
+ *     the 404 rewrite (F1–F7) checks against the dynamic models catalog and
+ *     turns into an actionable error.
  *
  * `catalogDefault` is injected rather than looked up inside, so the function
  * stays pure and testable.
@@ -341,14 +346,26 @@ export class AntigravityProviderTransport implements ProviderTransport {
 
   constructor(modelName: string) {
     this.modelName = modelName;
-    // Resolved against the LIVE served set in refreshAuth(); until then the raw
-    // name is a safe placeholder (composed-handler always awaits refreshAuth
-    // before any request).
+    // Resolved against the account's dynamic models catalog in refreshAuth();
+    // until then the raw name is a safe placeholder (composed-handler always
+    // awaits refreshAuth before any request).
     this.servedModelName = modelName;
   }
 
   getActiveModelName(): string | undefined {
     return this._activeModelName;
+  }
+
+  /**
+   * Pick a probe model from this account's own model list (fetchAvailableModels).
+   *
+   * The cloud catalog marks Antigravity `client_model_selection_required`: the
+   * dynamic models catalog is per account, so no hosted pick can be right for everyone.
+   * Without this method Test All had no candidate at all and reported "no probe
+   * model: transport does not support discovery" for a working subscription.
+   */
+  async discoverProbeModel(exclude?: ReadonlySet<string>): Promise<DiscoveryOutcome> {
+    return discoverProviderProbeModel(this.name, this.displayName, exclude);
   }
 
   getEndpoint(): string {
@@ -427,7 +444,7 @@ export class AntigravityProviderTransport implements ProviderTransport {
    *
    * `resetAntigravityUserCache()` is not incidental. `setupAntigravityUser()`
    * memoizes project + tier for the life of the PROCESS with no expiry, and
-   * `getServedAntigravityModels()` caches the served set for 10 minutes — both
+   * `getServedAntigravityModels()` caches the dynamic models catalog for 10 minutes — both
    * keyed to the identity that was just invalidated. A re-established session
    * can land on a different project, so keeping them would pin the fresh token
    * to the dead session's project. (Until now that reset function had no callers
@@ -457,11 +474,12 @@ export class AntigravityProviderTransport implements ProviderTransport {
    *
    * MODEL_CAPACITY_EXHAUSTED is reported as NON-terminal here on purpose, and
    * that is a deliberate behaviour change. It is terminal for ONE MODEL — which
-   * is why `enqueueRequest` answers it with the served-set fallback chain rather
-   * than a retry — but it says nothing about the account. Google has no capacity
-   * right now; capacity returns on the order of seconds, so retrying is the
-   * actual remedy rather than theatre, and a bare name whose chain continues
-   * (antigravity → google → openrouter) gets served instead of hard-failing.
+   * is why `enqueueRequest` answers it with a fallback chain drawn from the
+   * dynamic models catalog rather than a retry — but it says nothing about the
+   * account. Google has no capacity right now; capacity returns on the order of
+   * seconds, so retrying is the actual remedy rather than theatre, and a bare
+   * name whose chain continues (antigravity → google → openrouter) gets served
+   * instead of hard-failing.
    * Reporting it terminal also handed it the quota message, which is how a
    * capacity fault ended up telling users to check their billing.
    *
@@ -527,7 +545,7 @@ export class AntigravityProviderTransport implements ProviderTransport {
 
       if (response.status !== 429) {
         // A 404 usually means this model is not served by the tier we are on.
-        // Only rewrite when the live served set CONFIRMS that.
+        // Only rewrite when the account's dynamic models catalog CONFIRMS that.
         if (response.status === 404) {
           return this.rewriteModelNotFound(response);
         }
@@ -665,22 +683,23 @@ export class AntigravityProviderTransport implements ProviderTransport {
    * serves and how to reach the model anyway. Status stays 404 (terminal), so
    * composed-handler remaps it to a 400 surfaced verbatim.
    *
-   * Returns the response UNTOUCHED when the live served set contains the model.
+   * Returns the response UNTOUCHED when the account's dynamic models catalog
+   * contains the model.
    */
   private rewriteModelNotFound(response: Response, capacityFallbacksExhausted = false): Response {
-    // The served set is the LIVE fetchAvailableModels result — no hardcoded seed.
+    // The dynamic models catalog is the LIVE fetchAvailableModels result — no hardcoded seed.
     const served = this.servedModels;
 
     if (!capacityFallbacksExhausted && served.includes(this.servedModelName)) {
       log(
-        `[Antigravity] 404 for ${this.servedModelName}, which IS in the served set — passing through unmodified`
+        `[Antigravity] 404 for ${this.servedModelName}, which IS in the dynamic models catalog — passing through unmodified`
       );
       return response;
     }
 
     // Drain the original so the connection body isn't left hanging.
     response.text().catch(() => {});
-    // Only name the served set when we actually have one (the live fetch may
+    // Only name the dynamic models catalog when we actually have one (the live fetch may
     // have failed); otherwise stay honest about not knowing.
     const servesClause =
       served.length > 0 ? `That tier currently serves: ${served.join(", ")}. ` : "";

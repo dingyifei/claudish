@@ -5,12 +5,20 @@ import {
   extractProviderMessage,
   isTerminalError,
   sanitizeErrorMessage,
+  sseDataPayload,
   statusToErrorType,
   wrapAnthropicError,
 } from "./anthropic-error.js";
 
 const CAPTURED_BUN_DUMP =
   'error: Unable to connect. Is the computer able to access the url?\n  path: "https://chatgpt.com/backend-api/codex/responses",\n errno: 0,\n  code: "ConnectionRefused"\n';
+
+const ALIBABA_ACCESS_DENIED_PAYLOAD =
+  '{"code":"AccessDenied","message":"Model access denied.","request_id":"ecbdbfc8-..."}';
+const ALIBABA_ACCESS_DENIED_SSE = `event:error\ndata:${ALIBABA_ACCESS_DENIED_PAYLOAD}`;
+const ALIBABA_INVALID_PARAMETER_PAYLOAD =
+  '{"code":"InvalidParameter","message":"Model access denied.","request_id":"200170c3-..."}';
+const ALIBABA_INVALID_PARAMETER_SSE = `event:error\ndata:${ALIBABA_INVALID_PARAMETER_PAYLOAD}`;
 
 describe("statusToErrorType", () => {
   it("maps 400 to invalid_request_error", () => {
@@ -83,6 +91,52 @@ describe("wrapAnthropicError", () => {
 
     expect(result.error.message).toBe("first line second line");
     expect(result.error.message).not.toMatch(/[\r\n\t]/);
+  });
+
+  it("preserves sanitized provider evidence and omits the field when absent or blank", () => {
+    const result = wrapAnthropicError(
+      400,
+      "Alibaba PAYG error",
+      "invalid_request_error",
+      403,
+      " \u001b[31mModel\n access denied.\u001b[0m "
+    );
+
+    expect(result.error.provider_message).toBe("Model access denied.");
+    const omitted = wrapAnthropicError(400, "Alibaba PAYG error");
+    const blank = wrapAnthropicError(
+      400,
+      "Alibaba PAYG error",
+      "invalid_request_error",
+      403,
+      " \n\t "
+    );
+
+    expect(Object.hasOwn(omitted.error, "provider_message")).toBe(false);
+    expect(Object.hasOwn(blank.error, "provider_message")).toBe(false);
+  });
+});
+
+describe("sseDataPayload", () => {
+  it("handles real and flattened SSE frames without consuming non-SSE bodies", () => {
+    expect(sseDataPayload(ALIBABA_ACCESS_DENIED_SSE)).toBe(ALIBABA_ACCESS_DENIED_PAYLOAD);
+    expect(sseDataPayload(ALIBABA_INVALID_PARAMETER_SSE)).toBe(ALIBABA_INVALID_PARAMETER_PAYLOAD);
+
+    const frame = [
+      "event:error",
+      'data:{"code":"AccessDenied",',
+      'data:"message":"Model access denied.",',
+      'data:"request_id":"ecbdbfc8-..."}',
+    ].join("\n");
+
+    expect(sseDataPayload(frame)).toBe(ALIBABA_ACCESS_DENIED_PAYLOAD);
+
+    const flattened = sanitizeErrorMessage(ALIBABA_INVALID_PARAMETER_SSE);
+
+    expect(sseDataPayload(flattened)).toBe(ALIBABA_INVALID_PARAMETER_PAYLOAD);
+
+    expect(sseDataPayload("Model access denied.")).toBeUndefined();
+    expect(sseDataPayload(ALIBABA_ACCESS_DENIED_PAYLOAD)).toBeUndefined();
   });
 });
 
@@ -235,8 +289,46 @@ describe("ensureAnthropicErrorFormat", () => {
 });
 
 describe("extractProviderMessage", () => {
-  it("returns a raw string as-is", () => {
+  it("preserves an ordinary string", () => {
     expect(extractProviderMessage("plain error")).toBe("plain error");
+  });
+
+  it.each([
+    [
+      "multi-line",
+      'event:error\ndata:{"code":"AccessDenied","message":"Model access denied.","request_id":"x"}',
+    ],
+    [
+      "flattened",
+      'event:error data:{"code":"AccessDenied","message":"Model access denied.","request_id":"x"}',
+    ],
+    [
+      "flattened inside error.message",
+      {
+        error: {
+          message:
+            'event:error data:{"code":"AccessDenied","message":"Model access denied.","request_id":"x"}',
+        },
+      },
+    ],
+  ])("unwraps a real %s SSE frame", (_shape, body) => {
+    expect(extractProviderMessage(body)).toBe("Model access denied.");
+  });
+
+  it("does not truncate a FastAPI detail sentence containing data:", () => {
+    expect(extractProviderMessage({ detail: "Missing key in request data: messages" })).toBe(
+      "Missing key in request data: messages"
+    );
+  });
+
+  it("does not truncate a nested error message containing a data: URL reference", () => {
+    expect(
+      extractProviderMessage({
+        error: {
+          message: "Invalid content block: data: URLs are not supported for this model",
+        },
+      })
+    ).toBe("Invalid content block: data: URLs are not supported for this model");
   });
 
   it("pulls error.message from OpenAI-style bodies", () => {

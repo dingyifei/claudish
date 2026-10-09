@@ -1,0 +1,132 @@
+{
+  "version": 3,
+  "lastUpdated": "2026-09-24T00:00:00.000Z",
+  "entries": [
+    {
+      "modelId": "kimi-code-plan-marker",
+      "aliases": [],
+      "subscriptionPlanIds": ["kimi-code"],
+      "aggregators": [
+        {
+          "sourceProviderId": "moonshotai",
+          "sourceCollectorId": "stage5-test",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "moonshotai",
+            "routeProfileId": "kimi-code-subscription"
+          },
+          "externalModelId": "k3",
+          "confidence": "api_official"
+        }
+      ]
+    },
+    {
+      "modelId": "rule-mix",
+      "aliases": [],
+      "subscriptionPlanIds": [],
+      "aggregators": []
+    },
+    {
+      "modelId": "cat-found",
+      "aliases": [],
+      "subscriptionPlanIds": [],
+      "aggregators": [
+        {
+          "sourceProviderId": "openai",
+          "sourceCollectorId": "stage5-test",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openai",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "cat-found",
+          "confidence": "api_official"
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "stage5-test",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openrouter",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "cat-found",
+          "confidence": "api_official"
+        }
+      ]
+    },
+    {
+      "modelId": "cat-denied",
+      "aliases": [],
+      "subscriptionPlanIds": [],
+      "aggregators": [
+        {
+          "sourceProviderId": "openai",
+          "sourceCollectorId": "stage5-test",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openai",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "cat-denied",
+          "confidence": "api_official"
+        }
+      ]
+    },
+    {
+      "modelId": "plan-less",
+      "aliases": [],
+      "subscriptionPlanIds": [],
+      "aggregators": []
+    },
+    {
+      "modelId": "glm-5.2",
+      "aliases": [],
+      "subscriptionPlanIds": [],
+      "aggregators": [
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "stage5-test",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openrouter",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "glm-5.2",
+          "confidence": "api_official"
+        }
+      ]
+    },
+    {
+      "modelId": "gpt-5",
+      "aliases": [],
+      "subscriptionPlanIds": [],
+      "aggregators": [
+        {
+          "sourceProviderId": "openai",
+          "sourceCollectorId": "stage5-test",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openai",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "gpt-5",
+          "confidence": "api_official"
+        }
+      ]
+    }
+  ],
+  "models": [],
+  "plans": [
+    {
+      "id": "kimi-code",
+      "modelDiscovery": "catalog",
+      "routeStatus": "supported",
+      "route": {
+        "routeId": "moonshotai",
+        "routeProfileId": "kimi-code-subscription"
+      }
+    }
+  ],
+  "catalogGenerationId": "stage5-explain-route-fixture"
+}

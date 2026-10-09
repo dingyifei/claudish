@@ -1,11 +1,13 @@
 /**
- * Phase 5 end-to-end tests for the LiteLLM-demotion refactor.
+ * End-to-end tests around fallback routing and the LiteLLM-demotion refactor.
  *
  * Black-box tests. The proxy is invoked in-process via the public
  * `createProxyServer()` entry point. Each test redirects the active global
  * config to an ephemeral temp file so mutations never touch the real user config.
  *
- * Real API calls. All tests skipIf on missing credentials. No mocks.
+ * The hermetic group runs in a HOME-sandboxed child over a checked-in catalog.
+ * Groups B and C are live provider roundtrip smoke tests only; they do not prove
+ * that the proxy honours defaultProvider. Their tests skipIf on missing credentials.
  *
  * Group D's D1b asserts the slim-catalog aggregators[] SHAPE (the fields
  * claudish indexes) and that the live catalog still overlaps claudish's
@@ -18,7 +20,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setConfigFileOverride } from "../config-override.js";
@@ -27,6 +29,13 @@ import { pickerProviderToFirebaseSlug } from "../model-selector.js";
 import { createProxyServer } from "../proxy-server.js";
 import { hasCredential } from "../test-helpers/credential-gate.js";
 import type { ProxyServer } from "../types.js";
+
+const STAGE4_CATALOG_FIXTURE = join(
+  import.meta.dir,
+  "..",
+  "test-fixtures",
+  "stage4-default-provider-catalog.json"
+);
 
 // ---------------------------------------------------------------------------
 // Shared test infrastructure
@@ -256,7 +265,144 @@ describe("Group A — legacy LiteLLM auto-promotion removed (commit 5)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Group B — Real API routing behavior
+// Hermetic proxy coverage — defaultProvider reaches bare-name routing
+// ---------------------------------------------------------------------------
+
+type HermeticProxyScenario = "config-empty" | "env-empty" | "custom-no-key";
+
+interface HermeticProxyResult {
+  status: number;
+  raw: { error?: { message?: string } };
+  debugLog: string;
+}
+
+function runHermeticProxy(scenario: HermeticProxyScenario): HermeticProxyResult {
+  const home = mkdtempSync(join(tmpdir(), "claudish-default-provider-proxy-"));
+  const configDir = join(home, ".claudish");
+  mkdirSync(configDir, { recursive: true });
+  copyFileSync(STAGE4_CATALOG_FIXTURE, join(configDir, "cloud-models-catalog-v3.json"));
+
+  const config: Record<string, unknown> = {
+    version: "1.0.0",
+    defaultProfile: "default",
+    profiles: {},
+    defaultProvider: scenario === "config-empty" ? "" : "openrouter",
+  };
+  if (scenario === "custom-no-key") {
+    config.defaultProvider = "sandbox-no-key";
+    config.customEndpoints = {
+      "sandbox-no-key": {
+        kind: "simple",
+        url: "http://127.0.0.1:9/v1",
+        format: "openai",
+        apiKey: "${STAGE4_MISSING_KEY}",
+      },
+    };
+  }
+  writeFileSync(join(configDir, "config.json"), JSON.stringify(config), "utf8");
+
+  const proxyModuleUrl = new URL("../proxy-server.ts", import.meta.url).href;
+  const loggerModuleUrl = new URL("../logger.ts", import.meta.url).href;
+  const script = `
+    const { readFileSync, rmSync } = await import("node:fs");
+    const { createProxyServer } = await import(${JSON.stringify(proxyModuleUrl)});
+    const { getLogFilePath, initLogger } = await import(${JSON.stringify(loggerModuleUrl)});
+
+    let proxy;
+    let output;
+    try {
+      proxy = await createProxyServer(0, undefined, undefined, false, undefined, undefined, {
+        quiet: true,
+      });
+      initLogger(true, "debug", true);
+      const response = await fetch(proxy.url + "/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "no-such-model-xyz",
+          max_tokens: 16,
+          stream: false,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      const raw = await response.json();
+      await Bun.sleep(150);
+      const logPath = getLogFilePath();
+      if (!logPath) throw new Error("debug logger did not expose its path");
+      const debugLog = readFileSync(logPath, "utf8");
+      initLogger(false, "info", true);
+      rmSync(logPath, { force: true });
+      output = JSON.stringify({
+        status: response.status,
+        raw,
+        debugLog,
+      });
+    } finally {
+      if (proxy) await proxy.shutdown();
+    }
+    process.stdout.write(output, () => process.exit(0));
+  `;
+  const env: Record<string, string> = {
+    HOME: home,
+    PATH: process.env.PATH ?? "",
+    TMPDIR: process.env.TMPDIR ?? tmpdir(),
+    OPENROUTER_API_KEY: "",
+    STAGE4_MISSING_KEY: "",
+    CLAUDISH_DISABLE_CATALOG_WARM: "1",
+    CLAUDISH_DISABLE_KEYCHAIN: "1",
+    CLAUDISH_DISABLE_OP: "1",
+    CLAUDISH_SKIP_LIVE_E2E: "1",
+  };
+  if (scenario === "env-empty") env.CLAUDISH_DEFAULT_PROVIDER = "";
+
+  try {
+    const result = Bun.spawnSync([process.execPath, "-e", script], {
+      cwd: join(import.meta.dir, "../../../.."),
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = result.stdout.toString();
+    const stderr = result.stderr.toString();
+    expect(result.exitCode, stderr || stdout).toBe(0);
+    return JSON.parse(stdout) as HermeticProxyResult;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+describe("Hermetic proxy defaultProvider routing", () => {
+  test('config defaultProvider "" returns the catalog-empty no-route without an upstream call', () => {
+    const result = runHermeticProxy("config-empty");
+    expect(result.status).toBe(400);
+    expect(result.raw.error?.message).toContain(
+      '[Route] No provider in the catalog serves "no-such-model-xyz".'
+    );
+    expect(result.debugLog).not.toContain("[OpenRouter] Response status:");
+  });
+
+  test('CLAUDISH_DEFAULT_PROVIDER="" returns the same no-route without an upstream call', () => {
+    const result = runHermeticProxy("env-empty");
+    expect(result.status).toBe(400);
+    expect(result.raw.error?.message).toContain(
+      '[Route] No provider in the catalog serves "no-such-model-xyz".'
+    );
+    expect(result.debugLog).not.toContain("[OpenRouter] Response status:");
+  });
+
+  test("an uncredentialed custom fallback is named in the tried reason", () => {
+    const result = runHermeticProxy("custom-no-key");
+    expect(result.status).toBe(400);
+    expect(result.raw.error?.message).toContain(
+      '[Route] No credentialed providers in chain for "no-such-model-xyz" ' +
+        "(tried: sandbox-no-key)."
+    );
+    expect(result.debugLog).not.toContain("[sandbox-no-key] Response status:");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group B — Live provider roundtrips (not fallback-selection proof)
 // ---------------------------------------------------------------------------
 
 // Asked via claudish's OWN credential authority (env → aliases →
@@ -286,21 +432,18 @@ const HAS_LL = SKIP_LIVE_E2E
   : !!process.env.LITELLM_BASE_URL && (await hasCredential("litellm"));
 const HAS_XAI = SKIP_LIVE_E2E ? false : await hasCredential("x-ai");
 
-describe("Group B — real API routing", () => {
+describe("Group B — live provider roundtrips", () => {
   test.skipIf(!HAS_OR)(
-    "B1a — defaultProvider=openrouter + gpt-5.4 bare → served by OpenRouter",
+    "B1a — catalog-gathered gpt-5.4 bare → served by credentialed OpenRouter",
     async () => {
-      // Pin routing for `gpt-*` to skip codex (commit 5: DEFAULT_ROUTING_RULES
-      // puts openai-codex first for `gpt-*`, which can fire on dev boxes that
-      // happen to have a codex OAuth file. The intent of this test is the
-      // openrouter default-provider path, so we override the gpt-* chain to
-      // exclude codex.)
+      // No user rule: the chain must come from the cloud models catalog. The
+      // gpt-5.4 row publishes OpenRouter, so defaultProvider is deduplicated
+      // rather than manufacturing a second connection.
       sandboxHome({
         version: "1.0.0",
         defaultProfile: "default",
         profiles: {},
         defaultProvider: "openrouter",
-        routing: { "gpt-*": ["openai", "openrouter"] },
       });
       captureStderr();
       const t0 = Date.now();
@@ -328,7 +471,7 @@ describe("Group B — real API routing", () => {
       // The proxy emits its `[Route] N providers for <model>: A → B` line ONLY
       // when the credential-filtered chain has MORE THAN ONE candidate
       // (proxy-server.ts: `if (!options.quiet && candidates.length > 1)`). The
-      // chain pinned above is ["openai","openrouter"], so on a machine WITHOUT
+      // gathered chain includes OpenAI and OpenRouter, so on a machine WITHOUT
       // an OpenAI credential it filters down to a single candidate and NO line
       // is emitted — which is the common case for someone holding only an
       // OpenRouter key. A bare `expect(stderr).toContain("openrouter")` therefore
@@ -401,7 +544,7 @@ describe("Group B — real API routing", () => {
   );
 
   test.skipIf(!HAS_LL)(
-    "B2 — defaultProvider=litellm + minimax-m2.5 bare → served by LiteLLM first",
+    "B2 — defaultProvider=litellm + minimax-m2.5 bare → LiteLLM remains the fallback",
     async () => {
       sandboxHome({
         version: "1.0.0",
@@ -429,10 +572,9 @@ describe("Group B — real API routing", () => {
         `[B2] model=minimax-m2.5 ok=${ok} elapsed=${elapsed}ms litellm@${llIdx} openrouter@${orIdx} textLen=${text.length}`
       );
       expect(ok).toBe(true);
-      // Proof LiteLLM came first when both are visible in stderr
-      if (llIdx >= 0 && orIdx >= 0) {
-        expect(llIdx).toBeLessThan(orIdx);
-      }
+      // `defaultProvider` is the last-resort fallback position. If both names
+      // are visible, the catalog-gathered OpenRouter connection must precede it.
+      if (llIdx >= 0 && orIdx >= 0) expect(orIdx).toBeLessThan(llIdx);
     },
     90_000
   );
@@ -507,10 +649,10 @@ describe("Group B — real API routing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Group C — Custom endpoints
+// Group C — Live custom-endpoint roundtrips (not fallback-selection proof)
 // ---------------------------------------------------------------------------
 
-describe("Group C — custom endpoint registration", () => {
+describe("Group C — live custom-endpoint roundtrips", () => {
   // The model is INCIDENTAL to Group C — these tests prove custom-endpoint
   // registration + `${VAR}` expansion + roundtrip, and the endpoint routes
   // through the OpenAI adapter regardless of the model name. We deliberately
@@ -564,7 +706,6 @@ describe("Group C — custom endpoint registration", () => {
   test.skipIf(!HAS_OR)(
     "C2 — invalid custom endpoint is warned but bare call still succeeds",
     async () => {
-      // Pin routing for `gpt-*` to skip codex (see B1a comment).
       sandboxHome({
         version: "1.0.0",
         defaultProfile: "default",
@@ -584,7 +725,6 @@ describe("Group C — custom endpoint registration", () => {
           },
         },
         defaultProvider: "openrouter",
-        routing: { "gpt-*": ["openai", "openrouter"] },
       });
 
       captureStderr();
@@ -697,10 +837,13 @@ describe.skipIf(SKIP_LIVE_E2E)("Group D — Firebase slim catalog", () => {
   async function fetchCatalog(): Promise<any> {
     if (cachedBody) return cachedBody;
     const res = await fetch(
-      "https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?status=active&catalog=slim&limit=100"
+      "https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?status=active&catalog=slim&limit=100",
+      { headers: { Accept: "application/vnd.models-index.catalog+json;version=3" } }
     );
     expect(res.status).toBe(200);
-    cachedBody = await res.json();
+    const envelope = await res.json();
+    expect(envelope.contractVersion).toBe(3);
+    cachedBody = envelope.data;
     return cachedBody;
   }
 
@@ -729,10 +872,13 @@ describe.skipIf(SKIP_LIVE_E2E)("Group D — Firebase slim catalog", () => {
     const seenProviders = new Set<string>();
     for (const m of withAgg) {
       for (const agg of m.aggregators) {
-        expect(typeof agg.provider).toBe("string");
-        expect(typeof agg.externalId).toBe("string");
+        expect(typeof agg.sourceProviderId).toBe("string");
+        if (agg.routeStatus !== "mapped") continue;
+        expect(typeof agg.route?.routeId).toBe("string");
+        expect(typeof agg.route?.routeProfileId).toBe("string");
+        expect(typeof agg.externalModelId).toBe("string");
         expect(typeof agg.confidence).toBe("string");
-        seenProviders.add(agg.provider);
+        seenProviders.add(agg.sourceProviderId);
       }
     }
 

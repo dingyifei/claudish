@@ -13,13 +13,17 @@
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useEffect, useRef, useState } from "react";
+import { NATIVE_NOT_PROBED } from "../providers/native-route.js";
 import {
   type ProbeResult,
   type ProbeTiming,
   STREAM_MS_FLOOR,
   describeProbeState,
 } from "../providers/probe-live.js";
+import { type DroppedOutcome, describeDropped } from "../providers/probe-runner.js";
+import type { RouteExplanation, RouteWarning, RuleScope } from "../providers/routing-rules.js";
 import { getThemeMode } from "../theme/theme-mode.js";
+import { useAnimationFrame } from "../tui/hooks/useAnimationFrame.js";
 import {
   A,
   C,
@@ -50,48 +54,67 @@ export interface ProbeLinkState {
   displayName: string;
   /** Pinned model spec, e.g. "litellm@gpt-4o" */
   modelSpec: string;
-  status: "waiting" | "probing" | "live" | "failed";
+  /**
+   * `not-probed`: a row nothing is sent down — a native link, a dropped
+   * candidate, or a kept hop under `--no-probe`. It shows `note`, never a bar.
+   */
+  status: "waiting" | "probing" | "live" | "failed" | "not-probed";
   startTime?: number;
   endTime?: number;
   error?: string;
   /** Granular timing breakdown — present on "live" links (threaded from cli.ts). */
   timing?: ProbeTiming;
+  /** A `not-probed` row's text. */
+  note?: string;
+  /** A `not-probed` row's kind, which picks its colour at render time. */
+  tone?: "native" | "dropped" | "ready";
 }
 
-/** One link (provider candidate) in a model's resolved Details view. */
+/**
+ * One row in a model's Details view: a kept hop of the routing chain, a native
+ * target's one link, or a candidate the chain dropped (after the kept hops).
+ */
 export interface ProbeResultLink {
   provider: string;
   /** Provider display name, e.g. "OpenAI", "OpenRouter". */
   displayName: string;
   /** Resolved model id sent to the API, with NO redundant provider@ prefix. */
   modelId: string;
+  /** The hop's tier label, `fallback` for the fallback position. */
+  label?: string;
   hasCredentials: boolean;
   credentialHint?: string;
   probe?: ProbeResult;
+  /** A native link: served on Claude Code's own auth, so it is never probed. */
+  notProbed?: "native-auth";
+  /** Set on a candidate the routing chain dropped: why. Never probed. */
+  dropped?: DroppedOutcome;
 }
 
-/** Per-model results payload the Details tab consumes (built in cli.ts). */
+/**
+ * Per-model results payload the Details tab consumes (built in cli.ts from
+ * `explainRoute`). The parser's provider is deliberately absent: it is not a
+ * routing decision, and it stays in `--probe --json` only.
+ */
 export interface ProbeModelResult {
   /** User input, e.g. "gpt-5.5" or "or@deepseek-v4-pro". */
   model: string;
-  /** Parsed native provider name. */
-  nativeProvider: string;
-  /** Explicit provider@model spec. */
+  /** An explicit target: `provider@model`, `poe:<id>` or `anthropic/<id>`. */
   isExplicit: boolean;
-  routingSource: "direct" | "custom-rules" | "auto-chain";
-  /** Routing rule key that matched (for the routing-why line). */
+  routingSource: RouteExplanation["source"];
+  /** User rule only: the rule key that matched. */
   matchedPattern?: string;
-  /**
-   * Pre-computed routing explanation string. Derived in ONE helper in cli.ts so
-   * a later routing worktree can swap the derivation in a single place.
-   */
+  ruleScope?: RuleScope;
+  /** `describeRouteExplanation`: the one line `--probe` and the config TUI share. */
   routingExplanation: string;
   /**
-   * Provider-comparison links. For explicit/direct models this is a single
-   * synthetic link carrying the directProbe (so the model still renders one row
-   * and the live-count derives from the SAME array as the rows).
+   * The kept hops in chain order (a native target: its one not-probed link),
+   * then one row per dropped candidate. The live count reads the kept rows only.
    */
   links: ProbeResultLink[];
+  /** Set when there is no route: `route()`'s reason and hint, verbatim. */
+  noRoute?: { reason: string; hint?: string };
+  warnings?: RouteWarning[];
   wiring?: {
     formatAdapter: string;
     declaredStreamFormat: string;
@@ -163,16 +186,17 @@ export function useProbeStore(store: ProbeStore): ProbeAppState {
   return store.getState();
 }
 
-/** Bumps a counter every 100ms while active — used for progress bar animation and elapsed timers. */
-export function useAnimationFrame(active: boolean): number {
-  const [frame, setFrame] = useState(0);
-  useEffect(() => {
-    if (!active) return;
-    const id = setInterval(() => setFrame((f) => (f + 1) % 1_000_000), 100);
-    return () => clearInterval(id);
-  }, [active]);
-  return frame;
-}
+/**
+ * MOVED to `tui/hooks/useAnimationFrame.ts`, and re-exported here for one
+ * release so no `probe/` importer has to change. It is the only exported tick
+ * source in the repo and a second OpenTUI app needed it without dragging this
+ * whole component module along; `probe/ → tui/` is an edge that already exists
+ * (see the `../tui/theme.js` import above), the reverse is not.
+ *
+ * Removal trigger: delete this line when the picker has shipped and no importer
+ * outside `probe/` reads it from here.
+ */
+export { useAnimationFrame };
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -183,6 +207,8 @@ const TIMELINE_BAR_FULL = 24; // B
 const TIMELINE_BAR_NARROW = 12; // B when <80 cols
 const TOK_BAR_FULL = 14; // T
 const TOTAL_COL = 7; // right-aligned "14.34s"
+/** The live row's leading `"    MM:SS  "` — 4 indent + 5 clock + 2 gap. */
+const ELAPSED_COL = 11;
 // Each stage number is right-aligned to STAGE_NUM_W so the inner net/srv/str
 // columns line up across rows. W=6 fits the realistic worst case "21.05s".
 const STAGE_NUM_W = 6;
@@ -202,6 +228,16 @@ interface ProbeLayout {
   showBreakdown: boolean;
   /** Whether to fall back to today's single latency pill (<60 cols). */
   pillFallback: boolean;
+  /**
+   * The terminal width this layout was derived from.
+   *
+   * Carried because the pill fallback renders a failure reason with NO column to
+   * clip against — it has no timeline slot, which is where every other layout
+   * puts the reason and where the clipping happens. Without a width, a long
+   * provider message wrapped across as many rows as it needed, over the rows
+   * already drawn.
+   */
+  width: number;
 }
 
 /**
@@ -214,7 +250,7 @@ interface ProbeLayout {
  */
 function deriveLayout(width: number): ProbeLayout {
   if (width < 60) {
-    return { barWidth: 0, tokWidth: 0, showBreakdown: false, pillFallback: true };
+    return { barWidth: 0, tokWidth: 0, showBreakdown: false, pillFallback: true, width };
   }
   if (width < 80) {
     return {
@@ -222,6 +258,7 @@ function deriveLayout(width: number): ProbeLayout {
       tokWidth: 0,
       showBreakdown: false,
       pillFallback: false,
+      width,
     };
   }
   if (width < 100) {
@@ -230,6 +267,7 @@ function deriveLayout(width: number): ProbeLayout {
       tokWidth: 0,
       showBreakdown: true,
       pillFallback: false,
+      width,
     };
   }
   return {
@@ -237,6 +275,7 @@ function deriveLayout(width: number): ProbeLayout {
     tokWidth: TOK_BAR_FULL,
     showBreakdown: true,
     pillFallback: false,
+    width,
   };
 }
 
@@ -293,9 +332,37 @@ function padEndSafe(s: string, n: number): string {
   return s + " ".repeat(n - s.length);
 }
 
+/**
+ * Clip a failure reason to what is left of the terminal, ending in an ellipsis
+ * so a cut reads as a cut. Never pads: the reason is the last thing on its row.
+ */
+function clipReason(s: string, width: number): string {
+  const room = Math.max(8, width - 2);
+  return s.length <= room ? s : `${s.slice(0, room - 1)}…`;
+}
+
+/**
+ * Make provider text safe to paint on ONE row: no escape sequences, no control
+ * characters, no line breaks.
+ *
+ * The newline half is not cosmetic. Every caller is rendering an error message
+ * into a fixed-width slot, and `padEndSafe` clips by CHARACTER COUNT — so a `\n`
+ * that lands inside the clip survives it, ends the row where the terminal says
+ * it ends rather than where the layout says, and pushes the remaining columns
+ * onto the line below, over whatever is already there. `probe-live.ts` now
+ * flattens its messages at the source; this is the second wall, because the
+ * string also reaches here from provider text that never passed through there.
+ */
 function stripAnsi(text: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape sequences require control chars
-  return text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+  return (
+    text
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape sequences require control chars
+      .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+      // Whitespace RUNS, not just newlines: a collapsed frame otherwise leaves a
+      // gap the width of its indentation in the middle of the sentence.
+      .replace(/\s+/g, " ")
+      .trim()
+  );
 }
 
 // ── Banner ─────────────────────────────────────────────────────────
@@ -415,7 +482,8 @@ function ProgressBar({
       : link.startTime
         ? (link.endTime ?? Date.now()) - link.startTime
         : 0;
-  const elapsed = formatElapsed(elapsedMs);
+  // A row nothing was sent down has no clock: a blank keeps the column aligned.
+  const elapsed = link.status === "not-probed" ? "  –  " : formatElapsed(elapsedMs);
   const displayName = padEndSafe(link.displayName, maxNameLen);
 
   const prefix = (
@@ -425,6 +493,20 @@ function ProgressBar({
       <span fg={C.dim}>{"  "}</span>
     </>
   );
+
+  // —— NOT PROBED: a native link, a dropped candidate, or a hop under --no-probe.
+  // No bar, no status marker: the note is the whole story and runs to the edge.
+  // Colour per kind, read from C at render time.
+  if (link.status === "not-probed") {
+    const used = ELAPSED_COL + maxNameLen + 2;
+    const fg = link.tone === "native" ? C.cyan : link.tone === "ready" ? C.green : C.dim;
+    return (
+      <text>
+        {prefix}
+        <span fg={fg}>{clipReason(stripAnsi(link.note ?? "not probed"), layout.width - used)}</span>
+      </text>
+    );
+  }
 
   // \u2014\u2014 <60 col fallback: name + single latency pill (today's behavior) \u2014\u2014
   if (layout.pillFallback) {
@@ -443,20 +525,45 @@ function ProgressBar({
     return (
       <text>
         {prefix}
-        {renderNonLiveStatus(link, /* hasSlot */ false)}
+        {renderNonLiveStatus(link, /* hasSlot */ false, layout.width)}
       </text>
     );
   }
 
-  // \u2014\u2014 Non-live rows: blank both bars to a track, keep alignment \u2014\u2014
-  // The TIMELINE slot carries the failed reason, so the status is a bare \u2717.
+  // \u2014\u2014 FAILED row: the reason gets the WHOLE rest of the line \u2014\u2014
+  //
+  // A failed row draws no timeline bar, no breakdown and no tok/s bar, so every
+  // column after the provider name is dead space. It used to be spent on
+  // alignment anyway: the reason was padded into the `barWidth` slot (24 cols)
+  // so a trailing \u2717 could line up with the live rows above. At 24 columns
+  // "\u2717 error \u00b7 403 \u00b7 1151ms \u2014 Model access denied." clips to
+  // "\u2717 error \u00b7 403 \u00b7 1151ms \u2014", which ends on a dash promising a sentence that
+  // was thrown away \u2014 the one line on the row the reader needed.
+  //
+  // So the marker goes (the reason already starts with \u2717; a second one said
+  // nothing) and the reason runs to the edge of the terminal.
+  if (link.status === "failed") {
+    const used = ELAPSED_COL + maxNameLen + 2;
+    return (
+      <text>
+        {prefix}
+        <span fg={C.red}>
+          {clipReason(`\u2717 ${stripAnsi(link.error || "failed")}`, layout.width - used)}
+        </span>
+      </text>
+    );
+  }
+
+  // \u2014\u2014 Other non-live rows (probing / waiting): blank both bars to a track \u2014\u2014
+  // These DO keep the aligned slot: the animated bar is positional feedback, and
+  // it only reads as progress when it sits where the finished bars will sit.
   if (link.status !== "live" || !link.timing) {
     return (
       <text>
         {prefix}
         {renderTimelineSlot(link, animFrame, layout.barWidth)}
         <span fg={C.dim}>{"  "}</span>
-        {renderNonLiveStatus(link, /* hasSlot */ true)}
+        {renderNonLiveStatus(link, /* hasSlot */ true, layout.width)}
       </text>
     );
   }
@@ -559,10 +666,11 @@ function renderTimelineSlot(link: ProbeLinkState, animFrame: number, barWidth: n
  * `hasSlot` = true when a TIMELINE slot is also rendered for this row (the
  * normal layout): in that case the failed REASON already lives in the slot, so
  * the status is a bare red `\u2717` marker \u2014 no duplicate error text. When `hasSlot`
- * is false (the <60-col pill fallback, no slot), the status carries the full
- * reason itself.
+ * is false (the <60-col pill fallback, no slot), the status carries the reason
+ * itself \u2014 CLIPPED to the terminal, because there is no column to clip it to.
+ * Unclipped, a 400-character provider message wrapped across every row below it.
  */
-function renderNonLiveStatus(link: ProbeLinkState, hasSlot: boolean) {
+function renderNonLiveStatus(link: ProbeLinkState, hasSlot: boolean, width: number) {
   switch (link.status) {
     case "probing": {
       const elapsedMs = link.startTime ? Date.now() - link.startTime : 0;
@@ -572,7 +680,7 @@ function renderNonLiveStatus(link: ProbeLinkState, hasSlot: boolean) {
       return hasSlot ? (
         <span fg={C.red}>{"\u2717"}</span>
       ) : (
-        <span fg={C.red}>{`\u2717 ${stripAnsi(link.error || "failed")}`}</span>
+        <span fg={C.red}>{clipReason(`\u2717 ${stripAnsi(link.error || "failed")}`, width)}</span>
       );
     default:
       return <span fg={C.dim}>{"\u23F3 waiting\u2026"}</span>;
@@ -764,6 +872,22 @@ function shortFailureReason(probe: ProbeResult | undefined, hasCreds: boolean): 
 }
 
 /**
+ * The marker and text of a Details row nothing was sent down, or null for a row
+ * that was probed. A native link is a third outcome (neither ✓ nor ✗); a dropped
+ * candidate says why the chain dropped it and, when known, the remedy; a kept hop
+ * under `--no-probe` says only that it was not probed. Colours come from C at
+ * render time.
+ */
+function notProbedRow(link: ProbeResultLink): { mark: string; text: string; fg: string } | null {
+  if (link.notProbed) return { mark: "◐  ", text: `native — ${NATIVE_NOT_PROBED}`, fg: C.cyan };
+  if (link.dropped) {
+    return { mark: "–  ", text: describeDropped(link.dropped, link.credentialHint), fg: C.dim };
+  }
+  if (!link.probe && link.hasCredentials) return { mark: "○  ", text: "not probed", fg: C.dim };
+  return null;
+}
+
+/**
  * One Details row per provider link. Live links render the aligned
  * timeline/breakdown/tok columns; failed links render a dim-red reason. The
  * winner (first live+timed link) gets a brightGreen ●; everyone else a space,
@@ -798,13 +922,30 @@ function DetailLinkRow({
     </>
   );
 
+  const used = 2 + 1 + 1 + provW + 2 + 3;
+  const idle = notProbedRow(link);
+  if (idle) {
+    return (
+      <text>
+        {lead}
+        <span fg={idle.fg}>{idle.mark}</span>
+        <span fg={idle.fg}>{clipReason(idle.text, layout.width - used)}</span>
+      </text>
+    );
+  }
+
   if (!isLive || !probe?.timing) {
-    // Failed / missing — keep the provider column aligned, then ✗ + dim reason.
+    // Failed / missing — keep the provider column aligned, then ✗ + dim reason,
+    // CLIPPED to what is left of the terminal. `describeProbeState` returns the
+    // provider's own sentence and a provider is free to make it 400 characters
+    // long; unclipped it wrapped over the rows below instead of ending.
     return (
       <text>
         {lead}
         <span fg={C.red}>{"✗  "}</span>
-        <span fg={C.red}>{shortFailureReason(probe, link.hasCredentials)}</span>
+        <span fg={C.red}>
+          {clipReason(shortFailureReason(probe, link.hasCredentials), layout.width - used)}
+        </span>
       </text>
     );
   }
@@ -902,8 +1043,12 @@ function DetailModel({
       : "wire: —";
 
   // ── Routing advisor ────────────────────────────────────────────────
-  // Full route: the ordered chain of providers claudish would try.
-  const routeChain = result.links.map((l) => l.displayName).join(" → ");
+  // Full route: the ordered chain of providers claudish would try — the kept
+  // hops only, each with its tier label. Dropped rows are listed above, not here.
+  const routeChain = result.links
+    .filter((l) => !l.dropped)
+    .map((l) => (l.label ? `${l.displayName} (${l.label})` : l.displayName))
+    .join(" → ");
   const liveLinks = result.links.filter((l) => l.probe?.state === "live" && !!l.probe.timing);
   // Best live link on EACH axis: lowest total latency, and highest throughput.
   // We suggest a rule if the picked provider (winner) loses on EITHER axis —
@@ -966,6 +1111,21 @@ function DetailModel({
         <span fg={C.dim}>{" ".repeat(gap)}</span>
         <span fg={C.dim}>{result.routingExplanation}</span>
       </text>
+      {/* No route: route()'s own reason, verbatim */}
+      {result.noRoute && (
+        <text>
+          <span fg={C.red}>{"  no route  "}</span>
+          <span fg={C.fg}>{clipReason(result.noRoute.reason, layout.width - 12)}</span>
+        </text>
+      )}
+      {/* What route() would print to stderr for this decision (billing notices) */}
+      {(result.warnings ?? [])
+        .filter((w) => w.type !== "rule-problem")
+        .map((w) => (
+          <text key={`${result.model}:warn:${w.message}`}>
+            <span fg={C.yellow}>{`  ⚠ ${clipReason(w.message, layout.width - 4)}`}</span>
+          </text>
+        ))}
       {/* One row per provider link */}
       {result.links.map((link, i) => (
         <DetailLinkRow
@@ -1040,8 +1200,23 @@ function DetailsView({
   // (minus a 1-col scrollbar gutter) so the routing explanation hugs the right
   // edge of the rows instead of running off-screen.
   const headerW = Math.max(24, Math.min(detailRowWidth(provW, layout), (termWidth || 100) - 3));
+  // Rule problems are about the config, not one model: shown once, above the models.
+  const ruleProblems = [
+    ...new Set(
+      results.flatMap((r) =>
+        (r.warnings ?? []).filter((w) => w.type === "rule-problem").map((w) => w.message)
+      )
+    ),
+  ];
   return (
     <box flexDirection="column">
+      {ruleProblems.map((message) => (
+        <text key={`rule-problem:${message}`}>
+          <span fg={C.yellow}>
+            {`  ⚠ routing rule: ${clipReason(message, (termWidth || 100) - 20)}`}
+          </span>
+        </text>
+      ))}
       {results.map((r, idx) => (
         <DetailModel
           key={r.model}
@@ -1074,13 +1249,16 @@ interface LeaderRowData {
   provider: string;
   /** Live+timed timing for the representative; undefined = no live route. */
   timing?: ProbeTiming;
+  /** Why an unavailable row has no timing: `no live route`, `not probed (native)`, `no route`. */
+  missing?: string;
 }
 
 /**
  * Representative entry for a model: the first link that probed live AND carried
- * timing (the route claudish would actually use). The synthetic direct-probe
- * link is already part of `links` (see ProbeModelResult docs), so iterating the
- * links is the whole story — there is no separate directProbe field here.
+ * timing (the route claudish would actually use). An explicit target is a
+ * one-item chain, so iterating the links is the whole story. A model with none
+ * is listed under its first kept hop — or, with no hop at all, under the
+ * explanation line. Never under the parser's provider (`auto-route`).
  */
 function pickRepresentativeLink(result: ProbeModelResult): LeaderRowData {
   for (const link of result.links) {
@@ -1088,7 +1266,12 @@ function pickRepresentativeLink(result: ProbeModelResult): LeaderRowData {
       return { model: result.model, provider: link.displayName, timing: link.probe.timing };
     }
   }
-  return { model: result.model, provider: result.nativeProvider };
+  const first = result.links.find((link) => !link.dropped);
+  return {
+    model: result.model,
+    provider: first?.displayName ?? result.routingExplanation,
+    missing: first?.notProbed ? "not probed (native)" : first ? "no live route" : "no route",
+  };
 }
 
 /** One leaderboard data row (a live, timed representative). */
@@ -1286,7 +1469,7 @@ function LeaderboardView({
           <span fg={C.dim}>{padEndSafe(row.model, nameW)}</span>
           <span fg={C.dim}> </span>
           <span fg={C.dim}>{padEndSafe(row.provider, provW)}</span>
-          <span fg={C.dim}>{" — no live route"}</span>
+          <span fg={C.dim}>{` — ${row.missing}`}</span>
         </text>
       ))}
     </box>
@@ -1478,7 +1661,9 @@ export function ProbeApp({
           indicator — the probing model rows below ARE the feedback. */}
       {isDone ? <TabBar activeTab={state.activeTab} /> : null}
 
-      {groups.length > 0 ? (
+      {/* Results alone are enough: a run whose models are all native or all
+          unroutable probes nothing, and its Details tab must still render. */}
+      {groups.length > 0 || state.results.length > 0 ? (
         <>
           {/* The Summary tab keeps the run legend; the Leaderboard + Details
               tabs have their own header text inside the scrollbox. Wrapped in a

@@ -13,6 +13,7 @@ interface FakeLoginOptions {
   locateAgy?: AntigravityLoginDeps["locateAgy"];
   hasToken?: AntigravityLoginDeps["hasToken"];
   readToken?: AntigravityLoginDeps["readToken"];
+  suggestModel?: AntigravityLoginDeps["suggestModel"];
   confirmInstall?: AntigravityLoginDeps["confirmInstall"];
   runInstall?: AntigravityLoginDeps["runInstall"];
   runAgyAuth?: AntigravityLoginDeps["runAgyAuth"];
@@ -30,6 +31,7 @@ function makeLoginDeps(options: FakeLoginOptions = {}): AntigravityLoginDeps {
     locateAgy: options.locateAgy ?? (() => null),
     hasToken: options.hasToken ?? (() => false),
     readToken: options.readToken ?? (() => null),
+    suggestModel: options.suggestModel ?? (async () => "<model>"),
     confirmInstall: options.confirmInstall ?? (async () => false),
     runInstall: options.runInstall ?? (() => false),
     runAgyAuth: options.runAgyAuth ?? (() => {}),

@@ -17,14 +17,23 @@ import { isatty } from "node:tty";
 import { lookupModelForProvider } from "./adapters/model-catalog.js";
 import { classifierPassthroughEnabled } from "./classifier-passthrough.js";
 import { ENV } from "./config.js";
+import {
+  STRIPPED_CHILD_VARS,
+  magmuxPaneCapability,
+  planMagmuxWrap,
+} from "./launcher/magmux-wrapper.js";
 // Aliased: runClaudeWithProxy declares its own local `log` (a quiet-aware
 // console printer), and an unaliased import would be shadowed inside it.
 import { log as debugLog, logStderr } from "./logger.js";
+import { PANE_MARKER_VARS, isPaneChild } from "./pane/child-env.js";
 import { loadConfig } from "./profile-config.js";
 import { discoverContextWindow } from "./providers/model-discovery.js";
 import { parseModelSpec } from "./providers/model-parser.js";
 import { getProviderByName } from "./providers/provider-definitions.js";
 import { route } from "./providers/routing-rules.js";
+import { installRecoveryUi, shutdownRecoveryUi } from "./recovery/magmux-ui.js";
+import { applyRetryWatchdog, recoverySurfaceAllowed } from "./recovery/settings.js";
+import { assignedTokenFile, resolveTokenFilePath } from "./session/token-file.js";
 import { setClaudeCodeRunning } from "./telemetry.js";
 import { beginTerminalIsolation } from "./terminal-isolation.js";
 import { getThemeMode } from "./theme/theme-mode.js";
@@ -59,9 +68,12 @@ function releaseTerminalIsolation(): void {
 }
 
 /**
- * Check if any resolved model mapping targets a native Anthropic model (claude-*).
- * When true, placeholder auth tokens must NOT be set — Claude Code needs its real
- * subscription credentials so NativeHandler can forward them to api.anthropic.com.
+ * Check if any resolved model mapping targets a native Anthropic model: a name
+ * Claude Code owns (`claude-*`, `opus`, `opusplan`, `sonnet[1m]`, …), which the
+ * parser attributes to native-anthropic. When true, placeholder auth tokens must
+ * NOT be set — Claude Code needs its real subscription credentials so
+ * NativeHandler can forward them to api.anthropic.com. Any other bare name
+ * (`o4-mini`) is routed by the proxy, so it does not count.
  */
 function hasNativeAnthropicMapping(config: ClaudishConfig): boolean {
   const models = [
@@ -565,7 +577,7 @@ const MAX_TOKEN_FILES_SCANNED = 4000;
  * `~/.claudish/tokens-<port>.json` is keyed by PORT, not by session, and nothing
  * used to initialise it. Ports get reused, so a new session that happened to
  * bind a port some long-dead run had used inherited that run's numbers: a fresh
- * LM Studio-free session displayed `cli • LMStudio qc@qwen3.7-plus • $0.000 •
+ * LM Studio-free session displayed `cli • LMStudio qtoken@qwen3.7-plus • $0.000 •
  * 0% (36k/32k)`, where every figure came from a five-week-old leftover file.
  *
  * The zeroed record is deliberately NEUTRAL rather than pre-populated: no
@@ -849,15 +861,23 @@ export function createTempSettingsFile(
   const timestamp = Date.now();
   const tempPath = join(claudishDir, `settings-${timestamp}.json`);
 
-  // Token file path - also in .claudish directory
-  const tokenFilePath = join(claudishDir, `tokens-${port}.json`);
+  // The file the proxy's TokenTracker writes: one a parent ASSIGNED (a team slot's or
+  // channel session's own CLAUDISH_TOKEN_FILE), else `tokens-<port>.json` in .claudish.
+  // An enclosing claudish session's PUBLISHED file (inherited by a claudish run from its
+  // Bash tool) is not an assignment — see assignedTokenFile. Resolved by the same
+  // function as the tracker and the summary, so the status line can never be pointed at
+  // a file the tracker does not write.
+  const assignedFile = assignedTokenFile(process.env) !== null;
+  const tokenFilePath = resolveTokenFilePath(port);
 
   // Sweep the orphans FIRST (so this session's fresh file is never a candidate),
   // then blank the file for the port we are about to use. Without this the
   // status line can show a dead session's provider, cost and context — the file
-  // is keyed by port, and ports are recycled.
+  // is keyed by port, and ports are recycled. An assigned file is the parent's to
+  // read, unique to this child, so it is left for the tracker to create: a blank
+  // record would read as "answered with zero tokens".
   cleanupStaleTokenFiles(claudishDir);
-  initializeTokenFile(tokenFilePath);
+  if (!assignedFile) initializeTokenFile(tokenFilePath);
 
   let statusCommand: string;
 
@@ -935,7 +955,7 @@ export function createTempSettingsFile(
     //         silently dropped provider_name and model_name too. (macOS BSD grep
     //         exits 0, which is why it was invisible locally.)
     //      2. Only newlines are stripped, never spaces. `tr -d ' '` mangled every
-    //         value containing one — "Qwen Plan" rendered as "QwenPlan". The patterns
+    //         value containing one — "Alibaba Token Plan" rendered as "QwenPlan". The patterns
     //         instead tolerate optional whitespace after each colon, so a
     //         pretty-printed token file still parses.
     //      3. The "unknown" sentinel keeps working: an unmatched numeric field leaves
@@ -959,8 +979,8 @@ export function createTempSettingsFile(
     // The CHAINED segment deliberately drops the model name that
     // segmentWithDir shows. It is appended to the user's OWN status line, which
     // already renders the model — printing it again produced
-    // "… qc@qwen3.8-max … • qc@qwen3.8-max • $0.000 • N/A". The provider
-    // ("Qwen Plan") is the part the user's line cannot know, so it takes the
+    // "… qtoken@qwen3.8-max … • qtoken@qwen3.8-max • $0.000 • N/A". The provider
+    // ("Alibaba Token Plan") is the part the user's line cannot know, so it takes the
     // slot instead. When the token file hasn't reported one yet (a fresh
     // session, before the first response), the field is omitted ENTIRELY rather
     // than falling back to the model name or emitting an empty segment with a
@@ -999,6 +1019,33 @@ export function createTempSettingsFile(
 }
 
 /**
+ * Delete, from the environment built for Claude Code, the inherited variables that
+ * must not reach it. Called right after that environment is assembled.
+ *
+ * Interactive launches lose every `STRIPPED_CHILD_VARS` key. `CLAUDE_CODE_CHILD_SESSION`
+ * is set by Claude Code for its Bash-tool children; a claudish started from one (a
+ * user in a tool shell, a `team --grid` pane, an MCP pane) passed it on, and an
+ * interactive Claude Code that inherits it prints "Transcript saving is off" and
+ * writes no transcript. Only the magmux-wrap path stripped it before. Print mode is
+ * left as it was.
+ *
+ * Every launch loses the `CLAUDISH_PANE_*` markers (`PANE_MARKER_VARS`). They describe
+ * THIS claudish (an MCP pane child), not Claude Code; inherited, a claudish started
+ * from the slot's Bash tool would take itself for a pane child (re-apply a stale
+ * environment snapshot, refuse a prompt, lose its recovery surface). The markers stay
+ * in this process's own `process.env`, which `magmuxPaneCapability()` reads.
+ */
+export function scrubChildEnv(
+  env: Record<string, string | undefined>,
+  opts: { interactive: boolean }
+): void {
+  if (opts.interactive) {
+    for (const key of STRIPPED_CHILD_VARS) delete env[key];
+  }
+  for (const key of PANE_MARKER_VARS) delete env[key];
+}
+
+/**
  * Build the claudish `--settings` overlay object. This loads at the CLI-args precedence
  * tier, above the user/project/local settings files, so keys here override those three.
  *
@@ -1007,16 +1054,25 @@ export function createTempSettingsFile(
  *   via the placeholder ANTHROPIC_API_KEY, and a user/project/local
  *   `forceLoginMethod: "claudeai"` would block that at startup. In native-Anthropic /
  *   --monitor mode we leave it out so the user's real claude.ai subscription keeps working.
+ * - `skipDangerousModePermissionPrompt: true` is added ONLY in an MCP pane child
+ *   (`CLAUDISH_PANE_CHILD=1`). The pane runs `--dangerously-skip-permissions`, and its
+ *   one-time confirmation dialog defaults to "No, exit": nobody is at a headless pane to
+ *   answer it, so every slot would fail at boot. Verified to suppress the dialog at this
+ *   tier. Gated on the marker so no other launch changes.
  *
  * (The OS *managed* tier can't be overridden — that case aborts before we get here.)
  */
 export function buildClaudishSettingsOverlay(
   statusLine: { type: string; command: string; padding: number },
-  proxyAuthMode: boolean
+  proxyAuthMode: boolean,
+  paneChild: boolean = isPaneChild()
 ): Record<string, unknown> {
   const settings: Record<string, unknown> = { statusLine, disableClaudeAiConnectors: true };
   if (proxyAuthMode) {
     settings.forceLoginMethod = "console";
+  }
+  if (paneChild) {
+    settings.skipDangerousModePermissionPrompt = true;
   }
   return settings;
 }
@@ -1033,11 +1089,12 @@ export function buildClaudishSettingsOverlay(
  * Mutates: config.claudeArgs (removes --settings and path if found)
  * Mutates: tempSettingsPath file content (replaces with merged JSON)
  */
-function mergeUserSettingsIfPresent(
+export function mergeUserSettingsIfPresent(
   config: ClaudishConfig,
   tempSettingsPath: string,
   statusLine: { type: string; command: string; padding: number },
-  proxyAuthMode: boolean
+  proxyAuthMode: boolean,
+  paneChild: boolean = isPaneChild()
 ): void {
   const idx = config.claudeArgs.indexOf("--settings");
   if (idx === -1 || !config.claudeArgs[idx + 1]) {
@@ -1069,6 +1126,12 @@ function mergeUserSettingsIfPresent(
     // own --settings explicitly sets forceLoginMethod, in which case respect their choice.
     if (proxyAuthMode && !("forceLoginMethod" in userSettings)) {
       userSettings.forceLoginMethod = "console";
+    }
+
+    // In an MCP pane child, suppress the dangerous-mode confirmation (see
+    // buildClaudishSettingsOverlay) unless the caller's --settings decides it.
+    if (paneChild && !("skipDangerousModePermissionPrompt" in userSettings)) {
+      userSettings.skipDangerousModePermissionPrompt = true;
     }
 
     // Overwrite the temp settings file with the merged result
@@ -1671,12 +1734,35 @@ export async function runClaudeWithProxy(
     // of guessing a path, and can tell that the session is proxied (and therefore
     // that Anthropic plan/rate-limit numbers describe the wrong account).
     [ENV.CLAUDISH_TOKEN_FILE]: tokenFilePath,
+    // ...and marked as published, so a claudish started from this session's Bash tool
+    // keeps a file of its own instead of writing into ours (assignedTokenFile).
+    [ENV.CLAUDISH_PUBLISHED_TOKEN_FILE]: tokenFilePath,
     // Turn on Claude Code's experimental advisor tool under --advisor. The value
     // is `"1"` and nothing else (see resolveAdvisorToolEnv), and this spread is
     // empty when the parent environment already carries one — the `...process.env`
     // above then forwards the user's value untouched.
     ...advisorToolEnv.vars,
   };
+  scrubChildEnv(env, { interactive: Boolean(config.interactive) });
+
+  // Can this launch put a recovery banner on screen at all? Asked HERE, before
+  // the child environment is finalised, because the answer gates the watchdog
+  // below — and asked through a side-effect-free function so asking is free and
+  // repeatable. `planMagmuxWrap` further down consumes the same predicate, so
+  // "may we wrap" and "may we amplify the client's retries" cannot drift.
+  const paneCapability = magmuxPaneCapability({
+    interactive: Boolean(config.interactive),
+    stdoutIsTty: Boolean(process.stdout.isTTY),
+  });
+
+  // The client half of "retry forever". Tier 1 holds one request for the
+  // derived deadline and then hands the retry back as a 503; how far recovery
+  // actually reaches is decided by Claude Code's willingness to re-ask, which
+  // this sets. The arithmetic, the accepted cost, the side effect on claudish's
+  // OTHER 503s and all three gates are stated at `retryWatchdogEnv()`; why a
+  // failed gate also REMOVES one a parent claudish exported is at
+  // `applyRetryWatchdog()`.
+  applyRetryWatchdog(env, { paneEligible: paneCapability.kind !== "none" });
 
   // Provider display name, best-effort and FREE. Only an explicit `provider@model`
   // spec names its provider without routing, and route() would touch credentials /
@@ -1724,7 +1810,7 @@ export async function runClaudeWithProxy(
   // summary nothing will ever resume. Both are billed on the ROUTED model, so a
   // three-slot `team` run pays for three of them.
   //
-  // Measured 2026-09-17, same prompt and model (`qc@qwen3.8-max`), counting
+  // Measured 2026-09-17, same prompt and model (`qtoken@qwen3.8-max`), counting
   // upstream responses in the session log:
   //
   //   suppressed : 1 upstream request
@@ -2001,11 +2087,84 @@ export async function runClaudeWithProxy(
         ? ["inherit", "inherit", "pipe"]
         : "inherit";
 
-  const proc = spawn(spawnCommand, claudeArgs, {
-    env,
-    stdio,
-    shell: needsShell,
-  });
+  // Wrap the spawn in a magmux pane when — and ONLY when — the session is
+  // interactive, stdout is a real TTY, and the binary resolves. That is the
+  // whole gate: `-p`, `--stdin`, `serve`, the MCP server and the `team --grid`
+  // panes take the untouched path below, and a machine without magmux launches
+  // exactly as it did before this feature existed.
+  //
+  // The pane is what earns claudish the right to WAIT on a network fault
+  // instead of killing the turn: it is the only surface claudish owns during
+  // an interactive session, and a retryable status is only honest while the
+  // reason is legible somewhere.
+  //
+  // `recoverySurfaceAllowed()` is the user's half of the gate — BOTH switches,
+  // each flag > env > project > global > true. It decides whether claudish may
+  // own a SURFACE; it never decides whether a retry happens. Off means no pane,
+  // therefore no lease, therefore an inline error at exhaustion — which is the
+  // 503-vs-400 decision made structurally rather than by a second predicate
+  // somewhere else.
+  //
+  // It must ask `resolveRecoveryEnabled()` too, and asking only the UI switch
+  // here was a shipped defect: `--no-recovery` left the session wrapped in
+  // magmux — paying the scrollback, the +89 ms and the launcher script — for a
+  // pane that `shouldSkipTier1`'s `recovery-disabled` gate guarantees can never
+  // open. The reasoning is at `recoverySurfaceAllowed()`.
+  //
+  // `paneCapability` was resolved before the environment was finalised, and is
+  // re-used rather than re-derived: the watchdog above is exported on exactly
+  // the launches that reach `planMagmuxWrap` or the ambient branch below.
+  const wrap =
+    recoverySurfaceAllowed() && paneCapability.kind === "wrap"
+      ? planMagmuxWrap({
+          claudeBinary,
+          claudeArgs,
+          childEnv: env,
+          cwd: process.cwd(),
+          interactive: Boolean(config.interactive),
+          stdoutIsTty: Boolean(process.stdout.isTTY),
+          magmuxBinary: paneCapability.magmux,
+        })
+      : null;
+
+  const proc = wrap
+    ? spawn(wrap.command, wrap.args, { env: wrap.env, stdio, shell: false })
+    : spawn(spawnCommand, claudeArgs, {
+        env,
+        stdio,
+        shell: needsShell,
+      });
+
+  if (wrap) {
+    wrap.watch(proc);
+    // Hand the control socket to the proxy as an EXPLICIT input. It cannot be
+    // discovered: claudish is magmux's parent and `MAGMUX_SOCK` is exported
+    // downward only, so the `--id` path — fixed before magmux starts — is the
+    // only way the parent can ever know where to send `open_pane`.
+    installRecoveryUi(wrap.controlSocket);
+    wrap.onClaudeExit(() => {
+      // Claude Code is gone, so nothing can consume a recovery any more. Take
+      // the pane down at once rather than after its linger: `-w` waits for
+      // EVERY pane, so a lingering banner would hold the whole session open
+      // after the user had already quit.
+      void shutdownRecoveryUi();
+    });
+  } else if (recoverySurfaceAllowed() && paneCapability.kind === "ambient") {
+    // Already inside someone else's magmux — `team --grid --mode interactive`,
+    // or a user who launched claudish in a pane by hand. There is nothing to
+    // wrap, but there IS a multiplexer to ask for a pane, so the recovery UI
+    // installs against the ambient control socket. In a grid this runs in N
+    // processes at once; the cross-process `O_EXCL` lock decides which one
+    // serves the banner, and the losers still retry and still recover — they
+    // simply hold no lease and answer inline at exhaustion, which is exactly
+    // what "a retryable status only while the reason is legible" requires.
+    //
+    // The predicate is `magmuxPaneCapability()`'s, the same one the watchdog
+    // and the wrap above read. It used to be restated here as
+    // `config.interactive && process.env.MAGMUX_SOCK` — two statements of one
+    // rule, which `network-recovery.md` forbids because they drift.
+    installRecoveryUi(null);
+  }
 
   if (filterChildStderr && proc.stderr) {
     relayChildStderr(proc.stderr);
@@ -2057,12 +2216,25 @@ export async function runClaudeWithProxy(
   }>((resolve) => {
     proc.on("exit", (code, signal) => {
       setClaudeCodeRunning(false);
+      // Under the wrapper the process that just exited is MAGMUX, and magmux's
+      // status does not carry the pane's — measured: pane 0 exited 42 while
+      // magmux stayed alive waiting for a second pane. The pane's own exit is
+      // announced on the control socket, and that announcement is the
+      // authority for Claude Code's exit code. Falling back to magmux's is
+      // right for the case where magmux itself died first.
+      const paneExit = wrap?.paneExitCode() ?? null;
       resolve({
-        exitCode: signal ? 128 + (SIGNAL_EXIT_NUMBERS[signal] ?? 0) : (code ?? 1),
+        exitCode:
+          paneExit !== null
+            ? paneExit
+            : signal
+              ? 128 + (SIGNAL_EXIT_NUMBERS[signal] ?? 0)
+              : (code ?? 1),
         exitSignal: signal,
       });
     });
   });
+  wrap?.cleanup();
 
   // The only durable record of WHY the run ended. The always-on session log
   // carries proxy traffic, so a session that died before its first request left

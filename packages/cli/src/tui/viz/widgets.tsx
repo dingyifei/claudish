@@ -440,8 +440,18 @@ export function StackedBar({
 }
 
 /** A status chip: `label` and `bg` are the chip itself; `width` is the COLUMN it sits
- * in. See `badgePad` — the padding to `width` goes OUTSIDE the fill. */
-export type BadgeChip = { label: string; bg: ColorInput; width?: number };
+ * in. See `badgePad` — the padding to `width` goes OUTSIDE the fill.
+ *
+ * `fg` IS THE FOURTH ADDITIVE DEVIATION FROM THE SKILL'S SHIPPED FILE, and it exists
+ * because `pickInk` answers a DIFFERENT question from the one a chip we own is asking.
+ * `pickInk` picks the more legible of the two THEME inks, which is right for a fill
+ * whose colour it cannot predict; but a chip whose fill we chose owns BOTH sides, so
+ * its ink should be deterministic rather than a function of the user's palette.
+ * MEASURED on `#15803d`: dark mode picks white (5.02:1), light mode picks black
+ * (4.02:1) — the same chip, two inks, and the worse ratio on the page where a reader
+ * is most likely to be squinting. Omit `fg` and nothing changes; pass `C.ink` and the
+ * chip reads the same in both themes. */
+export type BadgeChip = { label: string; bg: ColorInput; width?: number; fg?: ColorInput };
 
 /**
  * Filler columns so a badge can hold a fixed-width COLUMN without growing its fill.
@@ -470,12 +480,13 @@ export function Badge({
   label,
   bg,
   width,
+  fg,
   style,
   ...layout
 }: WidgetLayout & BadgeChip & { style?: WidgetLayout }): ReactNode {
   return (
     <text flexShrink={0} {...layout} style={style}>
-      <span fg={pickInk(bg)} bg={bg} attributes={BOLD}>{` ${label} `}</span>
+      <span fg={fg ?? pickInk(bg)} bg={bg} attributes={BOLD}>{` ${label} `}</span>
       {badgePad(label, width)}
     </text>
   );
@@ -496,10 +507,10 @@ export function Badge({
  * `Badge`. The pair is spelled out twice rather than shared through a helper so each
  * form reads as one line of JSX; change one, change the other. No layout props: a
  * `<span>` is not a flex item, so its row's `<text>` owns the layout for both. */
-export function BadgeSpan({ label, bg, width }: BadgeChip): ReactNode {
+export function BadgeSpan({ label, bg, width, fg }: BadgeChip): ReactNode {
   return (
     <>
-      <span fg={pickInk(bg)} bg={bg} attributes={BOLD}>{` ${label} `}</span>
+      <span fg={fg ?? pickInk(bg)} bg={bg} attributes={BOLD}>{` ${label} `}</span>
       {badgePad(label, width)}
     </>
   );

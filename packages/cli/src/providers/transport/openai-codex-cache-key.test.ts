@@ -6,8 +6,12 @@
  * Every request also needs a fallback key, while explicit caller keys and the
  * existing model/auth payload transforms must continue to win where applicable.
  *
- * Hermetic: mock only credentials.getRequestAuth, matching the sibling OAuth
- * transport test, so no real credentials, filesystem, or network are touched.
+ * Hermetic: a fake `openai-codex` credential is registered on the REAL authority
+ * and delegates to `getRequestAuthMock`, matching the sibling OAuth transport
+ * test, so no real credentials, filesystem, or network are touched. The real
+ * credential is re-registered in afterAll. Never `mock.module()` the authority:
+ * Bun keeps that replacement for the rest of the process, and every later file
+ * that imports `credentials` got a fake with no `register`.
  * Both arms are modelled as the artifacts the real halves return (`arm` included);
  * the api-key half never throws, so nothing here pretends it does. See the sibling
  * file's header for why that distinction is load-bearing.
@@ -16,9 +20,12 @@
  * the afterEach clears it. See the sibling file's afterEach.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { credentials } from "../../auth/credentials/authority.js";
 import { clearSignedArm } from "../../auth/credentials/billing-probe.js";
+import type { CredentialProvider } from "../../auth/credentials/types.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
+import { OpenAICodexTransport } from "./openai-codex.js";
 
 const FAKE_TOKEN = "codex-oauth-token-abc";
 const FAKE_ACCOUNT = "acct-123";
@@ -53,13 +60,31 @@ const API_KEY_AUTH = {
 
 let getRequestAuthMock = mock(async (_name: string, _ctx: any) => CODEX_OAUTH_AUTH as any);
 
-mock.module("../../auth/credentials/authority.js", () => ({
-  credentials: {
-    getRequestAuth: (name: string, ctx: any) => getRequestAuthMock(name, ctx),
-  },
-}));
+// Registered under "openai-codex" ONLY; the authority consumes the name in its
+// registry lookup, so the fake passes it on. See the sibling file.
+const fakeCodexCredential: CredentialProvider = {
+  catalogName: "openai-codex",
+  isAvailable: async () => true,
+  describeReadiness: async () => ({ readiness: "present" }),
+  getRequestAuth: (ctx) => getRequestAuthMock("openai-codex", ctx),
+};
 
-const { OpenAICodexTransport } = await import("./openai-codex.js");
+let realCodexCredential: CredentialProvider | undefined;
+
+beforeAll(() => {
+  realCodexCredential = credentials.get("openai-codex");
+  if (!realCodexCredential) {
+    throw new Error("the authority has no openai-codex credential to restore after this file");
+  }
+  credentials.register(fakeCodexCredential, ["openai-codex"]);
+  credentials.invalidate("openai-codex");
+});
+
+afterAll(() => {
+  // Put the real credential back so no later file in the Bun run signs with the fake.
+  if (realCodexCredential) credentials.register(realCodexCredential, ["openai-codex"]);
+  credentials.invalidate("openai-codex");
+});
 
 const provider: RemoteProvider = {
   name: "openai-codex",

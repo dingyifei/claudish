@@ -46,7 +46,7 @@ import { getServedAntigravityModels, setupAntigravityUser } from "./antigravity-
 /**
  * Resolve a concrete CURRENT served model id for the success message, LIVE from
  * the backend (its `defaultAgentModelId`, e.g. gemini-3.6-flash-high) — no
- * hardcoded roster. Best-effort: any failure (no token, offline) → `<model>`.
+ * hardcoded model list. Best-effort: any failure (no token, offline) → `<model>`.
  */
 async function defaultSuggestModel(): Promise<string> {
   try {

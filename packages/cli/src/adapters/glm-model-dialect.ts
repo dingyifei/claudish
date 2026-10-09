@@ -31,7 +31,7 @@ export class GLMModelDialect extends BaseAPIFormat {
    * `zai@` both serve Z.AI GLM models; they differ in the WIRE, not the vendor.
    *
    * Not called on the Anthropic wire, which is `zai@` (z-ai →
-   * anthropicCompatProfile, /api/anthropic/v1/messages) and `qc@glm-5.2` (Qwen
+   * anthropicCompatProfile, /api/anthropic/v1/messages) and `qtoken@glm-5.2` (Qwen
    * Plan, also anthropicCompatProfile, serves GLM alongside Qwen). There
    * BaseAPIFormat.applyAnthropicWireReasoning() takes over.
    *
@@ -55,7 +55,13 @@ export class GLMModelDialect extends BaseAPIFormat {
     const reasoning = this.lookupReasoningCapability();
 
     if (effort && this.acceptsThinkingToggle(reasoning)) {
-      if (effort === "none" || effort === "minimal") {
+      // `meansReasoningOff`, not `effort === "none" || effort === "minimal"`.
+      // The catalog publishes `mandatory: true` for glm-5.3 and glm-5.3-flash,
+      // and Z.AI answers a `disabled` on those with `400 code 1210 "This model
+      // always engages in thinking and cannot be disabled"`. v10.0.1 stopped the
+      // PROBE asking for it; this is the same fault on the request path every
+      // `glm@` and `glm-coding@` turn takes.
+      if (this.meansReasoningOff(effort, reasoning)) {
         request.thinking = { type: "disabled" };
         // Never leave a depth knob contradicting the off-switch.
         if (request.reasoning_effort !== undefined) delete request.reasoning_effort;

@@ -216,3 +216,128 @@ describe("formatOtlpBatch", () => {
     expect(result.resourceLogs).toEqual([]);
   });
 });
+
+/**
+ * THE GUARD FOR THE ONE SILENT FAILURE IN `stats-otlp.ts`.
+ *
+ * `eventToLogRecord` is a hand-written attribute allowlist. A field added to
+ * `StatsEvent` and populated by `stats.ts` but NOT pushed there is typed,
+ * type-checked, buffered and written to `~/.claudish/stats-buffer.json` — and
+ * never leaves the machine. Nothing throws. The field is simply missing from
+ * every dashboard built to read it, and the loss is discovered a quarter later,
+ * when someone asks a question the data cannot answer.
+ *
+ * Two layers, and the first is the durable one:
+ *
+ *  1. `satisfies Record<OptionalStatsKey, …>` makes the table below EXHAUSTIVE
+ *     over `StatsEvent`'s optional fields AT COMPILE TIME. Add an optional field
+ *     to the interface and this file stops compiling until it is listed here.
+ *  2. The table then drives emit-when-set and omit-when-unset for every entry,
+ *     so listing a field without pushing it in `eventToLogRecord` is red.
+ *
+ * Together, a new optional field cannot reach `main` without its push. Layer 1
+ * is what stops this from being a checklist someone has to remember to read.
+ */
+type OptionalStatsKey = {
+  [K in keyof StatsEvent]-?: undefined extends StatsEvent[K] ? K : never;
+}[keyof StatsEvent];
+
+const OPTIONAL_WIRE = {
+  error_class: {
+    attribute: "llm.error_class",
+    sample: "network",
+    value: { stringValue: "network" },
+  },
+  error_code: {
+    attribute: "llm.error_code",
+    sample: "ECONNREFUSED",
+    value: { stringValue: "ECONNREFUSED" },
+  },
+  fallback_chain: {
+    attribute: "llm.fallback_chain",
+    sample: ["litellm", "openrouter"],
+    value: { arrayValue: { values: [{ stringValue: "litellm" }, { stringValue: "openrouter" }] } },
+  },
+  fallback_attempts: {
+    attribute: "llm.fallback_attempts",
+    sample: 2,
+    value: { intValue: "2" },
+  },
+  retry_attempts: {
+    attribute: "llm.retry_attempts",
+    sample: 5,
+    value: { intValue: "5" },
+  },
+  recovery_ms: {
+    attribute: "llm.recovery_ms",
+    sample: 201_900,
+    value: { intValue: "201900" },
+  },
+  recovery_episode_id: {
+    attribute: "llm.recovery_episode_id",
+    sample: "3f2b9c14-5d6e-4a71-9b0c-8e2d4f6a1b33",
+    value: { stringValue: "3f2b9c14-5d6e-4a71-9b0c-8e2d4f6a1b33" },
+  },
+  recovery_client_retry: {
+    attribute: "llm.recovery_client_retry",
+    sample: 3,
+    value: { intValue: "3" },
+  },
+  recovery_outcome: {
+    attribute: "llm.recovery_outcome",
+    sample: "handoff",
+    value: { stringValue: "handoff" },
+  },
+} satisfies Record<OptionalStatsKey, { attribute: string; sample: unknown; value: unknown }>;
+
+const OPTIONAL_ENTRIES = Object.entries(OPTIONAL_WIRE) as Array<
+  [OptionalStatsKey, { attribute: string; sample: unknown; value: unknown }]
+>;
+
+describe("eventToLogRecord — every optional field reaches the wire", () => {
+  for (const [field, spec] of OPTIONAL_ENTRIES) {
+    it(`emits ${spec.attribute} when ${field} is set`, () => {
+      const record = eventToLogRecord({ ...SAMPLE_EVENT, [field]: spec.sample } as StatsEvent);
+      const attr = record.attributes.find((a) => a.key === spec.attribute);
+      expect(attr).toBeDefined();
+      expect(attr?.value).toEqual(spec.value as any);
+    });
+
+    it(`omits ${spec.attribute} when ${field} is unset`, () => {
+      // Deleting rather than assigning undefined: `{ ...e, x: undefined }` leaves
+      // the KEY present, and the absent-key shape is the one production emits.
+      const bare = { ...SAMPLE_EVENT } as Record<string, unknown>;
+      delete bare[field];
+      const record = eventToLogRecord(bare as unknown as StatsEvent);
+      expect(record.attributes.some((a) => a.key === spec.attribute)).toBe(false);
+    });
+  }
+
+  it("emits retry_attempts: 0 — zero is a fact, not an absence", () => {
+    // The episode existed and this request added no re-issue to it. A truthiness
+    // guard (`if (event.retry_attempts)`) instead of `!== undefined` deletes this
+    // record's only evidence that recovery ran at all, and deletes it precisely
+    // on the requests that were handed off with no budget left.
+    const record = eventToLogRecord({
+      ...SAMPLE_EVENT,
+      retry_attempts: 0,
+      recovery_ms: 0,
+      recovery_client_retry: 0,
+      recovery_episode_id: "3f2b9c14-5d6e-4a71-9b0c-8e2d4f6a1b33",
+    });
+    expect(record.attributes.find((a) => a.key === "llm.retry_attempts")?.value).toEqual({
+      intValue: "0",
+    } as any);
+    expect(record.attributes.find((a) => a.key === "llm.recovery_client_retry")?.value).toEqual({
+      intValue: "0",
+    } as any);
+  });
+
+  it("a healthy request carries no recovery attributes at all", () => {
+    // The other half of NFR-1: a machine that never loses its network sends the
+    // same bytes it sent before this feature existed.
+    const keys = eventToLogRecord(SAMPLE_EVENT).attributes.map((a) => a.key);
+    expect(keys.filter((k) => k.startsWith("llm.recovery_"))).toEqual([]);
+    expect(keys).not.toContain("llm.retry_attempts");
+  });
+});

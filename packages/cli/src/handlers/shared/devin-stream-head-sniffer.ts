@@ -31,10 +31,10 @@
  * carries information the user needs (an unserved uid, a revoked entitlement),
  * so it is surfaced as an HTTP **400 `invalid_request_error`** — a status Claude
  * Code renders verbatim and inline — rather than buried under "API error ·
- * Retrying · attempt N/10". Retryable-after-our-own-retries becomes **503**,
- * which is safe specifically because `fallback-handler.isRetryableError` does
- * NOT list 503: it cannot silently switch the user off a pinned model, and it
- * reaches Claude Code, which runs its own retry loop.
+ * Retrying · attempt N/10". Retryable-after-our-own-retries becomes **503**.
+ * For a pinned `dv@` spec that reaches Claude Code, which runs its own retry
+ * loop; inside a bare-name chain `fallback-handler.isRetryableError` advances on
+ * it to the next candidate.
  *
  * `permission_denied` deserves a note. It was caused, in every reproduction
  * during protocol work, SOLELY by encoding a message with the wrong role enum

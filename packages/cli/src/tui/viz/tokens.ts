@@ -5,10 +5,11 @@
  * deliberate deviations from the shipped file. Everything else — the token NAMES, the
  * `Ramp` type and its non-empty bound, the ramp STRUCTURE (an explicit midtone stop so
  * `blendStops` never desaturates through the middle) — is unchanged. `color.ts` and
- * `text.ts` beside it are byte-identical copies; `widgets.tsx` carries three ADDITIVE
+ * `text.ts` beside it are byte-identical copies; `widgets.tsx` carries four ADDITIVE
  * changes, each documented at its own definition and none altering shipped behaviour:
- * `Panel`'s `flush` prop, and the `<span>` twins `MeterSpan` / `SparklineSpan` (with
- * `sparkGlyphs` extracted so the twin cannot drift from `Sparkline`). The twins exist for
+ * `Panel`'s `flush` prop, the `<span>` twins `MeterSpan` / `SparklineSpan` (with
+ * `sparkGlyphs` extracted so the twin cannot drift from `Sparkline`), and `BadgeChip`'s
+ * optional `fg`, for a chip whose fill WE chose and whose ink is therefore ours too. The twins exist for
  * the reason the file already gives for `BadgeSpan` — a `<text>` cannot nest in a `<text>`,
  * so every ONE-`<text>` widget is un-composable in a mixed row, and the alternative, flex
  * `<text>` siblings, is the arrangement Yoga silently shrinks. Never scatter hex

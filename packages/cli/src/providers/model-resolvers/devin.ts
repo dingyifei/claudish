@@ -15,7 +15,7 @@
  *
  * ## The three rules, and the measurements behind them
  *
- * Measured against a real captured roster (see the session's `evidence.md`):
+ * Measured against a real captured dynamic models catalog (see the session's `evidence.md`):
  *
  * 1. **Group by `model_family_label` x `contextWindow`.** Not by uid spelling:
  *    `-1m` appears on 7 uids while 97 natively-1M uids carry no suffix at all,
@@ -52,13 +52,13 @@ import type { DevinModelConfig } from "../devin/devin-models.js";
 import type {
   ExpandContext,
   ModelChoice,
+  ModelsCatalogEntry,
+  ModelsCatalogVariant,
   ProviderModelResolver,
-  RosterEntry,
-  RosterVariant,
 } from "./types.js";
 import { groupKeyOf, nonEmpty } from "./types.js";
 
-/** Axis keys Devin uses for the reasoning knob. Both appear in the live roster. */
+/** Axis keys Devin uses for the reasoning knob. Both appear in the dynamic models catalog. */
 const EFFORT_AXIS_KEYS = ["effort", "reasoning effort"];
 
 /** Axis key marking a speed premium. Its flag covers `-fast` AND `-priority`. */
@@ -110,7 +110,7 @@ export function devinHasSpeedPremium(config: DevinModelConfig): boolean {
  * Does this string NAME a reasoning tier?
  *
  * Deliberately about the SPELLING of what the user asked for, not about what
- * the roster says the uid is — it answers a question about intent. Typing
+ * the dynamic models catalog says the uid is — it answers a question about intent. Typing
  * `claude-opus-5-xhigh` names a tier and must be honoured verbatim even at
  * effort `low`. Typing `glm-5-2-1m` names a *context* variant and leaves the
  * tier open, so it resolves against the effort of the turn — which is exactly
@@ -135,8 +135,8 @@ function modifiersOf(config: DevinModelConfig): string[] {
   return devinHasSpeedPremium(config) ? ["premium"] : [];
 }
 
-/** Normalise a Devin roster row into the seam's provider-neutral shape. */
-export function devinRosterEntry(config: DevinModelConfig): RosterEntry {
+/** Normalise a Devin dynamic models catalog row into the seam's provider-neutral shape. */
+export function devinModelsCatalogEntry(config: DevinModelConfig): ModelsCatalogEntry {
   return {
     wireId: config.uid,
     displayName: config.displayName,
@@ -152,8 +152,8 @@ export function devinRosterEntry(config: DevinModelConfig): RosterEntry {
   };
 }
 
-/** Rebuild the Devin-shaped view a rule needs from a neutral roster entry. */
-function asConfig(entry: RosterEntry): DevinModelConfig {
+/** Rebuild the Devin-shaped view a rule needs from a neutral `ModelsCatalogEntry`. */
+function asConfig(entry: ModelsCatalogEntry): DevinModelConfig {
   return {
     uid: entry.wireId,
     displayName: entry.displayName ?? entry.wireId,
@@ -172,10 +172,10 @@ function asConfig(entry: RosterEntry): DevinModelConfig {
 /**
  * Order candidates for the default-of-last-resort: cheapest band, then cheapest
  * multiplier, then shortest id. Every tie is broken, so the answer is stable
- * across roster reorderings — a picker whose default moves between runs reads
- * as a bug even when both answers are defensible.
+ * across reorderings of the dynamic models catalog — a picker whose default
+ * moves between runs reads as a bug even when both answers are defensible.
  */
-function byCost(a: RosterEntry, b: RosterEntry): number {
+function byCost(a: ModelsCatalogEntry, b: ModelsCatalogEntry): number {
   const tier = (a.costTier ?? Number.MAX_SAFE_INTEGER) - (b.costTier ?? Number.MAX_SAFE_INTEGER);
   if (tier !== 0) return tier;
   const cost =
@@ -204,7 +204,7 @@ function byCost(a: RosterEntry, b: RosterEntry): number {
  * whose every member is premium, must still resolve to something — dropping it
  * from the picker would be worse than an imperfect representative.
  */
-function defaultOf(group: RosterEntry[]): RosterEntry {
+function defaultOf(group: ModelsCatalogEntry[]): ModelsCatalogEntry {
   const declared = group.find((entry) => entry.isFamilyDefault);
   if (declared) return declared;
   const plain = group.filter((entry) => !devinHasSpeedPremium(asConfig(entry)));
@@ -214,7 +214,7 @@ function defaultOf(group: RosterEntry[]): RosterEntry {
 }
 
 /** Group key: the vendor's row label, then the window — the two facts D1 rests on. */
-function keyOf(entry: RosterEntry): string {
+function keyOf(entry: ModelsCatalogEntry): string {
   return `${groupKeyOf(entry)} ${entry.contextWindow ?? 0}`;
 }
 
@@ -228,9 +228,9 @@ function formatWindow(tokens: number): string {
 export class DevinModelResolver implements ProviderModelResolver {
   readonly provider = "devin";
 
-  collapse(roster: RosterEntry[]): ModelChoice[] {
-    const groups = new Map<string, RosterEntry[]>();
-    for (const entry of roster) {
+  collapse(modelsCatalog: ModelsCatalogEntry[]): ModelChoice[] {
+    const groups = new Map<string, ModelsCatalogEntry[]>();
+    for (const entry of modelsCatalog) {
       const key = keyOf(entry);
       const bucket = groups.get(key);
       if (bucket) bucket.push(entry);
@@ -241,7 +241,7 @@ export class DevinModelResolver implements ProviderModelResolver {
     // be distinguishable; a label with only one row does not, and adding it
     // there would be noise on 36 of 39 families.
     const windowsPerLabel = new Map<string, Set<number>>();
-    for (const entry of roster) {
+    for (const entry of modelsCatalog) {
       const label = groupKeyOf(entry);
       const seen = windowsPerLabel.get(label) ?? new Set<number>();
       seen.add(entry.contextWindow ?? 0);
@@ -255,7 +255,7 @@ export class DevinModelResolver implements ProviderModelResolver {
       const ambiguous = (windowsPerLabel.get(label)?.size ?? 1) > 1;
       const window = chosen.contextWindow ?? 0;
 
-      const variants: RosterVariant[] = group.map((entry) => {
+      const variants: ModelsCatalogVariant[] = group.map((entry) => {
         const config = asConfig(entry);
         return {
           wireId: entry.wireId,
@@ -291,15 +291,15 @@ export class DevinModelResolver implements ProviderModelResolver {
    * 3. **A uid prefix** resolves only while every match sits in ONE group. When
    *    it spans several it is under-specified, not unknown, and falls to rule 4.
    * 4. **No usable match** passes through unchanged so the backend can answer.
-   *    The served-set-aware error rewrite turns that into a message naming what
-   *    IS served; guessing here would hide it.
+   *    The error rewrite checks the dynamic models catalog and turns that into a
+   *    message naming what IS served; guessing here would hide it.
    */
-  expand(selection: string, roster: RosterEntry[], ctx: ExpandContext): string {
+  expand(selection: string, modelsCatalog: ModelsCatalogEntry[], ctx: ExpandContext): string {
     const requested = selection.trim();
-    if (!requested || roster.length === 0) return requested || selection;
+    if (!requested || modelsCatalog.length === 0) return requested || selection;
 
-    const groups = new Map<string, RosterEntry[]>();
-    for (const entry of roster) {
+    const groups = new Map<string, ModelsCatalogEntry[]>();
+    for (const entry of modelsCatalog) {
       const key = keyOf(entry);
       const bucket = groups.get(key);
       if (bucket) bucket.push(entry);
@@ -307,7 +307,7 @@ export class DevinModelResolver implements ProviderModelResolver {
     }
 
     const lower = requested.toLowerCase();
-    const exact = roster.find((entry) => entry.wireId.toLowerCase() === lower);
+    const exact = modelsCatalog.find((entry) => entry.wireId.toLowerCase() === lower);
     if (exact) {
       if (!ctx.effort) return exact.wireId;
       const group = groups.get(keyOf(exact))!;
@@ -322,7 +322,7 @@ export class DevinModelResolver implements ProviderModelResolver {
 
     // 2. An exact vendor label or family id. Unambiguous by construction — it
     //    names one model, even when that model spans two context groups.
-    const named = roster.filter((entry) => {
+    const named = modelsCatalog.filter((entry) => {
       const label = nonEmpty(entry.groupLabel)?.toLowerCase();
       const family = nonEmpty(entry.family)?.toLowerCase();
       return label === lower || family === lower;
@@ -333,18 +333,19 @@ export class DevinModelResolver implements ProviderModelResolver {
     //    picking one would be a ×35-vs-×6 guess dressed up as a resolution, so
     //    it falls through to rule 4 instead. This is rule 3 of the doc comment
     //    applied to a request that is under-specified rather than unknown: the
-    //    backend's served-set error names the candidates, and we do not.
+    //    backend's error, rewritten against the dynamic models catalog, names the
+    //    candidates, and we do not.
     const pool =
       named.length > 0
         ? named
-        : roster.filter((entry) => entry.wireId.toLowerCase().startsWith(`${lower}-`));
+        : modelsCatalog.filter((entry) => entry.wireId.toLowerCase().startsWith(`${lower}-`));
     if (pool.length === 0) return requested;
     if (named.length === 0 && new Set(pool.map(keyOf)).size > 1) return requested;
 
     // One label, possibly several context groups (GLM-5.2 is 200K and 1M): take
     // the group the vendor itself defaults to, else the cheapest. Sorted, not
     // first-match — `byCost` breaks every tie, so the answer cannot depend on
-    // the order the roster happened to arrive in.
+    // the order the dynamic models catalog happened to arrive in.
     const chosen =
       pool.filter((entry) => entry.isFamilyDefault).sort(byCost)[0] ?? pool.slice().sort(byCost)[0];
     return pickForEffort(groups.get(keyOf(chosen!))!, ctx.effort).wireId;
@@ -358,7 +359,10 @@ export class DevinModelResolver implements ProviderModelResolver {
  * model is the worse failure. Premium variants are excluded entirely — they
  * cost ~2x and are reachable only by naming their uid.
  */
-function pickForEffort(group: RosterEntry[], effort: EffortLevel | undefined): RosterEntry {
+function pickForEffort(
+  group: ModelsCatalogEntry[],
+  effort: EffortLevel | undefined
+): ModelsCatalogEntry {
   if (!effort) return defaultOf(group);
 
   const plain = group.filter((entry) => !devinHasSpeedPremium(asConfig(entry)));
@@ -366,7 +370,9 @@ function pickForEffort(group: RosterEntry[], effort: EffortLevel | undefined): R
 
   const tiered = pool
     .map((entry) => ({ entry, effort: devinEffortOf(asConfig(entry)) }))
-    .filter((row): row is { entry: RosterEntry; effort: EffortLevel } => row.effort !== undefined);
+    .filter(
+      (row): row is { entry: ModelsCatalogEntry; effort: EffortLevel } => row.effort !== undefined
+    );
   if (tiered.length === 0) return defaultOf(group);
 
   const target = EFFORT_LEVELS.indexOf(effort);
@@ -383,7 +389,7 @@ function pickForEffort(group: RosterEntry[], effort: EffortLevel | undefined): R
     // Real case — Claude Opus 4.6 declares `Effort=High` on both its plain and
     // its `-thinking` uid, which differ only in `Thinking` and in price (×6 vs
     // ×8). Falling back to first-encountered made the answer depend on the
-    // order the roster arrived in, across 21 (label, effort) pairs and three
+    // order the dynamic models catalog arrived in, across 21 (label, effort) pairs and three
     // families, for swings up to 50%.
     const defaultA = a.entry.isFamilyDefault ? 0 : 1;
     const defaultB = b.entry.isFamilyDefault ? 0 : 1;

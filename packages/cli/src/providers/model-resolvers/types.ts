@@ -1,10 +1,10 @@
 /**
- * ProviderModelResolver — per-provider collapse/expand between a raw roster and
- * the rows a human picks.
+ * ProviderModelResolver — per-provider collapse/expand between a raw dynamic
+ * models catalog and the rows a human picks.
  *
  * ## Why this exists
  *
- * A provider's live roster is not always the list a human wants to choose from.
+ * A provider's dynamic models catalog is not always the list a human wants to choose from.
  * Devin is the motivating case: it encodes reasoning tier, speed modifier, and
  * context window in the model *uid* rather than in request parameters, so its
  * 170 served uids are really ~33 models with knobs on them. Listing all 170 is
@@ -21,17 +21,17 @@
  *
  * ## Scope
  *
- * This is deliberately NOT the same seam as `ModelCatalogResolver`
- * (`providers/catalog-resolvers/`). That one answers "what vendor prefix does
- * this aggregator want?" — a naming question about a model the user already
- * chose. This one answers "which of the provider's wire ids IS this choice,
- * right now, at this effort?" — a selection question. They compose: a catalog
- * resolver can feed a model id that a model resolver then expands.
+ * This is deliberately NOT the catalog's wire-id lookup (`resolveExternalId`,
+ * `providers/catalog-client.ts`). That one answers "which id does the cloud models
+ * catalog publish for this provider?" — a naming question about a model the user
+ * already chose. This one answers "which of the provider's wire ids IS this
+ * choice, right now, at this effort?" — a selection question. They compose: the
+ * catalog lookup can feed a model id that a model resolver then expands.
  *
  * ## Default is identity
  *
  * `getModelResolver()` returns undefined for every provider that has not opted
- * in, and callers treat that as 1 row per roster entry with `expand` returning
+ * in, and callers treat that as 1 row per `ModelsCatalogEntry` with `expand` returning
  * the selection unchanged. Adding this seam therefore changes nothing for a
  * provider that does not implement it.
  */
@@ -39,7 +39,7 @@
 import type { EffortLevel } from "../../adapters/base-api-format.js";
 
 /**
- * A knob the provider DECLARES for one roster entry, with the value that entry
+ * A knob the provider DECLARES for one `ModelsCatalogEntry`, with the value that entry
  * sits at.
  *
  * The point of carrying this is that a provider which states what each variant
@@ -48,7 +48,7 @@ import type { EffortLevel } from "../../adapters/base-api-format.js";
  * than parsing `-xhigh` off the end of the id, and it survives a vendor adding
  * a level whose spelling we never anticipated.
  */
-export interface RosterAxis {
+export interface ModelsCatalogAxis {
   /** The provider's own name for the knob (`Effort`, `1M Context`, `Fast Mode`). */
   key: string;
   /** The value THIS entry sits at (`XHigh`, `Max`, `No Thinking`). */
@@ -57,7 +57,7 @@ export interface RosterAxis {
   enabled: boolean;
 }
 
-/** A time-boxed or plan-included price on one roster entry. */
+/** A time-boxed or plan-included price on one `ModelsCatalogEntry`. */
 export interface ModelOffer {
   /**
    * - `promo` — a temporary price the vendor is advertising. ALWAYS carries an
@@ -71,14 +71,14 @@ export interface ModelOffer {
 }
 
 /**
- * One roster entry, exactly as the provider reports it.
+ * One entry of a dynamic models catalog, exactly as the provider reports it.
  *
  * Every field beyond `wireId` is optional because providers report wildly
  * different amounts: Ollama's `/api/tags` gives a name and little else, while
  * Devin publishes a label, a cost multiplier, a default flag, and the list of
  * knobs each model exposes.
  */
-export interface RosterEntry {
+export interface ModelsCatalogEntry {
   /** Exactly what goes in the request's model field. The only required fact. */
   wireId: string;
   displayName?: string;
@@ -100,12 +100,12 @@ export interface RosterEntry {
   /** The vendor marks this entry as recommended. */
   isRecommended?: boolean;
   /** The knobs the vendor says this entry exposes, in the vendor's own words. */
-  axes?: RosterAxis[];
+  axes?: ModelsCatalogAxis[];
   offer?: ModelOffer;
 }
 
 /** One wire id a {@link ModelChoice} can resolve to. */
-export interface RosterVariant {
+export interface ModelsCatalogVariant {
   wireId: string;
   /** The reasoning level this variant represents, when it maps to one. */
   effort?: EffortLevel;
@@ -130,7 +130,7 @@ export interface ModelChoice {
   displayName: string;
   contextWindow?: number;
   /** Every wire id this choice can expand into, including `id` itself. */
-  variants: RosterVariant[];
+  variants: ModelsCatalogVariant[];
   /** Cost at the default variant. */
   costFactor?: number;
   offer?: ModelOffer;
@@ -149,13 +149,13 @@ export interface ProviderModelResolver {
   readonly provider: string;
 
   /**
-   * Raw roster -> the rows a human chooses from.
+   * Raw dynamic models catalog -> the rows a human chooses from.
    *
    * Must be pure and total: any entry it cannot interpret still has to reach
    * the user somehow, because a model silently missing from the picker is
    * indistinguishable from a model the subscription does not serve.
    */
-  collapse(roster: RosterEntry[]): ModelChoice[];
+  collapse(modelsCatalog: ModelsCatalogEntry[]): ModelChoice[];
 
   /**
    * A chosen id + runtime signals -> the wire id to send.
@@ -164,23 +164,23 @@ export interface ProviderModelResolver {
    * backend can answer for itself. Guessing here would replace an actionable
    * "that model is not served, here is what is" with a silent substitution.
    */
-  expand(selection: string, roster: RosterEntry[], ctx: ExpandContext): string;
+  expand(selection: string, modelsCatalog: ModelsCatalogEntry[], ctx: ExpandContext): string;
 }
 
 /**
  * A non-empty string, or undefined.
  *
  * Providers report absent fields as `""` as often as they omit them, and `??`
- * does not catch the empty string — a real bug found while grouping the Devin
- * roster, where six entries with `family: ""` collapsed into one bogus group.
+ * does not catch the empty string — a real bug found while grouping Devin's
+ * dynamic models catalog, where six entries with `family: ""` collapsed into one bogus group.
  */
 export function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
-/** The label to group a roster entry under: vendor label, else family, else its own id. */
-export function groupKeyOf(entry: RosterEntry): string {
+/** The label to group an entry under: vendor label, else family, else its own id. */
+export function groupKeyOf(entry: ModelsCatalogEntry): string {
   return nonEmpty(entry.groupLabel) ?? nonEmpty(entry.family) ?? entry.wireId;
 }
 

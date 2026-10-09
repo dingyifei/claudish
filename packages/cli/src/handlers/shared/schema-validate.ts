@@ -257,7 +257,7 @@ export function applySchemaDefaults(
 /**
  * Names a model reaches for when it does not use the one the schema declares.
  *
- * This is a synonym vocabulary, not a roster in CLAUDE.md's sense: it is not
+ * This is a synonym vocabulary, not a hardcoded list in CLAUDE.md's sense: it is not
  * per-user, not per-account, not time-varying, and it names no tool and no
  * agent. Every entry RENAMES A VALUE THE MODEL SUPPLIED; none invents one. The
  * gate in {@link renameToDeclaredKeys} is what makes that safe.

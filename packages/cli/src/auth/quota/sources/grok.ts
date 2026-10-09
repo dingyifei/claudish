@@ -16,7 +16,7 @@
  * `xai-grok-shell/src/extensions/billing.rs` module whose error prose names the
  * path), then confirmed live. It is genuinely authenticated: a deliberately
  * bogus token answers 401, so a 200 here is evidence about the credential and
- * not a public roster — the trap Alibaba's `coding-intl` list set.
+ * not a public list — the trap Alibaba's `coding-intl` list set.
  *
  * Full protocol write-up: `ai-docs/reports/grok-subscription/protocol-spec.md`.
  */

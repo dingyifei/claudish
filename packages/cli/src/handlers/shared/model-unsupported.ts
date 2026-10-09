@@ -49,8 +49,39 @@ const UNSUPPORTED_PHRASES = [
   "model not found",
   "model_not_found",
   "unknown model",
+  // Alibaba's wording, and it is NOT a typo on our side: the Token Plan and
+  // PAYG hosts answer an id their silo does not serve with a bare
+  // `400 Model not exist` (measured 2026-09-17; `qwen-alibaba.md` records the
+  // dead end it produced). It matched none of the phrases above — not "model
+  // not found", not "does not exist" — so the one hint claudish could give was
+  // "Request format may be incompatible with provider", which sends the reader
+  // to audit a payload that is fine.
+  //
+  // Recognised for the MESSAGE only. `FallbackHandler.isRetryableError` keeps
+  // its own 400 phrase list and deliberately does not carry this one, so the
+  // chain still stops on it rather than advancing.
+  "model not exist",
   "no such model",
 ] as const;
+
+/**
+ * "not supported" with a PARAMETER as its subject, which is a different fault.
+ *
+ * The phrase list above is matched anywhere in the body, and "not supported" is
+ * the loosest entry in it. Gemini answers a thinking level its model does not
+ * take with `400 "Thinking level MINIMAL is not supported for this model."`
+ * (measured 2026-09-19 on gemini-3.8-flash). The model is real, reachable and
+ * carried; only the one field is wrong. Matching it as model-unsupported told
+ * the reader to "Verify model name", which sends them to check a name that is
+ * already correct — the same wrong-direction failure the narrowness note above
+ * describes, one level down.
+ *
+ * Keyed on the SUBJECT, not the model: a capability sentence such as "tools are
+ * not supported for this model" is also excluded, and rightly so. The model
+ * exists there too; what fails is the request's shape.
+ */
+const PARAMETER_IS_UNSUPPORTED =
+  /\b(thinking[ _-]?(level|budget)|reasoning[ _-]?effort|effort|temperature|top[_ ]?[pk]|tool[_ ]?choice|tools?|function[ _-]?calling|parameter|argument|field|image[s]?|audio|video|streaming|stream|json[ _-]?mode|response[ _-]?format|system[ _-]?(prompt|instruction)s?)\b[^.]{0,60}?\b(is|are|was|were)?\s*not supported\b/;
 
 /**
  * True when this error body says the provider does not carry the requested
@@ -63,6 +94,7 @@ const UNSUPPORTED_PHRASES = [
  */
 export function hasModelUnsupportedWording(errorBody: string): boolean {
   const lower = (errorBody || "").toLowerCase();
+  if (PARAMETER_IS_UNSUPPORTED.test(lower)) return false;
   return UNSUPPORTED_PHRASES.some((phrase) => lower.includes(phrase));
 }
 
@@ -80,7 +112,7 @@ export function hasModelUnsupportedWording(errorBody: string): boolean {
  *        https://opencode.ai/workspace/<id>/go"}}
  *
  * The route is fine, the credential is fine, the model IS carried (it is in the
- * live roster, so the availability filter correctly kept the provider) — the
+ * dynamic models catalog, so the availability filter correctly kept the provider) — the
  * account simply has not opted into that region. claudish rendered it as
  * "Check API key / OAuth credentials.", sending the user to audit a working key
  * while the fix — a link — sat in the same sentence.

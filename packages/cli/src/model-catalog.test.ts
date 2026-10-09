@@ -1,3 +1,4 @@
+import { catalogRouteForProvider } from "./providers/catalog-route-bindings.js";
 /**
  * E2E tests for the model catalog and translation layer.
  *
@@ -25,13 +26,14 @@ import {
   lookupModelForProvider,
   searchCatalogModels,
 } from "./adapters/model-catalog.js";
+import { getEffectiveBaseUrl, getProviderByName } from "./providers/provider-definitions.js";
 
 const MINIMAX_API_KEY = process.env.MINIMAX_CODING_API_KEY || process.env.MINIMAX_API_KEY;
-const SKIP_REAL_API = !MINIMAX_API_KEY;
-// Choose the host by key type because PAYG and coding are separate credential silos.
-const MINIMAX_API_BASE = process.env.MINIMAX_CODING_API_KEY
-  ? "https://api.minimax.io/anthropic/v1/messages"
-  : "https://api.minimaxi.com/anthropic/v1/messages";
+const SKIP_REAL_API = process.env.CLAUDISH_SKIP_LIVE_E2E === "1" || !MINIMAX_API_KEY;
+const MINIMAX_PROVIDER = getProviderByName(
+  process.env.MINIMAX_CODING_API_KEY ? "minimax-coding" : "minimax"
+)!;
+const MINIMAX_API_BASE = `${getEffectiveBaseUrl(MINIMAX_PROVIDER)}${MINIMAX_PROVIDER.apiPath}`;
 
 // ─── Mock slim-cache seeding ─────────────────────────────────────────────────
 
@@ -46,58 +48,67 @@ beforeAll(() => {
     {
       modelId: "minimax-m2.7",
       aliases: ["MiniMax-M2.7", "minimax-m2-7"],
-      sources: {},
+
       contextWindow: 204_800,
       supportsVision: false,
     },
     {
       modelId: "minimax-m2.5",
       aliases: ["MiniMax-M2.5", "minimax-m2-5"],
-      sources: {},
+
       contextWindow: 204_800,
       supportsVision: false,
     },
     {
       modelId: "minimax-m1",
       aliases: [],
-      sources: {},
+
       contextWindow: 1_000_000,
       supportsVision: false,
     },
     {
       modelId: "minimax-01",
       aliases: [],
-      sources: {},
+
       contextWindow: 1_000_000,
       supportsVision: false,
     },
     {
       modelId: "grok-4",
       aliases: [],
-      sources: {},
+
       contextWindow: 256_000,
     },
     {
       modelId: "gpt-5.6-sol",
       aliases: [],
-      sources: {},
+
       contextWindow: 1_050_000,
       aggregators: [
         {
-          provider: "openai",
-          externalId: "gpt-5.6-sol",
+          sourceCollectorId: "test",
+          routeStatus: "mapped",
+          route: catalogRouteForProvider("openai"),
+          sourceProviderId: "openai",
+          externalModelId: "gpt-5.6-sol",
           confidence: "api_official",
           contextWindow: 1_050_000,
         },
         {
-          provider: "openai-codex",
-          externalId: "gpt-5.6-sol",
+          sourceCollectorId: "test",
+          routeStatus: "mapped",
+          route: catalogRouteForProvider("openai-codex"),
+          sourceProviderId: "openai-codex",
+          externalModelId: "gpt-5.6-sol",
           confidence: "api_official",
           contextWindow: 372_000,
         },
         {
-          provider: "openrouter",
-          externalId: "openai/gpt-5.6-sol",
+          sourceCollectorId: "test",
+          routeStatus: "mapped",
+          route: catalogRouteForProvider("openrouter"),
+          sourceProviderId: "openrouter",
+          externalModelId: "openai/gpt-5.6-sol",
           confidence: "gateway_official",
         },
       ],
@@ -105,76 +116,76 @@ beforeAll(() => {
     {
       modelId: "grok-4-fast",
       aliases: ["x-ai/grok-4-fast"],
-      sources: {},
+
       contextWindow: 2_000_000,
     },
     {
       modelId: "grok-3",
       aliases: [],
-      sources: {},
+
       contextWindow: 131_072,
     },
     {
       modelId: "glm-5",
       aliases: [],
-      sources: {},
+
       contextWindow: 204_800,
       supportsVision: true,
     },
     {
       modelId: "glm-4-long",
       aliases: [],
-      sources: {},
+
       contextWindow: 1_000_000,
     },
     {
       modelId: "glm-4v",
       aliases: [],
-      sources: {},
+
       contextWindow: 128_000,
       supportsVision: true,
     },
     {
       modelId: "glm-4-flash",
       aliases: [],
-      sources: {},
+
       contextWindow: 128_000,
       supportsVision: false,
     },
     {
       modelId: "glm-5-turbo",
       aliases: [],
-      sources: {},
+
       contextWindow: 202_752,
     },
     {
       modelId: "kimi-k3",
       aliases: ["moonshotai/kimi-k3", "k3"],
-      sources: {},
-      subscriptionPlans: ["kimi-coding", "opencode-zen-go"],
+
+      subscriptionPlanIds: ["kimi-coding", "opencode-zen-go"],
     },
     {
       modelId: "kimi-k3-256k",
       aliases: [],
-      sources: {},
+
       releaseDate: "2026-07-16",
     },
     {
       modelId: "kimi-k3-fast",
       aliases: [],
-      sources: {},
     },
     {
       modelId: "kimi-k2.6",
       aliases: [],
-      sources: {},
     },
   ];
 
   writeFileSync(
     mockCachePath,
     JSON.stringify({
-      version: 2,
+      catalogGenerationId: "test-generation",
+      plans: [],
+      version: 3,
       lastUpdated: new Date().toISOString(),
       entries,
       models: entries.map((e) => ({ id: e.modelId })),
@@ -304,8 +315,8 @@ describe("searchCatalogModels", () => {
     const withPlans = searchCatalogModels("kimi-k3", 10, mockCachePath);
     const withoutPlans = searchCatalogModels("kimi-k3-fast", 10, mockCachePath);
 
-    expect(withPlans[0]?.subscriptionPlans).toEqual(["kimi-coding", "opencode-zen-go"]);
-    expect(withoutPlans[0]?.subscriptionPlans).toEqual([]);
+    expect(withPlans[0]?.subscriptionPlanIds).toEqual(["kimi-coding", "opencode-zen-go"]);
+    expect(withoutPlans[0]?.subscriptionPlanIds).toEqual([]);
   });
 
   test("matches model ids case-insensitively", () => {

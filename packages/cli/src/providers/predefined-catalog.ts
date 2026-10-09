@@ -314,7 +314,7 @@ export const PREDEFINED_ENDPOINTS: readonly PredefinedEndpoint[] = [
     // service from the builtin `kimi` provider — `kimi@` / `moon@` /
     // `moonshot@` are that builtin's shortcuts and reach the international
     // Kimi endpoint on a different credential. Both can be configured at once;
-    // they do not share keys, rosters, or billing.
+    // they do not share keys, model lists, or billing.
     name: "moonshot-cn",
     displayName: "Moonshot AI (China)",
     baseUrl: "https://api.moonshot.cn",

@@ -92,10 +92,9 @@ Custom endpoints can be registered in `~/.claudish/config.json`. See [docs/setti
    # OR Gemini direct
    export GEMINI_API_KEY='...'
 
-   # OR Vertex AI (Express mode)
-   export VERTEX_API_KEY='...'
-
-   # OR Vertex AI (OAuth mode - uses gcloud ADC)
+   # OR Vertex AI (Application Default Credentials)
+   gcloud auth application-default login
+   # Optional - claudish otherwise uses the ADC quota project or `gcloud config get project`
    export VERTEX_PROJECT='your-gcp-project-id'
    ```
 

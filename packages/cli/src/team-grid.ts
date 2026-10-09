@@ -1,16 +1,13 @@
 import { spawn } from "node:child_process";
-import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { type Socket, connect as netConnect } from "node:net";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
-import { loadConfig, loadLocalConfig } from "./profile-config.js";
-import { parseModelSpec } from "./providers/model-parser.js";
+import { findMagmuxBinary } from "./launcher/magmux-binary.js";
 import {
-  buildRoutingChain,
-  loadRoutingRules,
-  matchRoutingRule,
+  type RouteExplanation,
+  describeRouteExplanation,
+  explainRoute,
 } from "./providers/routing-rules.js";
 import {
   type ModelStatus,
@@ -21,97 +18,60 @@ import {
 
 // ─── Routing Resolution ──────────────────────────────────────────────────────
 
-interface RouteInfo {
-  chain: string[]; // e.g. ["LiteLLM", "OpenRouter"]
-  source: string; // "direct", "project routing", "user routing", "auto"
-  sourceDetail?: string; // matched pattern for custom rules
+/**
+ * A pane's route line: the hops a request for the model would use, then where
+ * the chain came from, worded by `describeRouteExplanation` exactly as
+ * `--probe` and the config TUI word it. Pure over one `explainRoute` decision,
+ * the decision a pane's own `claudish --model` makes when it routes.
+ *
+ * This file used to match the rules itself: project then global, with a
+ * prefix/suffix test instead of the router's longest glob, and a last step that
+ * read a built-in table that no longer exists. It named rules the router did
+ * not pick and showed no chain at all for a model the catalog routes.
+ */
+export function paneRouteLine(explanation: RouteExplanation): string {
+  const origin = describeRouteExplanation(explanation);
+  if (explanation.outcome.kind === "no-route") {
+    return `no route — ${explanation.outcome.reason}  (${origin})`;
+  }
+  if (explanation.native) return `${explanation.native.displayName}  (${origin})`;
+  const hops = explanation.candidates
+    .filter((candidate) => candidate.outcome === "kept")
+    .map((candidate) => candidate.displayName);
+  return `${hops.join(" → ")}  (${origin})`;
 }
 
-function resolveRouteInfo(modelId: string): RouteInfo {
-  const parsed = parseModelSpec(modelId);
-
-  // Explicit provider prefix (e.g. or@model) — no fallback chain
-  if (parsed.isExplicitProvider) {
-    return { chain: [parsed.provider], source: "direct" };
-  }
-
-  // Check local (project-scope) routing rules first
-  const local = loadLocalConfig();
-  if (local?.routing && Object.keys(local.routing).length > 0) {
-    const matched = matchRoutingRule(parsed.model, local.routing);
-    if (matched) {
-      const routes = buildRoutingChain(matched, parsed.model);
-      const pattern = Object.keys(local.routing).find((k) => {
-        if (k === parsed.model) return true;
-        if (k.includes("*")) {
-          const star = k.indexOf("*");
-          return (
-            parsed.model.startsWith(k.slice(0, star)) && parsed.model.endsWith(k.slice(star + 1))
-          );
-        }
-        return false;
-      });
-      return {
-        chain: routes.map((r) => r.displayName),
-        source: "project routing",
-        sourceDetail: pattern,
-      };
-    }
-  }
-
-  // Check global (user-scope) routing rules
-  const global_ = loadConfig();
-  if (global_.routing && Object.keys(global_.routing).length > 0) {
-    const matched = matchRoutingRule(parsed.model, global_.routing);
-    if (matched) {
-      const routes = buildRoutingChain(matched, parsed.model);
-      const pattern = Object.keys(global_.routing).find((k) => {
-        if (k === parsed.model) return true;
-        if (k.includes("*")) {
-          const star = k.indexOf("*");
-          return (
-            parsed.model.startsWith(k.slice(0, star)) && parsed.model.endsWith(k.slice(star + 1))
-          );
-        }
-        return false;
-      });
-      return {
-        chain: routes.map((r) => r.displayName),
-        source: "user routing",
-        sourceDetail: pattern,
-      };
-    }
-  }
-
-  // Default auto-routing — consult merged routing rules (defaults + user
-  // config). Returns an empty chain only if the catch-all "*" was deliberately
-  // disabled by the user.
-  const merged = loadRoutingRules();
-  const matched = matchRoutingRule(parsed.model, merged);
-  if (matched) {
-    const routes = buildRoutingChain(matched, parsed.model);
-    return {
-      chain: routes.map((r) => r.displayName),
-      source: "auto",
-    };
-  }
-  return {
-    chain: [],
-    source: "auto",
-  };
+/**
+ * Every model's route line, resolved BEFORE the grid file is written:
+ * `buildPaneHeader` is synchronous and `explainRoute` is not. An error becomes
+ * the line, so a model whose route cannot be calculated still gets its pane.
+ * `explainRoute` never writes to stderr, which is the user's terminal here.
+ */
+async function resolvePaneRouteLines(models: string[]): Promise<Map<string, string>> {
+  const unique = [...new Set(models)];
+  const entries = await Promise.all(
+    unique.map(async (model): Promise<[string, string]> => {
+      try {
+        return [model, paneRouteLine(await explainRoute(model))];
+      } catch (err) {
+        return [model, `unknown — ${err instanceof Error ? err.message : String(err)}`];
+      }
+    })
+  );
+  return new Map(entries);
 }
 
 /**
  * Build shell commands for the pane header.
  * Layout:
- *   ┌──────────────────────────────────────┐
- *   │  ██ model-name ██                    │  (white on colored bg)
- *   │  route: LiteLLM → OpenRouter (auto)  │  (dim)
- *   │  ──────────────────────────────────── │  (dim line)
- *   │  The full prompt text, word-wrapped   │  (normal)
- *   │  across multiple lines if needed...   │
- *   │  ──────────────────────────────────── │  (dim line)
- *   └──────────────────────────────────────┘
+ *   ┌──────────────────────────────────────────────────────┐
+ *   │  ██ model-name ██                                     │  (white on colored bg)
+ *   │  route: Kimi Coding → OpenRouter  (catalog · subscr…  │  (dim)
+ *   │  ──────────────────────────────────────────────────── │  (dim line)
+ *   │  The full prompt text, word-wrapped                   │  (normal)
+ *   │  across multiple lines if needed...                   │
+ *   │  ──────────────────────────────────────────────────── │  (dim line)
+ *   └──────────────────────────────────────────────────────┘
  */
 // Palette for model name backgrounds. Index is passed around between panes
 // via pickBannerColor() so visually-adjacent panes never share a color.
@@ -143,23 +103,18 @@ function pickBannerColor(model: string, used: Set<number>): string {
   return BANNER_BG_COLORS[idx];
 }
 
-function buildPaneHeader(model: string, prompt: string, bg: string): string {
-  const route = resolveRouteInfo(model);
-
+function buildPaneHeader(model: string, routeLine: string, prompt: string, bg: string): string {
   // Shell-escape single quotes in model name and route strings
   const esc = (s: string) => s.replace(/'/g, "'\\''");
-
-  // Route chain string: "LiteLLM → OpenRouter"
-  const chainStr = route.chain.join(" → ");
-  const sourceLabel = route.sourceDetail ? `${route.source}: ${route.sourceDetail}` : route.source;
 
   const lines: string[] = [];
 
   // Line 1: model name with colored background, padded
   lines.push(`printf '\\033[1;97;${bg}m  %s  \\033[0m\\n' '${esc(model)}';`);
 
-  // Line 2: route chain in dim with arrow symbols
-  lines.push(`printf '\\033[2m  route: ${esc(chainStr)}  (${esc(sourceLabel)})\\033[0m\\n' ;`);
+  // Line 2: the calculated route, dim. An argument, not part of the format
+  // string, so a `%` in a no-route reason prints as itself.
+  lines.push(`printf '\\033[2m  route: %s\\033[0m\\n' '${esc(routeLine)}';`);
 
   // Line 3: thin separator
   lines.push(`printf '\\033[2m  %s\\033[0m\\n' '────────────────────────────────────────';`);
@@ -173,53 +128,6 @@ function buildPaneHeader(model: string, prompt: string, bg: string): string {
   lines.push(`printf '\\033[2m  %s\\033[0m\\n\\n' '────────────────────────────────────────';`);
 
   return lines.join(" ");
-}
-
-// ─── Multiplexer Binary Detection ────────────────────────────────────────────
-
-/**
- * Find the magmux binary. Priority:
- * 1. Bundled magmux (native/magmux-<platform>-<arch>)
- * 2. Platform-specific npm package (@claudish/magmux-<platform>-<arch>)
- * 3. magmux in PATH (e.g. via Homebrew)
- */
-function findMagmuxBinary(): string {
-  const thisFile = fileURLToPath(import.meta.url);
-  const thisDir = dirname(thisFile);
-  const pkgRoot = join(thisDir, "..");
-  const platform = process.platform;
-  const arch = process.arch;
-
-  // 1. Bundled magmux (native/magmux-<platform>-<arch>)
-  const bundledMagmux = join(pkgRoot, "native", `magmux-${platform}-${arch}`);
-  if (existsSync(bundledMagmux)) return bundledMagmux;
-
-  // 2. Platform-specific npm package (@claudish/magmux-<platform>-<arch>)
-  //    npm installs only the matching platform's optional dep
-  try {
-    const pkgName = `@claudish/magmux-${platform}-${arch}`;
-    // Walk up from this file to find node_modules
-    let searchDir = pkgRoot;
-    for (let i = 0; i < 5; i++) {
-      const candidate = join(searchDir, "node_modules", pkgName, "bin", "magmux");
-      if (existsSync(candidate)) return candidate;
-      const parent = dirname(searchDir);
-      if (parent === searchDir) break;
-      searchDir = parent;
-    }
-  } catch {
-    /* not installed */
-  }
-
-  // 3. magmux in PATH
-  try {
-    const result = execSync("which magmux", { encoding: "utf-8" }).trim();
-    if (result) return result;
-  } catch {
-    /* not in PATH */
-  }
-
-  throw new Error("magmux not found. Install it:\n  brew install MadAppGang/tap/magmux");
 }
 
 // ─── Magmux Event Protocol ───────────────────────────────────────────────────
@@ -372,6 +280,10 @@ function buildTeamStatus(
         startedAt,
         completedAt: null,
         outputSize: 0,
+        model: manifest.models[anonId]?.model,
+        spawnModel: null,
+        provider: null,
+        pane: null,
       };
       continue;
     }
@@ -395,6 +307,10 @@ function buildTeamStatus(
       startedAt: result.startedAt ?? startedAt,
       completedAt: result.completedAt ?? new Date().toISOString(),
       outputSize: result.response?.length ?? 0,
+      model: manifest.models[anonId]?.model,
+      spawnModel: null,
+      provider: null,
+      pane: null,
     };
   }
 
@@ -449,6 +365,11 @@ export async function runWithGrid(
 
   const rawPrompt = readFileSync(join(sessionPath, "input.md"), "utf-8");
   const usedBannerColors = new Set<number>();
+  // Only default mode draws a pane header; interactive panes are Claude Code's TUI.
+  const routeLines =
+    mode === "interactive"
+      ? new Map<string, string>()
+      : await resolvePaneRouteLines(Object.values(manifest.models).map((entry) => entry.model));
 
   const gridLines = Object.entries(manifest.models).map(([anonId]) => {
     const model = manifest.models[anonId].model;
@@ -464,7 +385,7 @@ export async function runWithGrid(
     // Magmux auto-applies DONE/FAIL overlay and green/red tint when the
     // child exits, so no shell-level IPC is needed.
     const bg = pickBannerColor(model, usedBannerColors);
-    const header = buildPaneHeader(model, rawPrompt, bg);
+    const header = buildPaneHeader(model, routeLines.get(model) ?? "", rawPrompt, bg);
     return `${header} claudish --model ${model} -y --quiet '${prompt}'`;
   });
   writeFileSync(gridfilePath, `${gridLines.join("\n")}\n`, "utf-8");

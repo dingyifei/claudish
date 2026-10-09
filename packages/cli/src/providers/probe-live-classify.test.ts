@@ -34,7 +34,42 @@ const REGION_ERROR_BODY = JSON.stringify({
   },
 });
 
+const ALIBABA_ACCESS_DENIED_SSE =
+  'event:error\ndata:{"code":"AccessDenied","message":"Model access denied.","request_id":"ecbdbfc8-..."}';
+const ALIBABA_COMPOSED_MESSAGE =
+  "Alibaba PAYG error (HTTP 403): The provider accepted the credential but denied access to this model — check model access or activation for this account in the provider's console, not the key. — Model access denied.";
+
 describe("classifyHttpError — auth-shaped model errors", () => {
+  test("prefers provider evidence while preserving composed and raw-SSE fallbacks", () => {
+    const proxyBody = JSON.stringify({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: ALIBABA_COMPOSED_MESSAGE,
+        upstream_status: 403,
+        provider_message: "Model access denied.",
+      },
+    });
+
+    expect(classifyHttpError(400, proxyBody, 1200).errorMessage).toBe("Model access denied.");
+
+    const bodyWithoutProviderMessage = JSON.stringify({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: ALIBABA_COMPOSED_MESSAGE,
+        upstream_status: 403,
+      },
+    });
+
+    expect(classifyHttpError(400, bodyWithoutProviderMessage, 1200).errorMessage).toBe(
+      ALIBABA_COMPOSED_MESSAGE
+    );
+    expect(classifyHttpError(403, ALIBABA_ACCESS_DENIED_SSE, 1200).errorMessage).toBe(
+      "Model access denied."
+    );
+  });
+
   test("classifies a 401 unsupported-model response without rewriting its status", () => {
     const body = proxyErrorBody(401, "Model deepseek-v4-pro-0813 is not supported");
 

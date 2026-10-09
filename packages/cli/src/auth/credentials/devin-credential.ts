@@ -25,7 +25,8 @@
  */
 
 import { hasDevinCredentials, readDevinApiKey } from "../../providers/devin/devin-credentials.js";
-import type { CredentialProvider, RequestAuth } from "./types.js";
+import type { CredentialProvider, ReadinessResult, RequestAuth } from "./types.js";
+import { readinessDetail } from "./types.js";
 
 /**
  * Build the Devin request headers for a key.
@@ -48,15 +49,30 @@ export class DevinCredentialProvider implements CredentialProvider {
 
   /**
    * Available when a Devin credential resolves from env, claudish config, or the
-   * Devin CLI's `credentials.toml`. Never throws — an absent Devin CLI is the
-   * normal state for every user who does not have one.
+   * Devin CLI's `credentials.toml`.
+   *
+   * `false` used to be the answer to two different questions. An absent Devin
+   * CLI is the normal state for every user who does not have one — that is
+   * `absent`, and it must stay `absent` or every unconfigured provider starts
+   * reporting an error. A resolver that THREW (an unreadable config, a
+   * credentials file that is a directory, a permission error) is not evidence
+   * of absence at all, and reporting it as such is how a credentialed provider
+   * gets dropped from a routing chain in silence.
    */
-  async isAvailable(): Promise<boolean> {
+  async describeReadiness(): Promise<ReadinessResult> {
     try {
-      return hasDevinCredentials();
-    } catch {
-      return false;
+      return { readiness: hasDevinCredentials() ? "present" : "absent" };
+    } catch (err) {
+      return {
+        readiness: "failed",
+        detail: `Devin credential could not be read: ${readinessDetail(err) ?? "unknown error"}`,
+      };
     }
+  }
+
+  /** Unchanged contract: the `=== "present"` projection of the above. */
+  async isAvailable(): Promise<boolean> {
+    return (await this.describeReadiness()).readiness === "present";
   }
 
   async getRequestAuth(): Promise<RequestAuth> {

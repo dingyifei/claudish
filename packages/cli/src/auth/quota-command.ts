@@ -172,7 +172,7 @@ const FRIENDLY_NAMES: Record<string, string> = {
   sakana: "sakana-subscription",
   fugu: "sakana-subscription",
   zen: "opencode-zen-go",
-  qwen: "qwen-cloud",
+  qwen: "qwen-token-plan",
   // Same divergence as `gemini` above, in the other direction: as a ROUTING
   // prefix `grok` means the metered `x-ai` API, but someone typing
   // `claudish quota grok` is asking about the subscription — the only one of
@@ -225,8 +225,8 @@ function renderPlan(adapter: QuotaAdapter, plan: PlanUsage): void {
   // `claude-opus-4…` / `3.6-flash-med…` — losing exactly the tier suffix that
   // distinguishes one window from the next.
   //
-  // Clamped at both ends: 14 keeps short-roster providers from collapsing into
-  // a ragged narrow column, and 28 keeps the row inside 80 columns
+  // Clamped at both ends: 14 keeps providers with only short window names from
+  // collapsing into a ragged narrow column, and 28 keeps the row inside 80 columns
   // (2 indent + 2 gutter + 28 name + 24 bar + 2 + 4 pct + 2 + reset).
   //
   // The +1 is the column SEPARATOR, and it is not cosmetic padding: the bar is

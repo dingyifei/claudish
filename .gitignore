@@ -117,3 +117,15 @@ gtd/sessions/
 # Added by claudeup
 # A managed rule says this path should stay out of git.
 .claude/models.json
+# Added by magus
+# A managed rule says this path should stay out of git.
+.claude/settings.json
+
+# Added by magus
+# A managed rule says this path should stay out of git.
+.claude/profiles/
+# A managed rule says this path should stay out of git.
+.mcp.json
+
+# magus: generated profile config (source of truth: .claude/profiles.json)
+.claude/.magus-backups/

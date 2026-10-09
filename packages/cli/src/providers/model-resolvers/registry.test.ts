@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { collapseRoster, expandSelection, getModelResolver } from "./registry.js";
-import type { RosterEntry } from "./types.js";
+import { collapseModelsCatalog, expandSelection, getModelResolver } from "./registry.js";
+import type { ModelsCatalogEntry } from "./types.js";
 
 describe("model resolver registry", () => {
   test("registers only providers that opt in", () => {
@@ -11,13 +11,13 @@ describe("model resolver registry", () => {
   });
 
   test("uses identity collapse for an unregistered provider", () => {
-    const roster: RosterEntry[] = [
+    const modelsCatalog: ModelsCatalogEntry[] = [
       { wireId: "first", displayName: "First", contextWindow: 100_000 },
       { wireId: "second", displayName: "Second", costFactor: 2 },
       { wireId: "third" },
     ];
 
-    const choices = collapseRoster("openrouter", roster);
+    const choices = collapseModelsCatalog("openrouter", modelsCatalog);
     expect(choices.map((choice) => choice.id)).toEqual(["first", "second", "third"]);
     expect(choices.map((choice) => choice.displayName)).toEqual(["First", "Second", "third"]);
     expect(choices.map((choice) => choice.variants)).toEqual([
@@ -28,9 +28,9 @@ describe("model resolver registry", () => {
   });
 
   test("uses identity expand for an unregistered provider", () => {
-    const roster: RosterEntry[] = [{ wireId: "served-model" }];
-    expect(expandSelection("openrouter", "unlisted-selection", roster, { effort: "max" })).toBe(
-      "unlisted-selection"
-    );
+    const modelsCatalog: ModelsCatalogEntry[] = [{ wireId: "served-model" }];
+    expect(
+      expandSelection("openrouter", "unlisted-selection", modelsCatalog, { effort: "max" })
+    ).toBe("unlisted-selection");
   });
 });

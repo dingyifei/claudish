@@ -182,7 +182,7 @@ function defaultReadStore(): string | null {
     // That line is not an error. It is "not signed in", which this function
     // reports as `null` by design. Printing it corrupts the config TUI, which
     // shares its terminal with the Claude Code TUI, and it repeats forever
-    // because READ_STORE_TTL_MS is 3s and the provider roster is rebuilt on
+    // because READ_STORE_TTL_MS is 3s and the provider list is rebuilt on
     // every render. Same policy as providers/keychain.ts — see the spawn
     // comment there, and terminal-isolation.ts for the display corruption.
     //

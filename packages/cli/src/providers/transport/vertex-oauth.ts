@@ -1,5 +1,5 @@
 /**
- * VertexOAuthProvider — Vertex AI transport with OAuth authentication.
+ * VertexProviderTransport — Vertex AI transport with OAuth authentication.
  *
  * Supports multiple publishers via dynamic stream format:
  * - Google (Gemini): gemini-sse stream format
@@ -20,12 +20,23 @@ import {
   getVertexAuthManager,
 } from "../../auth/vertex-auth.js";
 import { log } from "../../logger.js";
+import type { DiscoveryOutcome } from "./probe-discovery.js";
 import type { ProviderTransport, StreamFormat } from "./types.js";
 
 export interface ParsedVertexModel {
   publisher: string;
   model: string;
 }
+
+/**
+ * The publisher a BARE Vertex model id belongs to.
+ *
+ * A rule, not a list: it is the default `parseVertexModel` applies, and probe
+ * discovery reads it so a bare id round-trips to the same publisher it was
+ * listed under. Other publishers (anthropic, mistralai, …) are reached by
+ * qualifying the id, never by enumerating them here.
+ */
+export const VERTEX_DEFAULT_PUBLISHER = "google";
 
 /**
  * Parse vertex model string into publisher and model.
@@ -35,7 +46,7 @@ export interface ParsedVertexModel {
 export function parseVertexModel(modelId: string): ParsedVertexModel {
   const parts = modelId.split("/");
   if (parts.length === 1) {
-    return { publisher: "google", model: parts[0] };
+    return { publisher: VERTEX_DEFAULT_PUBLISHER, model: parts[0] };
   }
   return { publisher: parts[0], model: parts.slice(1).join("/") };
 }
@@ -73,6 +84,25 @@ export class VertexProviderTransport implements ProviderTransport {
     );
   }
 
+  /**
+   * Pick a probe model from this PROJECT's own publisher models.
+   *
+   * Vertex has no catalog probe pick and never will: the cloud models catalog
+   * marks it `client_model_selection_required` because availability depends on
+   * the user's project, permissions and region. Without this, Test All had no
+   * candidate and reported "transport does not support discovery" for an install
+   * that answers normally. See `vertex-discovery.ts` for the endpoint and the
+   * filters, every one of which reads a field the API itself publishes.
+   *
+   * Imported DYNAMICALLY: that module reads this one (for the default publisher
+   * and the round-trip check), and discovery is a probe-time path that has no
+   * business on the request path's import graph.
+   */
+  async discoverProbeModel(exclude?: ReadonlySet<string>): Promise<DiscoveryOutcome> {
+    const { discoverVertexProbeModel } = await import("./vertex-discovery.js");
+    return discoverVertexProbeModel(exclude);
+  }
+
   async getHeaders(): Promise<Record<string, string>> {
     return { ...(this.cachedAuth?.headers ?? {}) };
   }
@@ -92,7 +122,14 @@ export class VertexProviderTransport implements ProviderTransport {
     try {
       this.cachedAuth = await credentials.getRequestAuth("vertex", { model: this.parsed.model });
     } catch (e: any) {
-      throw new Error(`Vertex AI auth failed: ${e.message}`);
+      // `{ cause: e }` is load-bearing, not decoration. `classifyConnectionError`
+      // finds a connection failure by walking `.code` and then the `.cause` chain
+      // to depth 8 (connection-error.ts:56-68). Rethrowing a bare Error discards
+      // both, so a DNS/refused failure while minting the Vertex token classified
+      // as `null` and ComposedHandler's refreshAuth catch answered 401 — which
+      // `isRetryableError` treats as retryable, walking the user down the
+      // fallback chain during a network outage.
+      throw new Error(`Vertex AI auth failed: ${e.message}`, { cause: e });
     }
   }
 
@@ -128,7 +165,3 @@ export class VertexProviderTransport implements ProviderTransport {
     return this.parsed;
   }
 }
-
-// Backward-compatible alias
-/** @deprecated Use VertexProviderTransport */
-export { VertexProviderTransport as VertexOAuthProvider };

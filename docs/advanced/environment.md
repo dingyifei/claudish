@@ -145,6 +145,44 @@ export CLAUDISH_PORT='3456'
 
 Useful when you need a predictable port for firewall rules or debugging.
 
+### `CLAUDISH_RECOVERY`
+
+Master switch for network recovery. Default **on**.
+
+```bash
+export CLAUDISH_RECOVERY=0        # or: claudish --no-recovery
+```
+
+When claudish cannot reach a provider — DNS unresolved, connection refused, host unreachable — it no longer fails the turn immediately. It retries on a `5s → 10s → 30s → 60s → 60s…` ladder for up to a derived deadline (see below), and if the network comes back the turn continues as if nothing happened.
+
+**Turn it off in CI and in scripted `-p` runs.** With recovery on, a genuinely dead endpoint — a wrong host, a firewalled port, a service you forgot to start — holds the request for the whole deadline before reporting. Off restores the previous behaviour exactly: an immediate error with the same message.
+
+The deadline is **derived from `API_TIMEOUT_MS`**, not fixed:
+
+```
+min(API_TIMEOUT_MS, 300s) − 30s        # ~270s at the 360s default
+```
+
+Claude Code aborts its own request at `API_TIMEOUT_MS` (360 000 ms by default), so a hold longer than that would be cut off by the client mid-wait. If you have shortened `API_TIMEOUT_MS`, claudish shortens the hold to match and says so with a `[Recovery]` line.
+
+The deadline is the ceiling on the **whole** attempt, including the first one: a connect that never completes is abandoned when the budget runs out rather than waiting out the operating system's own connect timeout (75 s on macOS), which on a shortened `API_TIMEOUT_MS` would answer you after the client had already given up.
+
+**Where the `[Recovery]` lines go.** A recovery episode reports itself on **stderr** — opened, each attempt, each wait and how it ended — with no `--debug` anywhere, because a request can be held for minutes and a hold nobody can see is worse than a fast failure. In an interactive session they are routed to the session log instead of the terminal, so they cannot corrupt Claude Code's display; `~/.claudish/logs/` keeps them either way.
+
+### `CLAUDISH_RECOVERY_UI`
+
+Whether claudish may open a magmux pane showing the recovery banner. Default **on**.
+
+```bash
+export CLAUDISH_RECOVERY_UI=0     # or: claudish --no-recovery-ui
+```
+
+The banner names the provider, the host, the reason, the attempt count and a live countdown, with `[r] try now` and `[q] give up`. Turning it off keeps the retries and drops only the surface — and with it the ability to hand a retry back to Claude Code, since claudish will not ask a client to retry a failure it cannot show you.
+
+Independent of `CLAUDISH_RECOVERY`: the UI switch never decides whether a retry happens, only whether it is visible.
+
+Full rationale — the measurements behind the deadline, and why the handoff status is 503 — is in `ai-docs/architecture/network-recovery.md`.
+
 ---
 
 ## Read-Only Variables
@@ -174,6 +212,9 @@ CLAUDISH_MODEL_SUBAGENT=minimax/minimax-m2
 
 # Fixed port (optional)
 # CLAUDISH_PORT=3456
+
+# CI: fail fast on an unreachable provider instead of retrying for ~270s
+# CLAUDISH_RECOVERY=0
 ```
 
 ---

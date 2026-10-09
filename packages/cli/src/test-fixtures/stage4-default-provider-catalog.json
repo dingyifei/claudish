@@ -1,0 +1,13 @@
+{
+  "version": 3,
+  "lastUpdated": "2026-09-24T00:00:00.000Z",
+  "entries": [
+    {
+      "modelId": "stage4-catalog-marker",
+      "aliases": []
+    }
+  ],
+  "models": [],
+  "plans": [],
+  "catalogGenerationId": "stage4-default-provider-fixture"
+}

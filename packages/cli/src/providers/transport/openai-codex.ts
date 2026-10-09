@@ -26,6 +26,7 @@ import { lookupModelForProvider } from "../../adapters/model-catalog.js";
 import { credentials } from "../../auth/credentials/authority.js";
 import { recordSignedArm } from "../../auth/credentials/billing-probe.js";
 import type { RequestAuth } from "../../auth/credentials/types.js";
+import { classifyConnectionError } from "../../handlers/shared/connection-error.js";
 import { conversationKey } from "./conversation-key.js";
 import { OpenAIProviderTransport } from "./openai.js";
 
@@ -45,8 +46,15 @@ export class OpenAICodexTransport extends OpenAIProviderTransport {
   async refreshAuth(): Promise<void> {
     try {
       this.cachedAuth = await credentials.getRequestAuth("openai-codex", { model: "" });
-    } catch {
-      // No OAuth (or refresh failed) → use the api-key path below.
+    } catch (err) {
+      // A NETWORK failure is not a rejected refresh, and must not be treated as
+      // one. Swallowing it fell through to the api-key path — the METERED
+      // `api.openai.com` — for a user whose subscription was only unreachable,
+      // not revoked. Rethrown, composed-handler's `refreshAuth` site classifies
+      // it and holds the request (CLAUDE.md: a connection failure wearing an
+      // auth status, the five sites; this catch was a sixth that swallowed).
+      if (classifyConnectionError(err)) throw err;
+      // The refresh was REJECTED (or no OAuth) → use the api-key path below.
       this.cachedAuth = null;
     }
     // ── DO NOT rewrite this as `this.cachedAuth ? "subscription" : "metered"` ──

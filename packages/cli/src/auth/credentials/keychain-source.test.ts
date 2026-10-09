@@ -215,7 +215,11 @@ describe("resolveKeychainKeyForEnvVars", () => {
     try {
       const resolved = resolveKeychainKeyForEnvVars([PRIMARY_ENV]);
 
-      expect(resolved).toEqual({ failed: true });
+      // The reason travels with the flag. Without it the caller can say
+      // "unavailable" but not WHICH store was unreachable, which is the
+      // difference between telling a user to unlock their keychain and telling
+      // them they have no subscription.
+      expect(resolved).toEqual({ failed: true, error: UNKNOWN_COMMAND_STDERR });
       expect("value" in resolved).toBe(false);
       expect(runCalls).toEqual([{ args: ["dump-keychain"], stdin: undefined }]);
     } finally {
@@ -233,8 +237,10 @@ describe("resolveKeychainKeyForEnvVars", () => {
 
     try {
       const resolved = resolveKeychainKeyForEnvVars([PRIMARY_ENV]);
-      expect(resolved).toEqual({ failed: true });
       expect(resolved.failed).toBe(true);
+      // A per-item read failure surfaces the engine's KeychainError message,
+      // not the enumeration diagnostic — enumeration succeeded here.
+      expect(resolved.error).toContain(UNKNOWN_COMMAND_STDERR);
       expect("value" in resolved).toBe(false);
     } finally {
       errorSpy.mockRestore();

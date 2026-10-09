@@ -85,6 +85,22 @@ surfaces work live. Chat Completions wins because claudish already has a Layer-2
 would route through the Codex adapter and strand it, for no measured benefit. `--probe grok-4.6`
 shows the composition: `openai-sse · GrokModelDialect · 500K`.
 
+**`stop_sequences` has no effect on `gk@`, and claudish is not the cause.** Observed on v9.5.0:
+`stop_sequences: ["STOPHERE"]` through `gk@grok-4.6` returned the whole sentence, `STOPHERE`
+included, while the same request through `kimi-coding` halted before it. The `gk@` body is NOT
+built by `GrokModelDialect`. The profile passes an explicit adapter, `OpenAIAPIFormat`
+(`provider-profiles.ts:290`); `getAdapter()` prefers it (`composed-handler.ts:294`), and its
+`buildChatCompletionsPayload` calls `applyOpenAISamplingParams` (`openai-api-format.ts:343`), so
+`stop` and `top_p` are sent. That is read from the code: a mock upstream measured it only behind a
+custom endpoint, never on this path. The dialect still takes part in the retry. On a 4xx,
+`GrokModelDialect` is asked first and the building adapter second (`composed-handler.ts:760`), and
+both hand `stop`/`top_p` to `BaseAPIFormat.recoverFromRejection`, which drops whichever of them
+the 4xx names (`base-api-format.ts:325-329`). So two explanations fit and the client cannot tell
+them apart: the proxy ignores `stop`, or it rejects it and the retry strips it. To measure which,
+point `GROK_PROXY_URL` (this provider's base URL override) at a recording mock. Editing
+`GrokModelDialect.buildPayload` changes nothing on `gk@`, and the payload needs no "fix".
+Evidence: `ai-docs/reports/translation-fixes-from-free-claude-code.md`.
+
 **`apiKeyEnvVar` MUST stay `""`.** Unlike Devin — where the reason is that a `Basic <k>-<k>` artifact
 cannot survive proxy-server's `Bearer `-stripping extraction — here the extraction would *succeed*
 and then CACHE a bearer token past the six hours it actually lives. Empty makes proxy-server skip
@@ -96,19 +112,32 @@ the exact ambiguity that keeps `openai-codex` out of `SUBSCRIPTION_PROVIDERS`. B
 has no metered path, it is *not* dual-mode and **is** in that set. `GROK_DEPLOYMENT_KEY` (enterprise)
 is out of scope for v1 for the same reason: it would reintroduce the ambiguity.
 
-**Bare `grok-*` routes subscription-FIRST** — `["grok-subscription", "x-ai", "openrouter"]`, matching
-every other split family. Unlike Devin and Qwen Plan, which are explicit-access-only because their
-uids collide with other vendors' namespaces, these ids are xAI's own, so a bare name is safe here.
-The provider declares **no `nativeModelPatterns`** (`x-ai` already owns `/^grok-/i`, and patterns are
-first-wins on array order); bare-name reachability comes from the routing chain instead.
+**Bare `grok-*` routes subscription-FIRST.** Unlike Devin and Alibaba Token Plan, which are
+explicit-access-only because their uids collide with other vendors' namespaces, these ids are
+xAI's own, so a bare name is safe here.
 
-**The roster is discovered, never pinned.** `/v1/models` is genuinely authenticated (401 without a
-token — unlike Alibaba's `coding-intl` roster, where a 200 proves nothing) and the served set is
-account-scoped. Note the per-model effort ladders differ — `grok-4.6` offers `xhigh`, `grok-4.5`
+That used to come from a hand-written chain, `["grok-subscription", "x-ai", "openrouter"]`. That
+table is gone. The provider now declares `nativeModelPatterns: [{ pattern: /^grok-/i }]` — a
+NAMESPACE CLAIM, which is the only way a dynamic subscription can enter a gathered chain at all:
+`x-ai/supergrok-subscription` is `client_model_selection_required` in the probe map and
+publishes zero `aggregators[]` rows, so the catalog cannot see the plan. `route-candidates.ts`
+turns the claim into a `dynamic-subscription`-tier candidate, which the tier order puts ahead of
+the metered `x-ai` hop.
+
+The claim does NOT win auto-detection, and that is deliberate: `x-ai` declares the same pattern
+and is defined earlier in `BUILTIN_PROVIDERS`, and `getNativeModelPatterns()` is first-wins on
+array order, so `parseModelSpec("grok-4.6").provider` is still `x-ai`. Two claimants on one
+namespace is fine now — the function that picked a single winner, `getProviderForModel`, no
+longer exists.
+
+**The dynamic models catalog is discovered, never pinned.** `/v1/models` is genuinely
+authenticated (401 without a token — unlike Alibaba's `coding-intl` discovery endpoint, where a
+200 proves nothing) and the dynamic models catalog it returns is account-scoped.
+Note the per-model effort ladders differ — `grok-4.6` offers `xhigh`, `grok-4.5`
 does not — which is exactly the drifting per-account data that must not be hardcoded.
 
 Models Index represents this as the `xai-supergrok` commercial plan, routed through provider UID
 `grok-subscription` with `modelDiscovery: "client"`. Its public `includedModels` value is therefore
-only an account-roster limitation note, not a static allow-list. Claudish keeps the subscription
+only the plan's published membership, not a static allow-list. Claudish keeps the subscription
 candidate when a Grok model is absent from the public slim catalog and lets the authenticated
-provider discovery decide the actual roster.
+provider discovery decide the account's actual dynamic models catalog.

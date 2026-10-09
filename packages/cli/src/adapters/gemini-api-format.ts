@@ -243,12 +243,18 @@ export class GeminiAPIFormat extends BaseAPIFormat {
           `[GeminiAPIFormat] thinkingLevel -> ${payload.generationConfig.thinkingConfig.thinkingLevel} (from ${effort}) for ${this.modelId}`
         );
       } else {
-        payload.generationConfig.thinkingConfig = {
-          thinkingBudget: this.effortToThinkingBudget(effort),
-        };
-        log(
-          `[GeminiAPIFormat] thinkingBudget -> ${payload.generationConfig.thinkingConfig.thinkingBudget} (from ${effort}) for ${this.modelId}`
+        const budget = this.budgetWithinOutputCap(
+          this.effortToThinkingBudget(effort),
+          claudeRequest.max_tokens
         );
+        if (budget === undefined) {
+          log(
+            `[GeminiAPIFormat] thinking omitted (from ${effort}): max_tokens ${claudeRequest.max_tokens} leaves no valid budget for ${this.modelId}`
+          );
+        } else {
+          payload.generationConfig.thinkingConfig = { thinkingBudget: budget };
+          log(`[GeminiAPIFormat] thinkingBudget -> ${budget} (from ${effort}) for ${this.modelId}`);
+        }
       }
     } else if (claudeRequest.thinking) {
       // Legacy fallback: raw thinking.budget_tokens.
@@ -272,6 +278,34 @@ export class GeminiAPIFormat extends BaseAPIFormat {
 
   /** Gemini 2.5 thinkingBudget ceiling (live API caps ~24576 even where docs say 32768). */
   private static readonly MAX_GEMINI_BUDGET = 24576;
+
+  /** Anthropic's smallest accepted `thinking.budget_tokens`. */
+  private static readonly MIN_CLAUDE_BUDGET = 1024;
+
+  /**
+   * Keep a Claude model's thinking budget below its output cap.
+   *
+   * Antigravity serves Claude through this Gemini-shaped request and hands the
+   * budget to Anthropic, which requires `budget_tokens < max_tokens` and
+   * `budget_tokens >= 1024`. The effort tiers ignore max_tokens, so a user who
+   * lowers CLAUDE_CODE_MAX_OUTPUT_TOKENS got a 400 on every turn: max_tokens
+   * 16000 with effort high (budget 16384), and 8000 with effort medium (8192),
+   * both returned "`max_tokens` must be greater than `thinking.budget_tokens`"
+   * (measured 2026-09-19 on claude-sonnet-4-6).
+   *
+   * An over-cap budget becomes half of max_tokens, not max_tokens - 1: the budget
+   * shares the cap with the visible answer, and a budget one token under the cap
+   * is valid but can leave the answer nothing. Returns undefined when half the
+   * cap is under Anthropic's minimum, and the caller then sends no thinking config.
+   *
+   * Gemini models are returned unchanged: none was measured to enforce this.
+   */
+  private budgetWithinOutputCap(budget: number, maxTokens: unknown): number | undefined {
+    if (!this.modelId.toLowerCase().startsWith("claude")) return budget;
+    if (typeof maxTokens !== "number" || budget < maxTokens) return budget;
+    const fitted = Math.floor(maxTokens / 2);
+    return fitted >= GeminiAPIFormat.MIN_CLAUDE_BUDGET ? fitted : undefined;
+  }
 
   /**
    * Gemini 3 `thinkingLevel` (string). Accepted values: minimal | low | medium |

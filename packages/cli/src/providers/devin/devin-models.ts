@@ -1,7 +1,7 @@
 /**
- * The LIVE Devin model roster — capability ∩ entitlement.
+ * Devin's dynamic models catalog — capability ∩ entitlement.
  *
- * No model roster, context window, family name, or reasoning tier is ever
+ * No model list, context window, family name, or reasoning tier is ever
  * written into claudish source: which models a subscription serves is
  * per-account and drifts, so it is discovered from the backend's own metadata
  * rpcs and cached briefly. The only literals here are endpoint paths, field
@@ -65,8 +65,8 @@ const MODEL_CONFIGS_PATH = "/exa.api_server_pb.ApiServerService/GetCliModelConfi
 /** Entitlement rpc — note the DIFFERENT service, not ApiServerService. */
 const TEAM_SETTINGS_PATH = "/exa.seat_management_pb.SeatManagementService/GetCliTeamSettings";
 
-/** Roster TTL. The served set moves on a daily cadence, not per request. */
-const ROSTER_TTL_MS = 5 * 60 * 1000;
+/** Dynamic models catalog TTL. It moves on a daily cadence, not per request. */
+const MODELS_CATALOG_TTL_MS = 5 * 60 * 1000;
 
 /** Metadata rpcs are small and on interactive paths (picker, probe). */
 const UNARY_TIMEOUT_MS = 10_000;
@@ -82,7 +82,7 @@ export interface DevinPromo {
  *
  * Devin STATES what each uid is instead of leaving it to be parsed out of the
  * name, so this is the authority wherever it is present. Measured against a
- * real roster:
+ * real dynamic models catalog:
  *
  * - `label` on the effort axis agrees with the uid suffix on all 130 uids that
  *   carry both, and additionally expresses `Minimal`, which no suffix rule does.
@@ -102,7 +102,7 @@ export interface DevinAxis {
   enabled: boolean;
 }
 
-/** One row of the live roster. */
+/** One row of the dynamic models catalog. */
 export interface DevinModelConfig {
   /** Routing key — request field 21 (e.g. `claude-opus-5-high`). */
   uid: string;
@@ -334,7 +334,7 @@ export async function fetchDevinModelConfigs(apiKey: string): Promise<DevinModel
 /**
  * Pure decode of a `GetCliModelConfigs` response body.
  *
- * Split out from the fetch so the roster decode can be replayed against a
+ * Split out from the fetch so decoding the dynamic models catalog can be replayed against a
  * captured response byte-for-byte — the fixture is real wire data, never
  * hand-written.
  */
@@ -365,8 +365,8 @@ export async function fetchDevinAllowedUids(apiKey: string): Promise<string[]> {
   return uids;
 }
 
-let rosterCache: DevinModelConfig[] | null = null;
-let rosterCacheAt = 0;
+let modelsCatalogCache: DevinModelConfig[] | null = null;
+let modelsCatalogCacheAt = 0;
 
 /**
  * The models this subscription can actually run: configs ∩ allowed uids, minus
@@ -375,7 +375,7 @@ let rosterCacheAt = 0;
  * That last filter drops `adaptive` (ctx 0), a server-side router pseudo-model
  * that is not a routable uid — it must never reach the picker or a probe.
  *
- * Cached for {@link ROSTER_TTL_MS}. Never throws: a stale cache beats an empty
+ * Cached for {@link MODELS_CATALOG_TTL_MS}. Never throws: a stale cache beats an empty
  * one, and an empty one beats a failed turn.
  */
 export async function getServedDevinModels(opts?: {
@@ -385,17 +385,18 @@ export async function getServedDevinModels(opts?: {
   apiKey?: string;
 }): Promise<DevinModelConfig[]> {
   const now = Date.now();
-  if (!opts?.force && rosterCache && now - rosterCacheAt < ROSTER_TTL_MS) return rosterCache;
+  if (!opts?.force && modelsCatalogCache && now - modelsCatalogCacheAt < MODELS_CATALOG_TTL_MS)
+    return modelsCatalogCache;
 
   const apiKey = opts?.apiKey ?? readDevinApiKey();
-  if (!apiKey) return rosterCache ?? [];
+  if (!apiKey) return modelsCatalogCache ?? [];
 
   try {
     const [configs, allowed] = await Promise.all([
       fetchDevinModelConfigs(apiKey),
       fetchDevinAllowedUids(apiKey),
     ]);
-    if (configs.length === 0) return rosterCache ?? [];
+    if (configs.length === 0) return modelsCatalogCache ?? [];
 
     const entitled = new Set(allowed);
     const served = configs.filter(
@@ -405,17 +406,17 @@ export async function getServedDevinModels(opts?: {
       log("[Devin] entitlement unknown — using the full config list (superset)");
     }
 
-    rosterCache = served;
-    rosterCacheAt = now;
+    modelsCatalogCache = served;
+    modelsCatalogCacheAt = now;
     return served;
   } catch (err) {
     log(`[Devin] served-model discovery error: ${err}`);
-    return rosterCache ?? [];
+    return modelsCatalogCache ?? [];
   }
 }
 
-/** Test seam: drop the cached roster. */
+/** Test seam: drop the cached dynamic models catalog. */
 export function _resetDevinModelCache(): void {
-  rosterCache = null;
-  rosterCacheAt = 0;
+  modelsCatalogCache = null;
+  modelsCatalogCacheAt = 0;
 }

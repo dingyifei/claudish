@@ -32,7 +32,7 @@ Rules **return** actions; the engine applies them. Nothing else in the layer mut
 | `anthropic-sse` | MiniMax, Kimi direct, Z.AI | Byte-level passthrough, so interception is strictly opt-in: only a named tool has its `input_json_delta` frames withheld and rewritten. Verified byte-identical output for untargeted tools. |
 | `gemini-sse` | Gemini | No buffering needed — Gemini delivers each `functionCall` with complete `args` in one part. Uses `repairToolArgs`, deliberately separate from the pre-existing `onToolCall` thought-signature hook. |
 | `ollama-jsonl` | Ollama local | Not wired — this parser has no tool-call handling at all. |
-- **Off for native Claude** (`claude-*` or provider `anthropic`) — a naming rule, not a pinned roster.
+- **Off for native Claude** (`claude-*` or provider `anthropic`) — a naming rule, not a pinned model list.
 - **Anchors live in `harness.ts` only.** `PLAN_MODE_HINT` is a cheap pre-test and **must stay a superset of the anchors** — an earlier version omitted "create your plan at" and short-circuited a valid anchor away. Never assume `~/.claude/plans`: CC has a `planDir` setting, so the path is always taken from the reminder.
 
 ## Why the layer is a SUPERVISOR, not a hint system

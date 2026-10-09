@@ -195,7 +195,7 @@ Claudish automatically loads `.env` from the current working directory at startu
 | `OPENROUTER_API_KEY` | OpenRouter (default backend / universal fallback) | | https://openrouter.ai/keys |
 | `GEMINI_API_KEY` | Google Gemini direct API (`g@`, `google@`) | | https://aistudio.google.com/app/apikey |
 | `OPENAI_API_KEY` | OpenAI direct API (`oai@`) | | https://platform.openai.com/api-keys |
-| `MINIMAX_API_KEY` | MiniMax (`mm@`, `mmax@`) | | https://www.minimaxi.com/ |
+| `MINIMAX_API_KEY` | MiniMax (`mm@`, `mmax@`) | | https://platform.minimax.io/user-center/basic-information/interface-key (China platform: https://www.minimaxi.com/, and set `MINIMAX_BASE_URL`) |
 | `MINIMAX_CODING_API_KEY` | MiniMax Coding Plan (`mmc@`) | | https://platform.minimax.io/ |
 | `MOONSHOT_API_KEY` | Kimi/Moonshot (`kimi@`, `moon@`) | `KIMI_API_KEY` | https://platform.moonshot.cn/ |
 | `KIMI_CODING_API_KEY` | Kimi Coding Plan (`kc@`); also accepts OAuth via `claudish --kimi-login` | | https://kimi.com/code |
@@ -204,25 +204,52 @@ Claudish automatically loads `.env` from the current working directory at startu
 | `ZAI_API_KEY` | Z.AI Anthropic-compatible API (`zai@`) | | https://z.ai/ |
 | `SAKANA_API_KEY` | Sakana Fugu API / token plan (`sakana@`, `fugu@`) | | https://console.sakana.ai/get-started |
 | `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` | https://console.sakana.ai/get-started |
+| `QWEN_TOKEN_PLAN_API_KEY` | Alibaba Token Plan (`qtoken@`) — Model Studio subscription, metered in Credits | _(none by design — see the note below)_ | https://docs.qwencloud.com/token-plan/overview |
+| `QWEN_CODING_PLAN_API_KEY` | Alibaba Coding Plan (`qcode@`) — Model Studio subscription, metered in requests | _(none by design — see the note below)_ | https://www.alibabacloud.com/help/en/model-studio/coding-plan |
+| `DASHSCOPE_API_KEY` | Alibaba PAYG (`qpay@`) — Model Studio pay-as-you-go, billed per token | _(none by design — see the note below)_ | https://www.alibabacloud.com/help/en/model-studio/get-api-key |
 | `OLLAMA_API_KEY` | OllamaCloud hosted API (`oc@`, `llama@`, `lc@`, `meta@`) | | https://ollama.com/account |
 | `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) — **required** | | https://opencode.ai/ |
 | `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`, `zengo@`) — **required** | | https://opencode.ai/ |
 | `XAI_API_KEY` | xAI / Grok (direct API, detected in model selector) | | https://x.ai/ |
 | `LITELLM_API_KEY` | LiteLLM proxy (`ll@`, `litellm@`) | | https://docs.litellm.ai/ |
 | `POE_API_KEY` | Poe (`poe@`) | | https://poe.com/ |
-| `VERTEX_API_KEY` | Vertex AI Express mode (`v@`, `vertex@`) | | https://console.cloud.google.com/vertex-ai |
-| `VERTEX_PROJECT` | Vertex AI OAuth mode — GCP project ID | `GOOGLE_CLOUD_PROJECT` | GCP Console |
+| `VERTEX_PROJECT` | Vertex AI (`v@`, `vertex@`) — GCP project ID; optional, see the note below | `GOOGLE_CLOUD_PROJECT` | GCP Console |
 | `VERTEX_LOCATION` | Vertex AI region | `us-central1` | |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP service account JSON file (Vertex OAuth) | | GCP Console |
 | `GOOGLE_CLOUD_PROJECT` | GCP project ID (Vertex AI) | `GOOGLE_CLOUD_PROJECT_ID` | |
 
-**Note on Vertex AI**: Vertex supports two authentication modes:
-- Express mode (`VERTEX_API_KEY`): Uses the Gemini API endpoint; supports Gemini models only.
-- OAuth mode (`VERTEX_PROJECT` + Application Default Credentials via `gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`): Supports all Vertex models including partner models (Anthropic Claude, Mistral, etc.).
+**Note on Vertex AI (changed 2026-09-21)**: Vertex has ONE authentication mode — OAuth over a Google Cloud project, using Application Default Credentials (`gcloud auth application-default login`) or a service account (`GOOGLE_APPLICATION_CREDENTIALS`). It reaches every Vertex model, partner models (Anthropic Claude, Mistral, etc.) included.
+
+The Express API-key mode (`VERTEX_API_KEY`) is **removed**, not deprecated: the variable is no longer read anywhere. Express served Gemini models from the plain Gemini API endpoint, which `GEMINI_API_KEY` and `g@` already do.
+
+You do not have to set `VERTEX_PROJECT`. Claudish resolves the project in this order, and stops at the first answer:
+
+1. `VERTEX_PROJECT`, then `GOOGLE_CLOUD_PROJECT`
+2. `quota_project_id` in `~/.config/gcloud/application_default_credentials.json`
+3. `gcloud config get project`
+
+If none of them answers, the error says so and names both remedies (`VERTEX_PROJECT=…` or `gcloud config set project …`). The project is resolved once per process and never written to disk, so `gcloud config set project` takes effect on the next run. `VERTEX_LOCATION` defaults to `us-central1`.
 
 **Note on OpenCode Zen (changed 2026-08-22)**: `OPENCODE_API_KEY` is now **required** for every model on the zen endpoint. Claudish previously sent `"Bearer public"` when no key was set, on the basis that free-tier models (cost.input === 0) needed no credential. The endpoint answers `401 — Missing API key` to that token, and because the fallback also made the provider report **Ready** without ever issuing a request, the failure only surfaced under a live test. The fallback has been removed; a Zen row with no key now correctly reads "not set".
 
 **Note on OpenCode Zen Go (changed 2026-09-02)**: `zgo@` used to accept `OPENCODE_API_KEY` as an alias, on the documented claim that a key minted for one OpenCode tier is refused by the other with a `401`. That claim was measured and is false — a Zen Go key is accepted by the plain Zen endpoint (`200`), against a bogus-key control that endpoint answers `401`. The alias is removed: `zgo@` requires `OPENCODE_GO_API_KEY`. The reason is billing, not access — `opencode-zen-go` is classified as a flat-rate plan, so a metered Zen key reaching it would have been reported as `SUB` at `$0` while OpenCode billed per token. If you previously ran `zgo@` on `OPENCODE_API_KEY`, set `OPENCODE_GO_API_KEY` to the key your Lite Plan subscription minted.
+
+**Note on Alibaba Model Studio — four products, three isolated silos.** Model Studio (also fronted by the QwenCloud console; same service, two consoles) sells four things whose keys and base URLs are, in Alibaba's own words, "completely isolated and must be used in matching pairs". Every silo answers every other silo's key with a near-identical 401, so picking the wrong key is both easy and hard to diagnose. Each silo has its own provider and its own variable, so you can hold all three keys at the same time:
+
+| Product | Billing unit | Prefix | Key | Host |
+|---------|--------------|--------|-----|------|
+| **Coding Plan** | Subscription metered in **requests** — 6,000 per 5h, 45,000 per week, 90,000 per month ($50/month in Alibaba's published pricing as of 2026-09-17) | `qcode@` | `QWEN_CODING_PLAN_API_KEY` | `coding-intl.dashscope.aliyuncs.com` |
+| **Token Plan — Individual** | Subscription metered in **Credits** | `qtoken@` | `QWEN_TOKEN_PLAN_API_KEY` | `token-plan.ap-southeast-1.maas.aliyuncs.com` |
+| **Token Plan — Team** | Subscription metered in **Credits**, one key per seat | `qtoken@` | `QWEN_TOKEN_PLAN_API_KEY` | `token-plan.ap-southeast-1.maas.aliyuncs.com` |
+| **Credit Packs** | Extra Credits with a limited validity window | n/a — a top-up on Token Plan Credits | — | — |
+| **Pay-as-you-go** | Metered **per token** | `qpay@` | `DASHSCOPE_API_KEY` | `dashscope-intl.aliyuncs.com` |
+
+- **One product, one variable, one prefix.** Each Alibaba product is named by the variable that opens it and the prefix that selects it, and no product accepts a second spelling of either. A name that identifies a vendor (`QWEN_…`) or a category (`…CLOUD_PLAN…`) is true of more than one of these three products and therefore selects none of them, which is how a subscription key ends up signing a metered request.
+- **No key ever crosses a silo.** A Coding Plan key set as the Token Plan's variable is rejected by the Token Plan host, and the reverse holds too; `DASHSCOPE_API_KEY` is metered and must never stand in for either subscription, which would cross a plan with a per-token bill. Claudish names the sibling variables in its "no API key" and 401 messages precisely because they are the keys you are most likely to already have exported.
+- **The key format identifies nothing.** Alibaba documents `sk-sp-…` as the Coding Plan's format; a measured Token Plan key has the same prefix. Claudish never infers a product from a key's bytes, and neither should you.
+- **A bare Qwen name tries the Coding Plan first.** `qwen3.*` and `qwen3-*` names route Coding Plan → Token Plan → OpenCode Zen Go → PAYG → OpenRouter, each step only when its credential is present (see §5.3). The Coding Plan serves other vendors' namespaces (`glm-4.7`, `glm-5`, `kimi-k2.5`, `MiniMax-M2.5`) alongside both Qwen naming styles, and its model-list endpoint is public — it answers in full with no credential at all — so neither the name nor the list can establish that *your* key covers a model. Alibaba answers an id outside the plan with `400 Model not exist` (measured on the Token Plan and PAYG hosts), and claudish does not move on to the next candidate after that error. To pin one product, name it: `qcode@qwen3-coder-plus`, `qtoken@qwen3.7-plus`.
+- **Credit Packs need no configuration.** They change the Credits balance, never the route or the dynamic models catalog.
+- **Individual vs Team is not modelled.** A key's edition is not derivable from anything claudish can read, so nothing in claudish depends on it.
 
 ### 3.4 Custom Endpoints (Remote Providers)
 
@@ -230,13 +257,16 @@ Claudish automatically loads `.env` from the current working directory at startu
 |----------|----------|---------|
 | `GEMINI_BASE_URL` | Google Gemini API | `https://generativelanguage.googleapis.com` |
 | `OPENAI_BASE_URL` | OpenAI API (also for Azure-compatible) | `https://api.openai.com` |
-| `MINIMAX_BASE_URL` | MiniMax API | `https://api.minimaxi.com` |
+| `MINIMAX_BASE_URL` | MiniMax API | `https://api.minimax.io`; set `https://api.minimaxi.com` for a China-platform key |
 | `MINIMAX_CODING_BASE_URL` | MiniMax Coding Plan endpoint | `https://api.minimax.io` |
 | `MOONSHOT_BASE_URL` | Kimi/Moonshot API | `https://api.moonshot.ai` |
 | `KIMI_BASE_URL` | Alias for `MOONSHOT_BASE_URL` | |
 | `ZHIPU_BASE_URL` | GLM/Zhipu API | `https://open.bigmodel.cn` |
 | `GLM_BASE_URL` | Alias for `ZHIPU_BASE_URL` | |
 | `ZAI_BASE_URL` | Z.AI API | `https://api.z.ai` |
+| `QWEN_TOKEN_PLAN_BASE_URL` | Alibaba Token Plan endpoint | `https://token-plan.ap-southeast-1.maas.aliyuncs.com` |
+| `QWEN_CODING_PLAN_BASE_URL` | Alibaba Coding Plan endpoint | `https://coding-intl.dashscope.aliyuncs.com` |
+| `DASHSCOPE_BASE_URL` | Alibaba PAYG endpoint; repoint here for a mainland-China account | `https://dashscope-intl.aliyuncs.com` |
 | `OLLAMACLOUD_BASE_URL` | OllamaCloud hosted API | `https://ollama.com` |
 | `OPENCODE_BASE_URL` | OpenCode Zen API (base; `/v1/chat/completions` appended) | `https://opencode.ai/zen` |
 | `LITELLM_BASE_URL` | LiteLLM proxy server URL (**required** to enable LiteLLM routing) | none |
@@ -414,10 +444,13 @@ Provider part is **case-insensitive**. Shortcuts are resolved to canonical provi
 | `zai` | `zai` | Z.AI Anthropic-compatible API (`ZAI_API_KEY`) |
 | `sakana`, `fugu` | `sakana` | Sakana Fugu API / token plan (`SAKANA_API_KEY`) |
 | `sc` | `sakana-coding` | Sakana Fugu Subscription (`SAKANA_CODING_API_KEY` or `SAKANA_API_KEY`) |
+| `qtoken` | `qwen-token-plan` | Alibaba Token Plan — Model Studio subscription, Credits (`QWEN_TOKEN_PLAN_API_KEY`) |
+| `qcode` | `qwen-coding` | Alibaba Coding Plan — Model Studio subscription, requests (`QWEN_CODING_PLAN_API_KEY`) |
+| `qpay` | `qwen-payg` | Alibaba PAYG — Model Studio pay-as-you-go, per token (`DASHSCOPE_API_KEY`) |
 | `oc`, `llama`, `lc`, `meta` | `ollamacloud` | OllamaCloud hosted API (`OLLAMA_API_KEY`) |
 | `zen` | `opencode-zen` | OpenCode Zen (`OPENCODE_API_KEY` required) |
 | `zengo`, `zgo` | `opencode-zen-go` | OpenCode Zen Go subscription plan (`OPENCODE_GO_API_KEY` required) |
-| `v`, `vertex` | `vertex` | Vertex AI (`VERTEX_API_KEY` or `VERTEX_PROJECT`) |
+| `v`, `vertex` | `vertex` | Vertex AI — Application Default Credentials (`VERTEX_PROJECT` optional) |
 | `mistral` | `mistralai` | Direct Mistral API (`MISTRAL_API_KEY`) |
 | `ag`, `antigravity` | `antigravity` | Gemini via your Antigravity subscription (`claudish login antigravity`) |
 | `go` | `antigravity` | _deprecated alias_ — Gemini Code Assist was retired by Google |
@@ -448,7 +481,9 @@ When no `provider@` prefix is given, Claudish detects the provider from the mode
 | `z-ai/*` or `zai/*` | Z.AI | |
 | `fugu*` or `sakana/*` | Sakana Fugu | |
 | `ollamacloud/*` or `meta-llama/*` or `llama-*` or `llama3*` | OllamaCloud | |
-| `qwen*` | Auto-routed (no direct API) | Falls to OpenRouter or LiteLLM |
+| `qwen3.*` (dotted Model Studio names, e.g. `qwen3.7-plus`) | Alibaba Token Plan (`qtoken@`) | Bare-name routing chain: Alibaba Coding Plan (`qcode@`), Alibaba Token Plan (`qtoken@`), OpenCode Zen Go, Alibaba PAYG (`qpay@`), then OpenRouter — each step only if that credential is present |
+| `qwen3-*` (hyphenated, e.g. `qwen3-coder-plus`) | Auto-routed (no direct API) | Same routing chain as `qwen3.*` |
+| `qwen*` (everything else) | Auto-routed (no direct API) | Falls to OpenRouter or LiteLLM |
 | `poe:*` | Poe | Literal `poe:` prefix |
 | `anthropic/*` or `claude-*` | Native Anthropic | Claude Code's own auth, no proxy |
 | `vendor/model` (unknown vendor) | Error | Must use explicit `openrouter@vendor/model` |
@@ -745,8 +780,8 @@ Other behaviours worth knowing:
 - **A row's base URL can be overridden**, when it declares one (e.g. `TUNING_ENGINES_BASE_URL` on `tuningengines`), from `config.endpoints["TUNING_ENGINES_BASE_URL"]` — what `claudish config` and the Providers tab's URL editor write — or from the environment variable of the same name. Config wins over environment, matching the `apiKeys` rule.
 - **A malformed base-URL override skips the row rather than falling back** to the bundled public URL, whichever source it came from. Silently redirecting a typo to a vendor's public host would leak the traffic a self-hosted gateway exists to contain. An unexpanded `${VAR}` placeholder is treated as *unset*, not as malformed.
 - **Turning a row off takes effect on the next start.** Runtime registration cannot be undone within a live process, so a row disabled mid-session keeps answering until claudish restarts. Claudish prints a warning naming the row and the reason rather than leaving that silent.
-- **No model roster ships with a row.** Catalog vendors get a free-text model prompt in the picker; model metadata comes from models-index or is absent.
-- **Nothing claudish ships puts a bundled row in a bare-name routing chain.** No row declares native model patterns or a legacy prefix, and none appears in the default routing rules, so a row is reachable only as `vendor@model` — an ambient key can add a picker row but cannot silently receive a request. (The one exception is your own doing: `defaultProvider` is appended to every bare chain, so setting `"defaultProvider": "groq"` does route bare names there.)
+- **No model list ships with a row.** Catalog vendors get a free-text model prompt in the picker; model metadata comes from models-index or is absent.
+- **Nothing claudish ships puts a bundled row in a bare-name routing chain.** No row declares native model patterns or a legacy prefix, and none is bound to a route in the cloud models catalog, so a row is reachable only as `vendor@model` — an ambient key can add a picker row but cannot silently receive a request. Routing proposes a provider only when a catalog connection resolves to it, so an unbound row cannot be proposed for any model. (`together` and `fireworks` are bound on purpose: they are gateways the catalog maps, and activating one is you naming it.) The other exception is also your own doing: the fallback is appended to every bare chain, so setting `"defaultProvider": "groq"` does route bare names there.
 - An invalid `predefinedEndpoints` block warns once and is treated as absent, never as "off".
 - **Evidence:** every shipped row is *probe*-verified — its configured path was confirmed to reach the vendor's own auth layer, and a deliberately bogus sibling path was confirmed to answer differently. **No row is live-verified**; that establishes the route, not the vendor's streaming dialect on a successful turn.
 

@@ -16,12 +16,19 @@
  *     re-delegates → getHeaders() returns the refreshed token
  *   - getEndpoint() / transformPayload() / getRequestInit() are unchanged
  *
- * Hermetic: mock credentials.getRequestAuth (delegation target) and the vertex-auth
- * manager (so refreshToken is observable and no gcloud/ADC is touched).
+ * Hermetic: a fake `vertex` credential registered on the REAL authority delegates
+ * to `getRequestAuthMock` (the real one is re-registered in afterAll), and the
+ * vertex-auth manager is mocked (so refreshToken is observable and no gcloud/ADC
+ * is touched). Never `mock.module()` the authority: Bun keeps that replacement
+ * for the rest of the process, and every later file that imports `credentials`
+ * got a fake with no `register`.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { credentials } from "../../auth/credentials/authority.js";
+import type { CredentialProvider } from "../../auth/credentials/types.js";
 import type { VertexConfig } from "../../auth/vertex-auth.js";
+import { classifyConnectionError } from "../../handlers/shared/connection-error.js";
 
 const {
   buildVertexOAuthEndpoint: actualBuildVertexOAuthEndpoint,
@@ -38,11 +45,32 @@ let getRequestAuthMock = mock(async (_name: string, _ctx: any) => ({
   headers: { Authorization: `Bearer ${currentToken}` },
 }));
 
-mock.module("../../auth/credentials/authority.js", () => ({
-  credentials: {
-    getRequestAuth: (name: string, ctx: any) => getRequestAuthMock(name, ctx),
-  },
-}));
+// Registered under "vertex" ONLY. The authority consumes the name in its registry
+// lookup, so the fake passes that name on itself; the mock is reached only when
+// the transport asked for "vertex", which the delegation assertions pin together.
+const fakeVertexCredential: CredentialProvider = {
+  catalogName: "vertex",
+  isAvailable: async () => true,
+  describeReadiness: async () => ({ readiness: "present" }),
+  getRequestAuth: (ctx) => getRequestAuthMock("vertex", ctx),
+};
+
+let realVertexCredential: CredentialProvider | undefined;
+
+beforeAll(() => {
+  realVertexCredential = credentials.get("vertex");
+  if (!realVertexCredential) {
+    throw new Error("the authority has no vertex credential to restore after this file");
+  }
+  credentials.register(fakeVertexCredential, ["vertex"]);
+  credentials.invalidate("vertex");
+});
+
+afterAll(() => {
+  // Put the real credential back so no later file in the Bun run signs with the fake.
+  if (realVertexCredential) credentials.register(realVertexCredential, ["vertex"]);
+  credentials.invalidate("vertex");
+});
 
 mock.module("../../auth/vertex-auth.js", () => ({
   getVertexAuthManager: () => ({
@@ -164,6 +192,38 @@ describe("VertexProviderTransport — delegated auth", () => {
     expect(refreshTokenMock).toHaveBeenCalledTimes(1);
     // Re-delegated artifact carries the refreshed token.
     expect((await t.getHeaders()).Authorization).toBe("Bearer vertex-token-B");
+  });
+
+  test("refreshAuth() preserves the credential failure as `cause`", async () => {
+    // `classifyConnectionError` finds a network failure by walking `.code` and
+    // then the `.cause` chain to depth 8. This catch used to rethrow a bare
+    // `new Error("Vertex AI auth failed: …")`, discarding both — so a DNS or
+    // refused-connection failure while minting the token classified as `null`,
+    // ComposedHandler's refreshAuth catch answered 401, and `isRetryableError`
+    // read that as retryable and walked the user down the fallback chain during
+    // a network outage. One extra argument is the whole fix; this pins it.
+    const underlying = Object.assign(new Error("Unable to connect."), {
+      code: "ConnectionRefused",
+    });
+    getRequestAuthMock = mock(async () => {
+      throw underlying;
+    });
+
+    const t = new VertexProviderTransport(config, parseVertexModel("gemini-2.5-flash"));
+
+    let thrown: unknown;
+    try {
+      await t.refreshAuth();
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect((thrown as Error).message).toContain("Vertex AI auth failed");
+    expect((thrown as Error).cause).toBe(underlying);
+    expect(classifyConnectionError(thrown)).toEqual({
+      kind: "refused",
+      code: "ConnectionRefused",
+    });
   });
 
   test("getEndpoint() / getRequestInit() unchanged; anthropic transformPayload unchanged", () => {

@@ -16,8 +16,13 @@
  *   OAuth present but its refresh REJECTED → the same api-key-shaped result, by a
  *                 different mechanism (cachedAuth null → super.getHeaders()).
  *
- * Hermetic: mock credentials.getRequestAuth (the delegation target), with each
- * fixture shaped like what the REAL half returns, `arm` included.
+ * Hermetic: a fake `openai-codex` credential is registered on the REAL authority
+ * and delegates to `getRequestAuthMock`, with each fixture shaped like what the
+ * REAL half returns, `arm` included. The real credential is saved with
+ * `credentials.get` and re-registered in afterAll. Never `mock.module()` the
+ * authority: Bun keeps that replacement for the rest of the process, so every
+ * later file that imports `credentials` got a fake with no `register` (measured:
+ * 9 failures in openai-codex-refresh-outage.test.ts).
  *
  * "No OAuth" is NOT a throw. `CompositeCredentialProvider.getRequestAuth` falls
  * through to `this.fallback.getRequestAuth(ctx)`, and `ApiKeyCredentialProvider`
@@ -35,9 +40,12 @@
  * fixture — see the afterEach.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { credentials } from "../../auth/credentials/authority.js";
 import { clearSignedArm } from "../../auth/credentials/billing-probe.js";
+import type { CredentialProvider } from "../../auth/credentials/types.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
+import { OpenAICodexTransport } from "./openai-codex.js";
 
 const FAKE_TOKEN = "codex-oauth-token-abc";
 const FAKE_ACCOUNT = "acct-123";
@@ -77,13 +85,33 @@ const API_KEY_AUTH = {
 
 let getRequestAuthMock = mock(async (_name: string, _ctx: any) => CODEX_OAUTH_AUTH as any);
 
-mock.module("../../auth/credentials/authority.js", () => ({
-  credentials: {
-    getRequestAuth: (name: string, ctx: any) => getRequestAuthMock(name, ctx),
-  },
-}));
+// Registered under "openai-codex" ONLY. The authority consumes the name in its
+// registry lookup, so the fake passes that name on itself; the mock is reached
+// only when the transport asked for "openai-codex", which is what the
+// "delegates with the openai-codex catalog name" assertions pin together.
+const fakeCodexCredential: CredentialProvider = {
+  catalogName: "openai-codex",
+  isAvailable: async () => true,
+  describeReadiness: async () => ({ readiness: "present" }),
+  getRequestAuth: (ctx) => getRequestAuthMock("openai-codex", ctx),
+};
 
-const { OpenAICodexTransport } = await import("./openai-codex.js");
+let realCodexCredential: CredentialProvider | undefined;
+
+beforeAll(() => {
+  realCodexCredential = credentials.get("openai-codex");
+  if (!realCodexCredential) {
+    throw new Error("the authority has no openai-codex credential to restore after this file");
+  }
+  credentials.register(fakeCodexCredential, ["openai-codex"]);
+  credentials.invalidate("openai-codex");
+});
+
+afterAll(() => {
+  // Put the real credential back so no later file in the Bun run signs with the fake.
+  if (realCodexCredential) credentials.register(realCodexCredential, ["openai-codex"]);
+  credentials.invalidate("openai-codex");
+});
 
 const provider: RemoteProvider = {
   name: "openai-codex",

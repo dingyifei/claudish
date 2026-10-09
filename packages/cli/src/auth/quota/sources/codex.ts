@@ -147,12 +147,12 @@ export function scrapeCodexHeaders(headers: Headers): PlanUsage | undefined {
 
 /**
  * Pick a model that actually exists on this account, from the Codex CLI's own
- * cache of the roster it was served.
+ * cache of the dynamic models catalog it was served.
  *
  * This matters more than it looks: a stale model id is rejected with a 400,
  * and a 400 carries NO `x-codex-*` headers at all — so a wrong id here is
  * indistinguishable from "this provider does not report quota". Discovering
- * the id rather than pinning one keeps a roster change from silently
+ * the id rather than pinning one keeps a change in the dynamic models catalog from silently
  * presenting as a missing feature.
  */
 function resolveProbeModel(): string | undefined {

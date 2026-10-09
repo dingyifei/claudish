@@ -1,0 +1,15 @@
+[2026-09-23T03:20:57.354Z] [Recovery] episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7 opened for Recov at http://127.0.0.1:54341/v1/chat/completions (refused/ConnectionRefused)
+[2026-09-23T03:20:57.354Z] [Recovery] Recov attempt 1 failed: ConnectionRefused (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, ladder 0)
+[2026-09-23T03:20:57.355Z] [Recovery] Recov waiting 5s before attempt 2 (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, 1 waiting)
+[2026-09-23T03:20:57.355Z] [Recovery] Recov attempt 2 failed: ConnectionRefused (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, ladder 0)
+[2026-09-23T03:20:57.355Z] [Recovery] banner will draw on magmux pane 0 (magmux launched by claudish)
+[2026-09-23T03:20:57.355Z] [Recovery] banner painted for episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7 on magmux pane 0 — lease granted
+[2026-09-23T03:21:02.358Z] [Recovery] Recov attempt 3 failed: ConnectionRefused (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, ladder 1)
+[2026-09-23T03:21:02.358Z] [Recovery] Recov waiting 10s before attempt 4 (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, 2 waiting)
+[2026-09-23T03:21:02.358Z] [Recovery] Recov attempt 4 failed: ConnectionRefused (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, ladder 1)
+[2026-09-23T03:21:12.361Z] [Recovery] Recov attempt 5 failed: ConnectionRefused (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, ladder 2)
+[2026-09-23T03:21:12.361Z] [Recovery] Recov waiting 30s before attempt 6 (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, 2 waiting)
+[2026-09-23T03:21:12.361Z] [Recovery] Recov attempt 6 failed: ConnectionRefused (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7, ladder 2)
+[2026-09-23T03:21:42.475Z] [Recovery] Recov recovered after 7 attempts in 45120ms (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7)
+[2026-09-23T03:21:57.672Z] [Recovery] Recov recovered after 8 attempts in 60316ms (episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7)
+[2026-09-23T03:21:57.672Z] [Recovery] episode fdd99463-0ffa-4bc9-b87f-2fbe2b8be6a7 closed: recovered after 60318ms and 8 attempts

@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GROK_PUBLIC_CLIENT_ID } from "../../auth/grok-oauth.js";
+import { classifyConnectionError } from "../../handlers/shared/connection-error.js";
 import {
   DEFAULT_GROK_PROXY_URL,
   FALLBACK_GROK_CLIENT_VERSION,
@@ -597,5 +598,40 @@ describe("forceRefreshGrokAccessToken", () => {
     // A rejected promise must leave the latch reusable instead of poisoning every later attempt.
     expect(failedFetch).toHaveBeenCalledTimes(1);
     expect(successfulFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a refused token exchange names the AUTH host, not the inference host", () => {
+  test("the error carries claudishEndpoint = the token endpoint", async () => {
+    // `getHeaders()` is a `gk@` request's FIRST network touch and it reaches
+    // `auth.x.ai` — never `api.x.ai`. `ComposedHandler` falls back to the MODEL
+    // endpoint when the error carries no `claudishEndpoint`, so without this
+    // the recovery banner, the `[Recovery]` log and the episode key all named a
+    // host that was never contacted, and told the user to check their network
+    // for it. `local.ts` attaches the same property for the same reason.
+    writeAuth({ [OIDC_SCOPE]: expiredEntry() });
+    let connectFailure: unknown;
+    try {
+      await realFetch("http://127.0.0.1:1/refused-on-purpose");
+    } catch (e) {
+      connectFailure = e;
+    }
+    globalThis.fetch = mock(async () => {
+      throw connectFailure;
+    }) as unknown as typeof fetch;
+
+    const error = await rejectedError(resolveGrokAccessToken());
+
+    expect((error as { claudishEndpoint?: string }).claudishEndpoint).toBe(
+      "https://auth.x.ai/oauth2/token"
+    );
+    // And the syscall evidence still rides in `cause`, so this remains a
+    // CONNECTION failure rather than an auth one — a network fault during a
+    // refresh must not walk the user down the fallback chain onto metered
+    // billing.
+    expect(classifyConnectionError(error)).toEqual({
+      kind: "refused",
+      code: "ConnectionRefused",
+    });
   });
 });

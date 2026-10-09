@@ -119,6 +119,18 @@ export interface KeychainResolveResult {
   value?: string;
   /** True when the keychain could not be consulted (NOT when it simply had no item). */
   failed: boolean;
+  /**
+   * One-line diagnostic for `failed`, taken from the engine's own
+   * `KeychainEnumeration.error` (`security`'s stderr, or the exit code when it
+   * said nothing). Present only when `failed` is true, and never key material —
+   * enumeration runs `dump-keychain` WITHOUT `-d`, so it never reads item data.
+   *
+   * It exists so the caller can say WHICH store was unreachable rather than
+   * "unavailable". The authority turns this into a `failed` readiness detail,
+   * which is the difference between telling a user to unlock their keychain and
+   * telling them to buy a subscription they already have.
+   */
+  error?: string;
 }
 
 /**
@@ -129,11 +141,16 @@ export interface KeychainResolveResult {
  * costs no per-variable spawn at all. Only a name that IS present pays the
  * ~17ms value lookup.
  *
- * NEVER THROWS. A keychain failure degrades this provider to "no credential",
- * which lets the caller fall through to 1Password and lets a proxy or MCP
- * server keep running. The same policy op-source applies under
- * `onAuthFailure: "skip"`, and for the same reason: a credential backend having
- * a bad day must not take down the process.
+ * NEVER THROWS, AND IT NEVER HAD TO. A failure is DATA here — `failed` plus
+ * `error` — not an exception and not a silent `undefined`. That distinction is
+ * the whole point: throwing would force every caller into a try/catch whose
+ * only honest outcome is the same flag, and returning a bare "no value" is what
+ * turned a locked keychain into "this user has no credential" and moved a
+ * flat-rate subscriber onto a metered provider without a word. A keychain
+ * failure still degrades this provider to "no credential" for THIS resolve, so
+ * the caller falls through to 1Password and a proxy or MCP server keeps running
+ * — the same policy op-source applies under `onAuthFailure: "skip"`. What
+ * changes is that the caller can now tell the two apart and say so.
  */
 export function resolveKeychainKeyForEnvVars(wanted: Iterable<string>): KeychainResolveResult {
   if (!hasKeychainSource()) return { failed: false };
@@ -151,17 +168,39 @@ export function resolveKeychainKeyForEnvVars(wanted: Iterable<string>): Keychain
       if (value) return { value, failed: false };
     }
   } catch (err) {
-    warnOnce(
-      `[claudish] macOS Keychain lookup skipped: ${err instanceof KeychainError ? err.message : String(err)}`
-    );
-    return { failed: true };
+    const detail = err instanceof KeychainError ? err.message : String(err);
+    warnOnce(`[claudish] macOS Keychain lookup skipped: ${detail}`);
+    return { failed: true, error: detail };
   }
   if (failed) {
     warnOnce(
       "[claudish] macOS Keychain could not be enumerated — treating this provider as unresolved rather than uncredentialed."
     );
+    // The engine already recorded WHY, and this read is normally a memo hit: the
+    // same `enumerateKeychainVars()` call `lookupKeychainVar` just made is inside
+    // the 3-second burst window, so asking for its diagnostic costs no extra spawn.
+    // Taking the reason from the engine rather than re-deriving it here keeps
+    // one description of the failure instead of two that can disagree.
+    return { failed: true, error: keychainFailureDetail() };
   }
   return { failed };
+}
+
+/**
+ * The engine's own reason the keychain could not be enumerated, if it still has
+ * one. Never throws. Called straight after `lookupKeychainVar` enumerated, so it
+ * is a memo hit inside the 3-second burst window; only if that window closed in
+ * between does it re-run the one `dump-keychain` the lookup already made. A
+ * re-read that now succeeds yields `undefined`, and a `failed` readiness without
+ * a detail is still a correct `failed`.
+ */
+function keychainFailureDetail(): string | undefined {
+  try {
+    const listed = enumerateKeychainVars();
+    return listed.failed ? listed.error : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

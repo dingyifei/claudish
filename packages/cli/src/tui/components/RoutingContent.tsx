@@ -1,45 +1,301 @@
 import type { ScrollBoxRenderable } from "@opentui/core";
 /** @jsxImportSource @opentui/react */
 import { useEffect, useRef } from "react";
-import type { ClaudishProfileConfig } from "../../profile-config.js";
-import { DEFAULT_ROUTING_RULES } from "../../providers/default-routing-rules.js";
+import {
+  type DefaultProviderSource,
+  type ResolvedDefaultProvider,
+  resolveDefaultProvider,
+} from "../../default-provider.js";
+import type { ClaudishProfileConfig, RoutingRules } from "../../profile-config.js";
+import { hopLabel as candidateHopLabel } from "../../providers/routing-rules.js";
 import { DETAIL_H, getChainProviders } from "../constants.js";
 import { deriveProbeOutcome } from "../probe-outcome.js";
 import { providerIsReady } from "../providers.js";
 import { A, C } from "../theme.js";
-import type { MergedRule, Mode, ProbeEntry, ProbeMode } from "../types.js";
+import type {
+  DroppedOutcome,
+  MergedRule,
+  Mode,
+  ProbeEntry,
+  ProbeMode,
+  ProbeSummary,
+} from "../types.js";
+
+/**
+ * What a dropped row says removed it. Total over the dropped outcomes, so a new
+ * outcome cannot render as nothing.
+ */
+const DROPPED_TEXT: Record<DroppedOutcome, string> = {
+  "no-credential": "no credential",
+  "credential-unreadable": "credential could not be read",
+  "not-served": "the account does not serve it",
+  "excluded-by-membership": "not in the plan's membership",
+};
+
+/**
+ * How a probe row's status reads: its glyph, its text, and its colour, read from
+ * `C` at render time (the palette changes when the theme is detected).
+ */
+function rowStatusView(entry: ProbeEntry): { icon: string; color: string; text: string } {
+  switch (entry.status) {
+    case "unverified":
+      return { icon: "◐", color: C.cyan, text: "native — not probed" };
+    case "success":
+      return {
+        icon: "●",
+        color: C.green,
+        text: entry.ms !== undefined ? `${entry.ms}ms` : "success",
+      };
+    case "failed":
+      return { icon: "✗", color: C.red, text: entry.error ?? "failed" };
+    case "testing":
+      return { icon: "◌", color: C.yellow, text: "testing..." };
+    case "dropped":
+      return {
+        icon: "○",
+        // A subscription the user holds whose key could not be read is a
+        // warning: the request lands on a different hop.
+        color: entry.outcome === "credential-unreadable" ? C.yellow : C.dim,
+        text: entry.outcome ? `dropped · ${DROPPED_TEXT[entry.outcome]}` : "dropped",
+      };
+    case "skipped":
+      return { icon: "·", color: C.dim, text: "not reached" };
+    case "no_key":
+      return { icon: "○", color: C.dim, text: "not configured, skipping" };
+    case "pending":
+      return { icon: "○", color: C.dim, text: "waiting" };
+  }
+}
+
+/** A no-route hint, one line per row; the hint is multi-line text. */
+function hintLines(hint: string | undefined): { id: string; text: string }[] {
+  if (!hint) return [];
+  return hint
+    .split("\n")
+    .filter((text) => text.trim().length > 0)
+    .map((text, n) => ({ id: `hint-${n}`, text }));
+}
 
 // Format a chain as inline text: "kimi → openrouter"
 function chainStr(chain: string[]): string {
   return chain.join(" → ");
 }
 
-// Reasons shown beneath each probe entry
-const PROVIDER_REASONS: Record<string, string> = {
-  litellm: "LiteLLM proxy",
-  "opencode-zen": "Free tier (OpenCode Zen)",
-  "opencode-zen-go": "Zen Go plan",
-  kimi: "Native Kimi API",
-  "kimi-coding": "Kimi Coding Plan",
-  minimax: "Native MiniMax API",
-  "minimax-coding": "MiniMax Coding Plan",
-  glm: "Native GLM API",
-  "glm-coding": "GLM Coding Plan",
-  "qwen-cloud": "Qwen Plan",
-  google: "Direct Gemini API",
-  openai: "Direct OpenAI API",
-  "openai-codex": "OpenAI Codex (Responses API)",
-  zai: "Z.AI API",
-  ollamacloud: "Cloud Ollama",
-  vertex: "Vertex AI Express",
-  openrouter: "Fallback: 580+ models",
+/**
+ * A rule's CHAIN cell, its colour read from `C` at render time. `[]` is a rule
+ * too: the user's explicit no-route, which a join would render as nothing.
+ */
+function ruleChainCell(chain: string[], selected: boolean): { text: string; fg: string } {
+  if (chain.length === 0) return { text: "no route", fg: C.yellow };
+  return { text: chainStr(chain), fg: selected ? C.cyan : C.fgMuted };
+}
+
+/** How a header segment is coloured; {@link toneColor} maps it onto `C` at render time. */
+export type HeaderTone = "title" | "value" | "warn" | "muted" | "dim";
+
+/** One run of Routing-tab header text in one tone. */
+export interface HeaderSegment {
+  text: string;
+  tone: HeaderTone;
+}
+
+export interface RoutingHeaderInput {
+  /** The rules in the global config (or the `--config` file). */
+  globalRules: RoutingRules;
+  /** The rules in the project's `.claudish.json`. */
+  localRules: RoutingRules;
+  /** The fallback hop in force, and where it was set. */
+  resolved: Pick<ResolvedDefaultProvider, "provider" | "source">;
+}
+
+/**
+ * The Routing tab's header: the one routing fact that is global rather than per
+ * model. Pure, as lines of toned segments the renderer colours.
+ *
+ * - **A `"*"` rule** decides every model no other rule matches, and a matched
+ *   rule is used verbatim: the catalog is not consulted and no fallback hop is
+ *   appended (`explainBareName`). The header says so and draws no fallback line,
+ *   which would name a hop no request takes. The project file's `"*"` wins over
+ *   the global one, because the project file overwrites the global one key by
+ *   key (`loadRoutingRules`); a `"*"` whose value is not a list is no rule to the
+ *   router, so it is none here either.
+ * - **Otherwise** the fallback hop: the provider appended after everything the
+ *   catalog maps, or none when it is disabled.
+ */
+export function routingHeaderLines({
+  globalRules,
+  localRules,
+  resolved,
+}: RoutingHeaderInput): HeaderSegment[][] {
+  const catchAll = { ...globalRules, ...localRules }["*"];
+  if (Array.isArray(catchAll)) {
+    const scope = Object.hasOwn(localRules, "*") ? "project" : "global";
+    return [
+      [
+        { text: ' "*" rule:', tone: "title" },
+        { text: "  decides every model no other rule matches", tone: "muted" },
+      ],
+      [
+        { text: "  → ", tone: "dim" },
+        catchAll.length > 0
+          ? { text: chainStr(catchAll), tone: "value" }
+          : { text: "no route", tone: "warn" },
+        { text: ` (${scope})`, tone: "muted" },
+      ],
+      [{ text: "  The catalog and the fallback hop are not used.", tone: "dim" }],
+    ];
+  }
+  return fallbackHopLines(resolved);
+}
+
+/**
+ * Where the header says the fallback hop was set, named as the user sets it.
+ * `--default-provider` reaches this process as the env variable (index.ts
+ * exports it), so a flag reads as `CLAUDISH_DEFAULT_PROVIDER` here.
+ */
+const FALLBACK_SOURCE_LABEL: Record<DefaultProviderSource, string> = {
+  "cli-flag": "--default-provider",
+  "env-var": "CLAUDISH_DEFAULT_PROVIDER",
+  "config-file": "config",
+  // Both route identically: "no preference" takes openrouter.
+  "openrouter-key": "default",
+  hardcoded: "default",
 };
+
+/** The header without a `"*"` rule: which provider occupies the last position, and why. */
+function fallbackHopLines(resolved: RoutingHeaderInput["resolved"]): HeaderSegment[][] {
+  const source = ` (${FALLBACK_SOURCE_LABEL[resolved.source]})`;
+  const note: HeaderSegment[] = [
+    {
+      text: "  --default-provider overrides this for one run and the sessions it starts.",
+      tone: "dim",
+    },
+  ];
+  // An explicitly EMPTY string disables the hop; unset means "no preference"
+  // and takes openrouter. `explainCatalogChain` draws the same line.
+  if (resolved.provider === "") {
+    return [
+      [
+        { text: " Fallback hop:", tone: "title" },
+        { text: "  (none — a model the catalog maps to no provider gets no route)", tone: "muted" },
+      ],
+      [
+        { text: "  → ", tone: "dim" },
+        { text: "disabled", tone: "warn" },
+        { text: `, set to ""${source}`, tone: "muted" },
+      ],
+      note,
+    ];
+  }
+  return [
+    [
+      { text: " Fallback hop:", tone: "title" },
+      { text: "  (tried last, after every provider the catalog maps)", tone: "muted" },
+    ],
+    [
+      { text: "  → ", tone: "dim" },
+      { text: resolved.provider, tone: "value" },
+      { text: source, tone: "muted" },
+    ],
+    note,
+  ];
+}
+
+/**
+ * The fallback hop the header shows: `resolveDefaultProvider` over the env and
+ * the config, the resolver the proxy and `route()` read, so the header cannot
+ * name a hop a request does not take. `CLAUDISH_DEFAULT_PROVIDER=` (empty) beats
+ * a config value, as it does for a request. A project `.claudish.json`
+ * `defaultProvider` is not read, because no routing path reads it.
+ */
+export function resolveFallbackHop(
+  config: ClaudishProfileConfig,
+  env: NodeJS.ProcessEnv = process.env
+): Pick<ResolvedDefaultProvider, "provider" | "source"> {
+  return resolveDefaultProvider({ config, env });
+}
+
+/** A header tone's colour, read from `C` at render time, never snapshotted. */
+function toneColor(tone: HeaderTone): string {
+  switch (tone) {
+    case "title":
+      return C.blue;
+    case "value":
+      return C.cyan;
+    case "warn":
+      return C.yellow;
+    case "muted":
+      return C.fgMuted;
+    case "dim":
+      return C.dim;
+  }
+}
+
+/** One scope's rules, from the rows the table shows (disk state, both scopes). */
+function rulesOfScope(mergedRules: MergedRule[], scope: MergedRule["kind"]): RoutingRules {
+  return Object.fromEntries(
+    mergedRules.filter((rule) => rule.kind === scope).map((rule) => [rule.pattern, rule.chain])
+  );
+}
+
+/** The native passthrough's hop label: it has no tier; Claude Code's own auth serves it. */
+const NATIVE_HOP_LABEL = "Claude Code's own auth";
+
+/**
+ * A probe row's hop label: the native row's own auth, else routing-rules.ts's
+ * `hopLabel` — the tier of the provider holding the hop, or "fallback" for the
+ * fallback POSITION whichever provider holds it. `--probe` labels its hops with
+ * the same function, and `describeRouteExplanation` words its "… first" with it.
+ *
+ * Derived, never a per-provider table. The map this replaces (19 hand-written
+ * reasons) labelled OpenRouter "Fallback" wherever it stood in a chain, and any
+ * provider it did not list read as its bare uid; a tier label is right for a
+ * provider added tomorrow with no edit here.
+ */
+export function hopLabel(entry: Pick<ProbeEntry, "status" | "tier" | "position">): string {
+  if (entry.status === "unverified") return NATIVE_HOP_LABEL;
+  return candidateHopLabel(entry);
+}
+
+/**
+ * The text of a probe row's second line: the provider's display name, which the
+ * first line truncates (the three Alibaba products are the definitions' own
+ * names: "Alibaba Coding Plan", "Alibaba Token Plan", "Alibaba PAYG"), then its
+ * hop label.
+ */
+export function probeRowLabel(
+  entry: Pick<ProbeEntry, "displayName" | "status" | "tier" | "position">
+): string {
+  return `${entry.displayName} · ${hopLabel(entry)}`;
+}
+
+/** The hop label's colour, read from `C` at render time, never snapshotted. */
+function hopLabelColor(entry: ProbeEntry): string {
+  if (entry.status === "dropped") return C.dim;
+  if (entry.status === "unverified") return C.cyan;
+  if (entry.position === "fallback") return C.yellow;
+  switch (entry.tier) {
+    case "subscription":
+    case "dynamic-subscription":
+      return C.green;
+    case "native":
+      return C.cyan;
+    case "gateway":
+      return C.blue;
+    case "fallback":
+      return C.yellow;
+    default:
+      return C.dim;
+  }
+}
 
 interface RoutingContentProps {
   config: ClaudishProfileConfig;
   probeMode: ProbeMode;
   probeModel: string;
   probeResults: ProbeEntry[];
+  /** The decision as a whole, from the same explainRoute call as the rows. */
+  probeSummary: ProbeSummary | null;
   mode: Mode;
   routingPattern: string;
   chainSelected: Set<string>;
@@ -67,6 +323,7 @@ export function RoutingContent({
   probeMode,
   probeModel,
   probeResults,
+  probeSummary,
   mode,
   routingPattern,
   chainSelected,
@@ -151,16 +408,17 @@ export function RoutingContent({
         </box>
         <text> </text>
         <text>
-          <span fg={C.dim}>{"Examples: kimi-k2  deepseek-r1  gemini-2.0-flash  gpt-4o"}</span>
-        </text>
-        <text> </text>
-        <text>
           <span fg={C.fgMuted}>
-            {"The probe resolves the fallback chain and tests each provider's"}
+            {"The probe shows the routing chain a request would use, then tests"}
           </span>
         </text>
         <text>
-          <span fg={C.fgMuted}>{"API key in order, stopping at the first success."}</span>
+          <span fg={C.fgMuted}>
+            {"each kept hop in order, stopping at the first success. Dropped"}
+          </span>
+        </text>
+        <text>
+          <span fg={C.fgMuted}>{"candidates are listed with the reason, never tested."}</span>
         </text>
       </box>
     );
@@ -213,79 +471,43 @@ export function RoutingContent({
           </text>
         </box>
         <text> </text>
-        {/* Route source */}
+        {/* Where the chain came from: describeRouteExplanation, the line
+            --probe prints for the same decision. */}
         <text>
-          <span fg={C.fgMuted}>
-            {probeResults[0]?.reason ?? `Chain (${probeResults.length} providers):`}
-          </span>
+          <span fg={C.fgMuted}>{probeSummary?.line ?? ""}</span>
         </text>
+        {probeSummary?.warnings.map((warning) => (
+          <text key={`warning:${warning}`}>
+            <span fg={C.yellow}>{`! ${warning}`}</span>
+          </text>
+        ))}
+        {probeSummary?.notes.map((note) => (
+          <text key={`note:${note}`}>
+            <span fg={C.dim}>{note}</span>
+          </text>
+        ))}
         <text> </text>
-        {/* Chain entries — 2 lines each */}
+        {/* Chain entries — 2 lines each, dropped candidates in place */}
         {probeResults.map((entry, idx) => {
-          const isNoKey = entry.status === "no_key";
+          const isDropped = entry.status === "dropped";
           const isNotReached = entry.status === "skipped";
           const isSelected = entry.status === "success" && probeMode === "done";
-
-          const statusIcon =
-            entry.status === "unverified"
-              ? "◐"
-              : entry.status === "success"
-                ? "●"
-                : entry.status === "failed"
-                  ? "✗"
-                  : entry.status === "testing"
-                    ? "◌"
-                    : isNoKey
-                      ? "○"
-                      : isNotReached
-                        ? "·"
-                        : "○";
-
-          const statusColor =
-            entry.status === "unverified"
-              ? C.cyan
-              : entry.status === "success"
-                ? C.green
-                : entry.status === "failed"
-                  ? C.red
-                  : entry.status === "testing"
-                    ? C.yellow
-                    : C.dim;
-
+          const status = rowStatusView(entry);
           const nameCol = entry.displayName.padEnd(18).substring(0, 18);
 
-          const statusText =
-            entry.status === "unverified"
-              ? "native — not probed"
-              : entry.status === "success"
-                ? entry.ms !== undefined
-                  ? `${entry.ms}ms`
-                  : "success"
-                : entry.status === "failed"
-                  ? (entry.error ?? "failed")
-                  : entry.status === "testing"
-                    ? "testing..."
-                    : isNoKey
-                      ? "not configured, skipping"
-                      : isNotReached
-                        ? "not reached"
-                        : "waiting";
-
-          const reason = PROVIDER_REASONS[entry.provider] ?? entry.provider;
-
           return (
-            <box key={entry.provider} flexDirection="column">
+            <box key={`${idx}:${entry.provider}`} flexDirection="column">
               <text>
                 <span fg={C.dim}>{`${idx + 1}. `}</span>
                 <span
-                  fg={isNoKey ? C.dim : isSelected ? C.strong : isNotReached ? C.dim : C.fgMuted}
+                  fg={isDropped || isNotReached ? C.dim : isSelected ? C.strong : C.fgMuted}
                   attributes={A.boldIf(isSelected)}
                 >
                   {nameCol}
                 </span>
                 <span fg={C.dim}>{"  "}</span>
-                <span fg={statusColor} attributes={A.boldIf(entry.status === "success")}>
-                  {statusIcon} {statusText}
+                <span fg={status.color} attributes={A.boldIf(entry.status === "success")}>
+                  {status.icon} {status.text}
                 </span>
                 {isSelected && (
                   <span fg={C.green} attributes={A.bold}>
@@ -294,8 +516,11 @@ export function RoutingContent({
                 )}
               </text>
               <text>
+                {/* probeRowLabel's two parts, the label in its tier colour */}
                 <span fg={C.dim}>{"    ↳ "}</span>
-                <span fg={isNoKey ? C.dim : C.fgMuted}>{reason}</span>
+                <span fg={isDropped ? C.dim : C.fgMuted}>{entry.displayName}</span>
+                <span fg={C.dim}>{" · "}</span>
+                <span fg={hopLabelColor(entry)}>{hopLabel(entry)}</span>
               </text>
             </box>
           );
@@ -305,7 +530,14 @@ export function RoutingContent({
           <>
             <text> </text>
             <text>
-              {allFailed ? (
+              {probeSummary?.noRoute ? (
+                <>
+                  <span fg={C.red} attributes={A.bold}>
+                    {"Result: "}
+                  </span>
+                  <span fg={C.red}>{`✗ No route — ${probeSummary.noRoute.reason}`}</span>
+                </>
+              ) : allFailed ? (
                 <>
                   <span fg={C.red} attributes={A.bold}>
                     {"Result: "}
@@ -334,6 +566,11 @@ export function RoutingContent({
                 </>
               )}
             </text>
+            {hintLines(probeSummary?.noRoute?.hint).map((line) => (
+              <text key={line.id}>
+                <span fg={C.dim}>{`  ${line.text}`}</span>
+              </text>
+            ))}
           </>
         )}
       </box>
@@ -350,37 +587,29 @@ export function RoutingContent({
       flexDirection="column"
       paddingX={1}
     >
-      {/* Catch-all default — the only "global" default that actually exists.
-          Per-pattern defaults (gpt-* → codex/openai/openrouter, etc.) are
-          visible in the rule table below alongside any user overrides.
-          Each header `<text>` is pinned to height={1} so flex layout doesn't
-          collapse them into the scrollbox below in tight viewports. */}
-      <text height={1}>
-        <span fg={C.blue} attributes={A.bold}>
-          {" Catch-all default:"}
-        </span>
-        <span fg={C.fgMuted}>{"  (used for any model not matched by a rule)"}</span>
-      </text>
-      <text height={1}>
-        <span fg={C.dim}>{"  * "}</span>
-        <span fg={C.dim}>{"→ "}</span>
-        <span fg={C.cyan}>
-          {config.defaultProvider && config.defaultProvider.length > 0
-            ? config.defaultProvider
-            : (DEFAULT_ROUTING_RULES["*"]?.[0] ?? "openrouter")}
-        </span>
-        {(() => {
-          const builtIn = DEFAULT_ROUTING_RULES["*"]?.[0] ?? "openrouter";
-          const override = config.defaultProvider;
-          const hasOverride = !!(override && override.length > 0);
-          const overridesBuiltIn = hasOverride && override !== builtIn;
-          return overridesBuiltIn ? (
-            <span fg={C.fgMuted}>{`  (defaultProvider — overrides built-in '${builtIn}')`}</span>
-          ) : (
-            <span fg={C.fgMuted}>{"  (built-in)"}</span>
-          );
-        })()}
-      </text>
+      {/* The one routing fact that is global rather than per model: the user's
+          "*" rule when there is one, otherwise the fallback hop appended after
+          the chain gathered from the cloud models catalog. There is no built-in
+          rule table to compare either against. Each header `<text>` is pinned
+          to height={1} so flex layout doesn't collapse them into the scrollbox
+          below in tight viewports. */}
+      {routingHeaderLines({
+        globalRules: rulesOfScope(mergedRules, "global"),
+        localRules: rulesOfScope(mergedRules, "project"),
+        resolved: resolveFallbackHop(config),
+      }).map((line) => (
+        <text key={line.map((segment) => segment.text).join("")} height={1}>
+          {line.map((segment) => (
+            <span
+              key={`${segment.tone}:${segment.text}`}
+              fg={toneColor(segment.tone)}
+              attributes={A.boldIf(segment.tone === "title")}
+            >
+              {segment.text}
+            </span>
+          ))}
+        </text>
+      ))}
       {/* Dashed section divider (" ─" units). Intentionally NOT a border:
           OpenTUI borders are solid, so a border={["top"]} box would render a
           continuous line and lose the dashed look. The count is derived from
@@ -451,47 +680,19 @@ export function RoutingContent({
           >
             {mergedRules.map((rule, idx) => {
               const sel = idx === providerIndex;
-              const isDefault = rule.kind === "default";
               const isProject = rule.kind === "project";
-              // Marker priority: project (▴ cyan) > override (★ yellow) >
-              // user (• green) > default (· dim). Each row owns one scope
-              // — no shadowing in the table — so override + project never
-              // collide on the same row.
-              let marker: string;
-              let markerFg: string;
-              if (isDefault) {
-                marker = "·";
-                markerFg = C.dim;
-              } else if (isProject) {
-                marker = "▴";
-                markerFg = C.cyan;
-              } else if (rule.overridesDefault) {
-                marker = "★";
-                markerFg = C.yellow;
-              } else {
-                marker = "•";
-                markerFg = C.green;
-              }
+              // Marker: project (▴ cyan) > global (• green). Every row is one
+              // of the user's own rules and owns one scope — no shadowing in
+              // the table. The dim "·" built-in row and the yellow "★"
+              // override-of-a-default row are both gone, because the shipped
+              // rules table they compared against no longer exists.
+              const marker = isProject ? "▴" : "•";
+              const markerFg = isProject ? C.cyan : C.green;
               // SCOPE column: explicit text, color-coded.
-              //   default → "—" (dim)
-              //   global  → "global" (green)
-              //   project → "project" (cyan)
-              let scopeText: string;
-              let scopeFg: string;
-              if (isDefault) {
-                scopeText = "—       ";
-                scopeFg = C.dim;
-              } else if (isProject) {
-                scopeText = "project ";
-                scopeFg = C.cyan;
-              } else {
-                scopeText = "global  ";
-                scopeFg = C.green;
-              }
-              // Pattern column: white when selected, cyan when user, dim when default.
-              const patFg = sel ? C.strong : isDefault ? C.fgMuted : C.cyan;
-              // Chain column: cyan when selected, fgMuted when user, dim when default.
-              const chainFg = sel ? C.cyan : isDefault ? C.dim : C.fgMuted;
+              const scopeText = isProject ? "project " : "global  ";
+              const scopeFg = isProject ? C.cyan : C.green;
+              const patFg = sel ? C.strong : C.cyan;
+              const chainCell = ruleChainCell(rule.chain, sel);
               return (
                 <box
                   key={`${rule.kind}-${rule.pattern}`}
@@ -500,12 +701,12 @@ export function RoutingContent({
                   backgroundColor={sel ? C.bgHighlight : C.bg}
                 >
                   <text>
-                    <span fg={markerFg} attributes={A.boldIf(!isDefault)}>{` ${marker} `}</span>
+                    <span fg={markerFg} attributes={A.bold}>{` ${marker} `}</span>
                     <span fg={patFg} attributes={A.boldIf(sel)}>
                       {rule.pattern.padEnd(16).substring(0, 16)}
                     </span>
                     <span fg={scopeFg}>{scopeText}</span>
-                    <span fg={chainFg}>{chainStr(rule.chain)}</span>
+                    <span fg={chainCell.fg}>{chainCell.text}</span>
                   </text>
                 </box>
               );

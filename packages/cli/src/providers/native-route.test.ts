@@ -41,13 +41,7 @@ describe("nativeRouteFor", () => {
     expect(nativeRouteFor("dv@claude-opus-5-high")).toBeNull();
   });
 
-  test("routes unrecognised bare names natively without treating them as tier aliases", () => {
-    // The proxy routes typos natively too, so diagnostics must probe rather than declare success.
-    expect(nativeRouteFor("some-typo-model")).toEqual({
-      provider: "native-anthropic",
-      modelSpec: "some-typo-model",
-      displayName: "Anthropic (Native)",
-      isTierAlias: false,
-    });
+  test("does not route unrecognised bare names through the native passthrough", () => {
+    expect(nativeRouteFor("some-typo-model")).toBeNull();
   });
 });

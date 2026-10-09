@@ -24,21 +24,35 @@ import {
   resolveGrokAccessToken,
   resolveGrokClientVersion,
 } from "../../providers/grok/grok-credentials.js";
-import type { CredentialProvider, RequestAuth } from "./types.js";
+import type { CredentialProvider, ReadinessResult, RequestAuth } from "./types.js";
+import { readinessDetail } from "./types.js";
 
 export class GrokSubscriptionCredentialProvider implements CredentialProvider {
   readonly catalogName = "grok-subscription";
 
   /**
-   * Available when `grok login` has written a credential. Never throws — an
-   * absent Grok CLI is the normal state for every user who does not have one.
+   * Available when `grok login` has written a credential.
+   *
+   * An absent Grok CLI is the normal state for every user who does not have one
+   * — `absent`, and it stays `absent`. A resolver that THREW is a different
+   * fact: nothing was established about whether the credential exists, and
+   * calling that "no credential" is what quietly drops a flat-rate `gk@`
+   * subscription out of a routing chain in favour of the metered `x-ai`.
    */
-  async isAvailable(): Promise<boolean> {
+  async describeReadiness(): Promise<ReadinessResult> {
     try {
-      return hasGrokCredentials();
-    } catch {
-      return false;
+      return { readiness: hasGrokCredentials() ? "present" : "absent" };
+    } catch (err) {
+      return {
+        readiness: "failed",
+        detail: `Grok credential could not be read: ${readinessDetail(err) ?? "unknown error"}`,
+      };
     }
+  }
+
+  /** Unchanged contract: the `=== "present"` projection of the above. */
+  async isAvailable(): Promise<boolean> {
+    return (await this.describeReadiness()).readiness === "present";
   }
 
   /**

@@ -279,7 +279,7 @@ The startup notice says which, and warns when an inherited value reads as false.
 catalog. The published catalog path (`CLAUDE_CODE_MODEL_CATALOG_URL`) feeds a different accessor
 and does not supply it. No foreign model can earn a rank, and the table changes on every Claude
 Code release. Never copy it into claudish: conditioning the variable on rank would mean
-duplicating that roster, which CLAUDE.md forbids. claudish sets the variable unconditionally
+duplicating that table, which CLAUDE.md forbids. claudish sets the variable unconditionally
 under `--advisor` instead.
 
 The advisor model itself must still be configured on the Claude Code side (`advisorModel` in

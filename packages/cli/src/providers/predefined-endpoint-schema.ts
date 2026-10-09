@@ -12,7 +12,7 @@
  *
  *  1. **No model data, ever.** There is no `models`, `contextWindow`,
  *     `maxOutputTokens`, `pricing`, `capabilities` or `modelDiscovery` field.
- *     A shipped roster is exactly the hardcoded model data this project forbids:
+ *     A shipped model list is exactly the hardcoded model data this project forbids:
  *     it rots the moment a vendor adds a model, and the failure shape is
  *     claudish refusing a model that actually works. Model metadata comes from
  *     models-index or is absent. The schema is `.strict()`, so a future
@@ -53,7 +53,7 @@ import { z } from "zod";
  *  - `tier: "probe"` — a POST to the configured chat path with a deliberately
  *    invalid key was answered by the vendor's auth layer, and differed from a
  *    deliberately bogus sibling path. A `GET /v1/models` result is NOT evidence
- *    and must never be recorded here: Alibaba's `coding-intl` roster endpoint
+ *    and must never be recorded here: Alibaba's `coding-intl` model-list endpoint
  *    answers a bogus key, and no key at all, with the full list.
  *  - `verdict: "auth-realm"` — 401/403; credentials are checked at this path.
  *  - `verdict: "model-gate"` — the route resolved and rejected the fake model.

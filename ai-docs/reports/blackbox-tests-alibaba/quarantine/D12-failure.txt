@@ -1,0 +1,26 @@
+Ported 2026-09-19 from branch worktree-qwen-token-plan (6b627f1). Test title and
+variable name translated to HEAD's; otherwise as captured on that branch.
+
+bun test v1.4.0 (34cbb9a40)
+
+src/providers/model-discovery.blackbox.test.ts:
+119 |   test("D12 a blank Token Plan endpoint is a failure, not an absent subscription list", async () => {
+120 |     process.env.QWEN_TOKEN_PLAN_BASE_URL = "";
+121 |     const result = await discoverDynamicCatalog(provider);
+122 |     expect(result.status).toBe("failed");
+123 |     expect(result.models).toEqual([]);
+124 |     expect(result.failure?.kind).toBe("unreachable");
+                                       ^
+error: expect(received).toBe(expected)
+
+Expected: "unreachable"
+Received: "no-credentials"
+
+      at <anonymous> (/Users/jack/mag/claudish/.claude/worktrees/qwen-token-plan/packages/cli/src/providers/model-discovery.blackbox.test.ts:124:34)
+(fail) discovery failures identify the rejecting silo > D12 a blank Token Plan endpoint is a failure, not an absent subscription list [0.73ms]
+
+ 0 pass
+ 20 filtered out
+ 1 fail
+ 4 expect() calls
+Ran 1 test across 1 file. [19.00ms]

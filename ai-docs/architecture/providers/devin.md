@@ -7,7 +7,7 @@
 The only **binary** wire in the pipeline: Connect-protocol envelopes carrying protobuf, on
 `POST <server>/exa.api_server_pb.ApiServerService/GetChatMessage` with `authorization: Basic <k>-<k>`
 (the key literally doubled), `content-type: application/connect+proto`, `connect-protocol-version: 1`.
-Codec, request builder, credentials, live roster, and uid resolution live in `providers/devin/`;
+Codec, request builder, credentials, live model discovery, and uid resolution live in `providers/devin/`;
 Layer 1 is `adapters/devin-api-format.ts`, Layer 3 `providers/transport/devin.ts`, the parser
 `handlers/shared/stream-parsers/devin-connect.ts`. Full reverse-engineering write-up:
 `ai-docs/sessions/dev-arch-devin-subscription-20260806-120000-a1b2c3d4/protocol-spec.md` (write-up lost — predates the ai-docs tracking fix).
@@ -26,17 +26,22 @@ handler is never built and the model **silently falls through to OpenRouter**. A
 quietly succeeding is worse than a crash. Same pattern as Antigravity: empty env var + a dedicated
 `CredentialProvider` + transport-side `credentials.getRequestAuth()`.
 
-**Access is always EXPLICIT — no bare name ever routes to Devin.** Its uids collide head-on with
-other providers' namespaces (`claude-opus-5-medium` matches native-anthropic's `/^claude-/i`,
-`gpt-5-6-luna-medium` matches OpenAI's, `glm-5-2` GLM's, `kimi-k3-high` Kimi's), so the definition
-declares **no `nativeModelPatterns`** and there is **no `DEFAULT_ROUTING_RULES` entry**. Same
-reasoning as Qwen Plan, which also re-serves other vendors' models.
+**Access to a RE-SERVED model is always EXPLICIT — no colliding bare name ever routes to Devin.**
+Its uids collide head-on with other providers' namespaces (`claude-opus-5-medium` matches
+native-anthropic's `/^claude-/i`, `gpt-5-6-luna-medium` matches OpenAI's, `glm-5-2` GLM's,
+`kimi-k3-high` Kimi's). The definition therefore declares exactly ONE `nativeModelPatterns`
+entry, `/^swe-/i` — Cognition's own line, which collides with nothing — and that claim is the
+only way a bare name reaches Devin. Nothing else can: Devin is a dynamic subscription, so it
+publishes no catalog connection for `route-candidates.ts` to gather, and the
+`DEFAULT_ROUTING_RULES` table that once held a `"swe-*": ["devin"]` entry is deleted. Same
+reasoning as Alibaba Token Plan, which also re-serves other vendors' models.
 
 **The reasoning tier is IN the model id — there is no effort parameter.** `dv@claude-opus-5` at
 effort `high` resolves to the uid `claude-opus-5-high` via `resolveDevinModelUid` against the LIVE
-roster (`getServedDevinModels` = `GetCliModelConfigs` ∩ `GetCliTeamSettings.allowed_model_uids`,
-minus `contextWindow === 0`, which is what drops the `adaptive` router pseudo-model). No roster,
-window, family, or tier is ever hardcoded — 167 models on the developer's own account. Note the two
+dynamic models catalog (`getServedDevinModels` = `GetCliModelConfigs` ∩
+`GetCliTeamSettings.allowed_model_uids`, minus `contextWindow === 0`, which is what drops the
+`adaptive` router pseudo-model). No model list, window, family, or tier is ever hardcoded —
+167 models on the developer's own account. Note the two
 metadata rpcs are **unary and BARE** (`application/proto`, no envelope), field 1 is `"chisel"` there
 versus `"devin-cli"` on `GetChatMessage`, `GetCliTeamSettings` lives on `SeatManagementService` not
 `ApiServerService`, and metadata field 7 is required (dropping it → HTTP 400).
@@ -51,8 +56,8 @@ versus `"devin-cli"` on `GetChatMessage`, `GetCliTeamSettings` lives on `SeatMan
   `not_found`, quota-worded `resource_exhausted`) goes straight to a **400 rendered inline**. An
   UNRECOGNIZED code is terminal on purpose: guessing "retryable" costs 48s of backoff and still hides
   the reason. An **unserved uid comes back as `permission_denied`, not `not_found`** — the transport's
-  served-set-aware rewrite names it and lists available families, but keeps the upstream text, because
-  `permission_denied` was also the symptom of the wrong role enum.
+  rewrite checks the dynamic models catalog, names the uid and lists available families, but keeps
+  the upstream text, because `permission_denied` was also the symptom of the wrong role enum.
 - **Field 28 usage is float32 LITTLE-endian** at `28→2→4→2`, selected by the STRING key at `28→2→5`.
   Field 28 is repeated with the groups in unspecified order, so select by key, never by index; an
   absent value means zero. LE reads 16185 tokens where BE reads 2.09e-38.

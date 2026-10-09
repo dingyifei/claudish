@@ -112,7 +112,15 @@ interface CapturedResponse {
 function makeContext(): { c: Context; captured: CapturedResponse } {
   const captured: CapturedResponse = {};
   const c = {
-    req: { header: () => ({}) },
+    // Opt out of the Tier-1 retry ladder. These tests assert how an error is
+    // SURFACED, not whether it is retried, so they take the same escape hatch
+    // `probe-live.ts:157` uses — the header read at `composed-handler.ts:441`.
+    // Without it a provoked connect failure retries for the full deadline and
+    // the assertions time out rather than failing.
+    req: {
+      header: (name?: string) =>
+        name === undefined ? {} : name === "x-claudish-no-recovery" ? "1" : undefined,
+    },
     header: () => {},
     body: (body: BodyInit | null, init?: ResponseInit) => new Response(body, init),
     json: (body: unknown, status?: number) => {

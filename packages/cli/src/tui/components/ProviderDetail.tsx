@@ -73,6 +73,13 @@ interface ProviderDetailProps {
    * the kind of thing a user is entitled to see before pressing Enter.
    */
   keySaveTarget: string;
+  /**
+   * Where this provider's credential actually came from, when the generic
+   * env/config row cannot say it (Vertex: a Google Cloud project out of the ADC
+   * file or `gcloud config`). Undefined for every env-var provider, which leaves
+   * their pane byte-identical.
+   */
+  credentialNote?: string;
   cfgKeyMask: string;
   envKeyMask: string;
   activeEndpoint: string;
@@ -110,6 +117,7 @@ export function ProviderDetail({
   isKcKey,
   hasKcKey,
   keySaveTarget,
+  credentialNote,
   cfgKeyMask,
   envKeyMask,
   activeEndpoint,
@@ -246,17 +254,20 @@ export function ProviderDetail({
             expects, so "Not configured" is actionable without leaving the TUI.
             Fits here because the "From:" segment only renders when a key IS
             set — the two never share the row. */}
-        {!hasKey && !selectedProvider.isLocal && selectedProvider.apiKeyEnvVar && (
-          <>
-            <span fg={C.dim}>{"   "}</span>
-            <span fg={C.blue} attributes={A.bold}>
-              {"Env: "}
-            </span>
-            <span fg={C.yellow}>
-              {[selectedProvider.apiKeyEnvVar, ...(selectedProvider.aliases ?? [])].join(" | ")}
-            </span>
-          </>
-        )}
+        {!hasKey &&
+          !selectedProvider.isLocal &&
+          selectedProvider.apiKeyEnvVar &&
+          !credentialNote && (
+            <>
+              <span fg={C.dim}>{"   "}</span>
+              <span fg={C.blue} attributes={A.bold}>
+                {"Env: "}
+              </span>
+              <span fg={C.yellow}>
+                {[selectedProvider.apiKeyEnvVar, ...(selectedProvider.aliases ?? [])].join(" | ")}
+              </span>
+            </>
+          )}
         {hasKey && selectedProvider.isLocal && (
           <>
             <span fg={C.dim}>{"   "}</span>
@@ -271,7 +282,7 @@ export function ProviderDetail({
         {/* OAuth branch FIRST among the non-local sources. Without it an
             OAuth-only provider reaches the env/cfg block below, where both
             flags are false and "From: " renders with nothing after it. */}
-        {hasKey && !selectedProvider.isLocal && isOAuth && (
+        {hasKey && !selectedProvider.isLocal && isOAuth && !credentialNote && (
           <>
             <span fg={C.dim}>{"   "}</span>
             <span fg={C.blue} attributes={A.bold}>
@@ -283,7 +294,7 @@ export function ProviderDetail({
             <span fg={C.fgMuted}>{" (used)"}</span>
           </>
         )}
-        {hasKey && !selectedProvider.isLocal && isOAuth && (
+        {hasKey && !selectedProvider.isLocal && isOAuth && !credentialNote && (
           <>
             <span fg={C.dim}>{"   "}</span>
             <span fg={C.blue} attributes={A.bold}>
@@ -294,7 +305,7 @@ export function ProviderDetail({
             </span>
           </>
         )}
-        {hasKey && !selectedProvider.isLocal && !isOAuth && (
+        {hasKey && !selectedProvider.isLocal && !isOAuth && !credentialNote && (
           <>
             <span fg={C.dim}>{"   "}</span>
             <span fg={C.blue} attributes={A.bold}>
@@ -330,6 +341,18 @@ export function ProviderDetail({
           </>
         )}
       </text>
+      {/* Replaces the `Env:` / `From:` segments above for a provider whose
+          credential is not an environment variable — it names the source
+          precisely (which project, from the ADC file or `gcloud config`) or, when
+          nothing resolved, both remedies. */}
+      {credentialNote && (
+        <text>
+          <span fg={C.blue} attributes={A.bold}>
+            {"Auth:  "}
+          </span>
+          <span fg={hasKey ? C.green : C.yellow}>{credentialNote}</span>
+        </text>
+      )}
       {selectedProvider.endpointEnvVar && (
         <text>
           <span fg={C.blue} attributes={A.bold}>
@@ -354,7 +377,9 @@ export function ProviderDetail({
       {selectedProvider.keyUrl && !failureText && (
         <text>
           <span fg={C.blue} attributes={A.bold}>
-            Get Key:{" "}
+            {/* "Get Key" is the wrong instruction for a provider that has no key
+                to get — the URL is its console, not a key page. */}
+            {credentialNote ? "Console: " : "Get Key: "}
           </span>
           <span fg={C.cyan}>{selectedProvider.keyUrl}</span>
         </text>

@@ -1,0 +1,349 @@
+{
+  "provenance": {
+    "source": "~/.claudish/cloud-models-catalog-v3.json, written by the v3 reader from the live models-index catalog",
+    "catalogGenerationId": "g-20260919013346169-feffb8ad",
+    "extractedAt": "2026-09-19",
+    "why": {
+      "kimi-k3": "exact id plus an OpenRouter moving pointer (~moonshotai/kimi-latest) on the same route",
+      "gemini-flash-latest": "the model id itself is a moving pointer; the user asked for latest",
+      "gemini-omni-1.1-flash": "videoOutput: true, so not a chat model",
+      "gemini-3.8-flash": "videoInput: true, videoOutput not true, so still a chat model"
+    }
+  },
+  "entries": [
+    {
+      "contractVersion": 3,
+      "modelId": "kimi-k3",
+      "displayName": "Kimi K3",
+      "provider": "moonshotai",
+      "aliases": [
+        "moonshotai/kimi-k3",
+        "moonshotai/kimi-k3:batch",
+        "~moonshotai/kimi-latest",
+        "moonshotai/Kimi-K3",
+        "accounts/fireworks/models/kimi-k3",
+        "k3",
+        "kimi-k3:cloud"
+      ],
+      "status": "active",
+      "releaseDate": "2026-07-16",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 943718,
+      "subscriptionPlanIds": ["kimi-code", "ollama-cloud", "opencode-go"],
+      "aggregators": [
+        {
+          "sourceProviderId": "fireworks",
+          "sourceCollectorId": "fireworks-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "fireworks",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "accounts/fireworks/models/kimi-k3"
+        },
+        {
+          "sourceProviderId": "fireworks",
+          "sourceCollectorId": "fireworks-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "unknown",
+          "reason": "unsupported_provider",
+          "observedExternalModelId": "accounts/fireworks/models/kimi-k3"
+        },
+        {
+          "sourceProviderId": "kimi-code",
+          "sourceCollectorId": "kimi-code-models",
+          "confidence": "gateway_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "moonshotai",
+            "routeProfileId": "kimi-code-subscription"
+          },
+          "externalModelId": "k3"
+        },
+        {
+          "sourceProviderId": "moonshotai",
+          "sourceCollectorId": "moonshot-api",
+          "confidence": "api_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "moonshotai",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "kimi-k3"
+        },
+        {
+          "sourceProviderId": "ollamacloud",
+          "sourceCollectorId": "ollama-cloud-scrape",
+          "confidence": "gateway_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "ollama",
+            "routeProfileId": "cloud"
+          },
+          "externalModelId": "kimi-k3:cloud",
+          "pricing": {
+            "input": 3,
+            "output": 15,
+            "cachedRead": 0.3
+          }
+        },
+        {
+          "sourceProviderId": "opencode-go",
+          "sourceCollectorId": "popular-coding-subscriptions",
+          "confidence": "gateway_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "opencode",
+            "routeProfileId": "go-subscription"
+          },
+          "externalModelId": "kimi-k3"
+        },
+        {
+          "sourceProviderId": "opencode-zen",
+          "sourceCollectorId": "opencode-zen-pricing-scrape",
+          "confidence": "gateway_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "opencode",
+            "routeProfileId": "zen"
+          },
+          "externalModelId": "kimi-k3",
+          "pricing": {
+            "input": 3,
+            "output": 15,
+            "cachedRead": 0.3
+          }
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "openrouter-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openrouter",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "~moonshotai/kimi-latest",
+          "pricing": {
+            "input": 2.1,
+            "output": 10.95,
+            "cachedRead": 0.23
+          },
+          "probeEligible": false
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "openrouter-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openrouter",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "moonshotai/kimi-k3",
+          "pricing": {
+            "input": 2.1,
+            "output": 10.95,
+            "cachedRead": 0.23
+          }
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "openrouter-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "unknown",
+          "reason": "unverified_mapping",
+          "observedExternalModelId": "moonshotai/kimi-k3:batch"
+        },
+        {
+          "sourceProviderId": "together-ai",
+          "sourceCollectorId": "together-ai-api",
+          "confidence": "gateway_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "together-ai",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "moonshotai/Kimi-K3",
+          "pricing": {
+            "input": 3,
+            "output": 15
+          },
+          "probeEligible": true
+        },
+        {
+          "sourceProviderId": "together-ai",
+          "sourceCollectorId": "together-ai-api",
+          "confidence": "gateway_official",
+          "routeStatus": "unknown",
+          "reason": "unsupported_provider",
+          "observedExternalModelId": "moonshotai/Kimi-K3"
+        }
+      ],
+      "supportsVision": true,
+      "supportsTools": true,
+      "videoInput": false,
+      "videoOutput": false,
+      "reasoning": {
+        "supported": true,
+        "mandatory": false,
+        "control": "effort",
+        "efforts": ["max", "high", "low"],
+        "defaultEffort": "max"
+      }
+    },
+    {
+      "contractVersion": 3,
+      "modelId": "gemini-flash-latest",
+      "displayName": "Gemini Flash Latest",
+      "provider": "google",
+      "aliases": [],
+      "status": "active",
+      "releaseDate": "2026-05-19",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 65536,
+      "aggregators": [
+        {
+          "sourceProviderId": "google",
+          "sourceCollectorId": "google-model-get-api",
+          "confidence": "api_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "google",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "gemini-flash-latest"
+        }
+      ],
+      "supportsVision": true,
+      "supportsTools": true
+    },
+    {
+      "contractVersion": 3,
+      "modelId": "gemini-omni-1.1-flash",
+      "displayName": "Gemini Omni 1.1 Flash",
+      "provider": "google",
+      "aliases": ["google/gemini-omni-1.1-flash"],
+      "status": "active",
+      "releaseDate": "2026-08-27",
+      "contextWindow": 1048576,
+      "aggregators": [
+        {
+          "sourceProviderId": "google",
+          "sourceCollectorId": "google-model-get-api",
+          "confidence": "api_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "google",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "gemini-omni-1.1-flash"
+        }
+      ],
+      "supportsVision": true,
+      "supportsTools": false,
+      "videoInput": true,
+      "videoOutput": true,
+      "reasoning": {
+        "supported": false,
+        "control": "none"
+      }
+    },
+    {
+      "contractVersion": 3,
+      "modelId": "gemini-3.8-flash",
+      "displayName": "Gemini 3.8 Flash",
+      "provider": "google",
+      "aliases": ["google/gemini-3.8-flash", "google/gemini-3.8-flash:batch"],
+      "status": "active",
+      "releaseDate": "2026-09-02",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 65536,
+      "aggregators": [
+        {
+          "sourceProviderId": "google",
+          "sourceCollectorId": "google-model-get-api",
+          "confidence": "api_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "google",
+            "routeProfileId": "direct-api"
+          },
+          "externalModelId": "gemini-3.8-flash"
+        },
+        {
+          "sourceProviderId": "opencode-zen",
+          "sourceCollectorId": "opencode-zen-api",
+          "confidence": "gateway_official",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "opencode",
+            "routeProfileId": "zen"
+          },
+          "externalModelId": "gemini-3.8-flash"
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "openrouter-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openrouter",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "~google/gemini-flash-latest",
+          "pricing": {
+            "input": 0.75,
+            "output": 3.75,
+            "cachedRead": 0.075,
+            "batchDiscountPct": 50
+          },
+          "probeEligible": false
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "openrouter-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "mapped",
+          "route": {
+            "routeId": "openrouter",
+            "routeProfileId": "gateway"
+          },
+          "externalModelId": "google/gemini-3.8-flash",
+          "pricing": {
+            "input": 0.75,
+            "output": 3.75,
+            "cachedRead": 0.075,
+            "batchDiscountPct": 50
+          }
+        },
+        {
+          "sourceProviderId": "openrouter",
+          "sourceCollectorId": "openrouter-api",
+          "confidence": "aggregator_reported",
+          "routeStatus": "unknown",
+          "reason": "unverified_mapping",
+          "observedExternalModelId": "google/gemini-3.8-flash:batch"
+        }
+      ],
+      "supportsVision": true,
+      "supportsTools": true,
+      "videoInput": true,
+      "videoOutput": false,
+      "reasoning": {
+        "supported": true,
+        "mandatory": true,
+        "control": "effort",
+        "efforts": ["high", "medium", "low"],
+        "defaultEffort": "medium"
+      },
+      "endpoints": {
+        "gemini": {
+          "api": "gemini",
+          "toolsWithReasoning": "ok"
+        }
+      }
+    }
+  ]
+}

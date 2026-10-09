@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_ROUTING_RULES } from "./default-routing-rules.js";
 import { parseModelSpec } from "./model-parser.js";
+import { getProviderByName } from "./provider-definitions.js";
+import { gatherRouteCandidates } from "./route-candidates.js";
 
 describe("SWE model routing", () => {
   test("auto-detects bare swe-* names as Devin without marking them explicit", () => {
@@ -12,11 +13,22 @@ describe("SWE model routing", () => {
     }
   });
 
-  test("routes swe-* only to Devin with no fallback", () => {
-    const routes = DEFAULT_ROUTING_RULES["swe-*"];
+  test("Devin claims the swe-* namespace and gathering emits that route candidate", () => {
+    const devin = getProviderByName("devin")!;
+    expect(devin.nativeModelPatterns?.map(({ pattern }) => pattern.source)).toEqual(["^swe-"]);
 
-    expect(routes).toEqual(["devin"]);
-    expect(routes).toHaveLength(1);
+    const gathered = gatherRouteCandidates(
+      "swe-1.7",
+      `${import.meta.dir}/fixtures/intentionally-missing-catalog.json`
+    );
+    expect(gathered.candidates).toContainEqual({
+      provider: "devin",
+      wireId: "swe-1.7",
+      tier: "dynamic-subscription",
+      isVendorOwn: false,
+      price: { known: false, label: "unknown" },
+      source: "namespace-claim",
+    });
   });
 
   test("never auto-detects Devin's re-served vendor model collisions", () => {

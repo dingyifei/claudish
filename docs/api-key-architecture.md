@@ -33,7 +33,7 @@ When a model ID is provided, it's resolved in this order:
 | `g/`, `gemini/` | Google Gemini | `GEMINI_API_KEY` | Direct Gemini API |
 | `ag/`, `antigravity/` | Antigravity (Gemini subscription) | OAuth | Requires `claudish login antigravity` |
 | `go/` | _deprecated alias → `ag/`_ | OAuth | Gemini Code Assist was retired by Google |
-| `v/`, `vertex/` | Vertex AI | `VERTEX_API_KEY` or `VERTEX_PROJECT` (OAuth) | Google Cloud |
+| `v/`, `vertex/` | Vertex AI | Application Default Credentials (`VERTEX_PROJECT` optional) | Google Cloud |
 | `oai/` | OpenAI | `OPENAI_API_KEY` | Direct OpenAI API |
 | `mmax/`, `mm/` | MiniMax | `MINIMAX_API_KEY` | Anthropic-compatible |
 | `kimi/`, `moonshot/` | Kimi/Moonshot | `MOONSHOT_API_KEY` or `KIMI_API_KEY` | Anthropic-compatible |

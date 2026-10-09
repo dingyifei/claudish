@@ -26,14 +26,10 @@ export const API_KEY_MAP: Record<string, { envVar: string; aliases?: string[] }>
     envVar: "SAKANA_SUBSCRIPTION_API_KEY",
     aliases: ["SAKANA_CODING_API_KEY"],
   },
-  // No alias by design: a Qwen Plan key authenticates ONLY against the
-  // plan host; the DashScope/PAYG hosts reject it (401/403), so aliasing onto
-  // DASHSCOPE_API_KEY / QWEN_API_KEY could only mis-route or mis-bill.
-  "qwen-cloud": { envVar: "QWEN_CLOUD_PLAN_API_KEY" },
-  // The PAYG sibling is the inverse case: both of these names hold a metered
-  // Model Studio key, so they are two spellings of ONE billing mode and may
-  // safely alias. Neither may ever alias onto the plan key above.
-  "qwen-payg": { envVar: "DASHSCOPE_API_KEY", aliases: ["QWEN_API_KEY"] },
+  // Alibaba products use isolated credentials and hosts.
+  "qwen-token-plan": { envVar: "QWEN_TOKEN_PLAN_API_KEY" },
+  "qwen-coding": { envVar: "QWEN_CODING_PLAN_API_KEY" },
+  "qwen-payg": { envVar: "DASHSCOPE_API_KEY" },
   ollamacloud: { envVar: "OLLAMA_API_KEY" },
   "opencode-zen": { envVar: "OPENCODE_API_KEY" },
   // The Go plan has its OWN key. This entry used to name OPENCODE_API_KEY — the
@@ -49,12 +45,17 @@ export const API_KEY_MAP: Record<string, { envVar: string; aliases?: string[] }>
   // NO alias (2026-09-02). The fix above left OPENCODE_API_KEY behind as one,
   // and the definition dropped its matching `apiKeyAliases` on the day the 401
   // claim was measured false. Keeping it HERE would have been worse than never
-  // fixing it: this table is what `--probe` uses to decide `hasCredentials`
-  // (`cli.ts` buildDirectChainEntry / buildResultLinks), so the probe would have
-  // printed a credentialed `zgo@` row for a key the credential authority now
-  // refuses to sign with — a row asserting readiness nothing has verified, the
-  // same defect as the removed publicKeyFallback.
+  // fixing it: this table was then what `--probe` used to decide `hasCredentials`,
+  // so the probe would have printed a credentialed `zgo@` row for a key the
+  // credential authority now refuses to sign with — a row asserting readiness
+  // nothing has verified, the same defect as the removed publicKeyFallback.
+  // (`--probe` now takes that decision from `explainRoute`, i.e. the authority,
+  // and reads this table only for the key it names in a dropped row's hint.)
   "opencode-zen-go": { envVar: "OPENCODE_GO_API_KEY" },
-  vertex: { envVar: "VERTEX_API_KEY", aliases: ["VERTEX_PROJECT"] },
+  // Vertex takes no API key: the project ID plus Application Default
+  // Credentials. VERTEX_API_KEY (Express) was deleted on 2026-09-21, and it was
+  // the primary here — so `--probe` asked for a variable no longer read while
+  // treating the one that IS read as an alias.
+  vertex: { envVar: "VERTEX_PROJECT" },
   poe: { envVar: "POE_API_KEY" },
 };

@@ -29,6 +29,16 @@
  *     provider resolves as "not available", so the MCP/serve server keeps
  *     running instead of dying at startup.
  *
+ * `"skip"` MUST NOT ERASE THE REASON, and it used to. A swallowed failure and a
+ * clean "1Password does not hold this key" both came back as `{}`, so the
+ * credential authority reported a denied handshake as "the user has no
+ * credential" and routing quietly moved a flat-rate subscription onto a metered
+ * provider. `opts.onFailure` is the seam that keeps the reason: it fires for
+ * every failure this function decides not to throw, per CALL, so a second
+ * provider asking after the same denial still learns about it (the `warnOnce`
+ * line and the `recordOpFailure` entry are both de-duplicated, by design — they
+ * are for the user, not for the caller's control flow).
+ *
  * This module replaces the per-entry-point PUSH-into-process.env machinery that
  * used to live in index.ts (loadStoredApiKeys / applyCustomEndpointOpKeys /
  * getSdkAuth). There is no "resolve everything" pass here — resolution is
@@ -159,6 +169,27 @@ export class OpAuthError extends Error {
 
 /** What to do when SDK auth resolution fails. */
 export type OnAuthFailure = "throw" | "skip";
+
+/** Options accepted by {@link resolveOpKeyForEnvVars}. */
+export interface OpResolveOptions {
+  onAuthFailure?: OnAuthFailure;
+  allowPrompt?: boolean;
+  /**
+   * Called once per SWALLOWED failure, with a one-line reason.
+   *
+   * Only fires under `onAuthFailure: "skip"` semantics — i.e. for the failures
+   * this module deliberately does not throw (a denied or unavailable desktop
+   * handshake, a glob that could not be read, an Environment fetch that failed,
+   * a reference that would not resolve). It is NOT called for a clean resolve
+   * that simply found nothing: "1Password does not hold this key" is an answer,
+   * not a failure, and turning it into one would mark every unconfigured
+   * provider as broken.
+   *
+   * Reasons are already humanized and carry no key material. A throwing sink is
+   * swallowed — diagnostics must never be able to fail a credential resolve.
+   */
+  onFailure?: (reason: string) => void;
+}
 
 // ── Lazy SDK-auth resolution (memoized once per process) ────────────────────
 
@@ -334,6 +365,7 @@ async function authForEntry(
   // the real resolver and run `op account list` against the developer's actual
   // machine — 12 tests did exactly that, at ~2s each, silently depending on real
   // 1Password state.
+  if (testSeams?.ambientAuthFailure) throw new OpAuthError(testSeams.ambientAuthFailure);
   if (testSeams?.auth) return testSeams.auth;
   return getSdkAuth(allowPrompt);
 }
@@ -382,6 +414,18 @@ interface OpSourceTestSeams {
   sdkFactory?: SdkClientFactory;
   /** Skips getSdkAuth() entirely (no account resolution, no prompts). */
   auth?: SdkAuth;
+  /**
+   * Make AMBIENT auth resolution FAIL with this message, as a denied or locked
+   * 1Password desktop handshake does.
+   *
+   * The one production path `auth` above cannot express, and the one that
+   * decides `failed` vs `absent` for a whole routing chain. `auth` short-circuits
+   * `getSdkAuth()` with a success; without it a hermetic test reaches the real
+   * resolver and runs `op account list` against the developer's machine. So the
+   * failure needs its own seam, or the denial branch is untestable without
+   * `mock.module()` — which Bun leaks process-wide across sibling files.
+   */
+  ambientAuthFailure?: string;
 }
 let testSeams: OpSourceTestSeams | undefined;
 
@@ -786,7 +830,7 @@ export function __resetResolveCacheForTests(): void {
  */
 export async function resolveOpKeyForEnvVars(
   wanted: Set<string>,
-  opts: { onAuthFailure?: OnAuthFailure; allowPrompt?: boolean } = {}
+  opts: OpResolveOptions = {}
 ): Promise<Record<string, string>> {
   if (wanted.size === 0) return {};
 
@@ -887,10 +931,36 @@ function importAccountLookup(): Map<string, string | undefined> {
   return out;
 }
 
+/** What `collectConfigImports` returns, restated to avoid a static SDK import. */
+interface CollectedImports {
+  opRefs: Record<string, string>;
+  globImports: string[];
+  warnings: string[];
+}
+
+/**
+ * The env var names a custom endpoint's `op://` apiKey would resolve INTO.
+ *
+ * Mirrors the derivation in step 2 of the resolve body exactly — a custom
+ * endpoint named `my-vllm` supplies only `CUSTOM_MY_VLLM_KEY`, and nothing else.
+ * Used to decide applicability, so the two must not drift.
+ */
+function customEndpointRefNames(cfg: SniffedConfig): string[] {
+  if (!cfg.customEndpoints || typeof cfg.customEndpoints !== "object") return [];
+  const names: string[] = [];
+  for (const [name, raw] of Object.entries(cfg.customEndpoints)) {
+    if (!raw || typeof raw !== "object") continue;
+    const apiKey = (raw as { apiKey?: unknown }).apiKey;
+    if (typeof apiKey !== "string" || !apiKey.startsWith("op://")) continue;
+    names.push(`CUSTOM_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_KEY`);
+  }
+  return names;
+}
+
 /** The actual resolution body (runs inside runOpExclusive). */
 async function resolveOpKeyForEnvVarsInner(
   wanted: Set<string>,
-  opts: { onAuthFailure?: OnAuthFailure; allowPrompt?: boolean } = {},
+  opts: OpResolveOptions = {},
   span?: OpSpanCtx
 ): Promise<Record<string, string>> {
   if (wanted.size === 0) return {};
@@ -898,6 +968,86 @@ async function resolveOpKeyForEnvVarsInner(
 
   const onAuthFailure = opts.onAuthFailure ?? "skip";
   const allowPrompt = opts.allowPrompt ?? false;
+
+  // ── APPLICABILITY IS DECIDED BEFORE RESOLUTION ────────────────────────────
+  //
+  // `hasOpSources()` above is a GLOBAL sniff. It answers "does this RUN
+  // configure 1Password at all", never "could 1Password hold THIS provider's
+  // key" — so a locked Mac or a denied handshake used to be reported as a
+  // credential FAILURE to every provider that asked, including providers whose
+  // env var no configured source names.
+  //
+  // Routing reads `failed` as "a real key exists and could not be read", and
+  // tells the user so (routing-rules.ts). So the over-report is not cosmetic:
+  // a metered-only user whose 1Password happens to be locked would be told
+  // that a subscription they never bought could not be read. That is the
+  // mirror image of the bug three-valued readiness fixed — `failed` read as
+  // `absent` — and an `absent` result must stay `absent`.
+  //
+  // So: a failure is attributed to THIS call only when some configured source
+  // could actually carry one of the wanted names —
+  //
+  //   EXPLICIT — an `op://` reference whose derived env var is in `wanted`
+  //              (an `apiKeys` entry, an `onepassword[]` single ref, a custom
+  //              endpoint's key). Its contents ARE known by name, so a ref
+  //              naming something else is definitively not about this caller.
+  //   BROAD    — a glob import or a 1Password Environment. Its contents cannot
+  //              be known without reading it, so a read that failed leaves the
+  //              question genuinely open: still `failed`.
+  //
+  // Computed HERE, before any handshake, rather than inferred from what the
+  // resolve happened to touch. The failure paths below fire from places that no
+  // longer know which source was in play, and `absent`-vs-`failed` is not a
+  // question to answer from a stack position.
+  const importedOnepassword = await import("../../providers/onepassword.js");
+  const cfg = readConfigRaw();
+  let collected: CollectedImports = { opRefs: {}, globImports: [], warnings: [] };
+  let collectFailed = false;
+  try {
+    collected = importedOnepassword.collectConfigImports(
+      {
+        apiKeys: cfg.apiKeys,
+        // collectConfigImports parses op:// strings; the account lives beside it
+        // in importAccounts, so only the VALUES go in here.
+        onepassword: parseOpSourceEntries(cfg.onepassword ?? [], "ref").map((e) => e.value),
+      },
+      process.env
+    );
+  } catch {
+    // Could not tell WHAT is configured. Keep the previous, broader attribution
+    // rather than silently narrowing it — a fix for over-reporting must not
+    // become a cause of under-reporting.
+    collectFailed = true;
+  }
+  const sourcesCouldHoldWanted =
+    collectFailed ||
+    Object.keys(collected.opRefs).some((name) => wanted.has(name)) ||
+    customEndpointRefNames(cfg).some((name) => wanted.has(name)) ||
+    collected.globImports.length > 0 ||
+    registeredEnvironmentEntries().length > 0;
+
+  /**
+   * Report a failure this function is about to swallow. Per CALL, not
+   * de-duplicated: `warnOnce` and `recordOpFailure` both collapse repeats
+   * because a user does not want the same line four times, but a caller
+   * deciding "absent or failed?" needs the answer every time it asks — that
+   * de-duplication is exactly why a call-site check of `getOpFailures()` would
+   * report the second provider in a chain as cleanly uncredentialed.
+   *
+   * The stderr warning and the run-scoped `recordOpFailure` record are NOT
+   * gated by applicability, deliberately: a broken 1Password is still worth
+   * telling the user about once, and provenance still wants the whole picture.
+   * Only the per-caller "is YOUR credential failed or absent?" answer is.
+   */
+  const noteFailure = (reason: string): void => {
+    if (!opts.onFailure) return;
+    if (!sourcesCouldHoldWanted) return;
+    try {
+      opts.onFailure(reason);
+    } catch {
+      // A diagnostic sink must never be able to fail a credential resolve.
+    }
+  };
 
   // AMBIENT auth is resolved LAZILY, not as an upfront gate.
   //
@@ -913,6 +1063,7 @@ async function resolveOpKeyForEnvVarsInner(
   // run whose every source is declared never resolves ambient auth at all.
   let ambientFailure: OpAuthError | undefined;
   const ambientAuth = async (): Promise<SdkAuth | undefined> => {
+    if (testSeams?.ambientAuthFailure) throw new OpAuthError(testSeams.ambientAuthFailure);
     if (testSeams?.auth) return testSeams.auth;
     if (ambientFailure) throw ambientFailure;
     try {
@@ -926,6 +1077,7 @@ async function resolveOpKeyForEnvVarsInner(
   /** Report an auth failure the way the old upfront gate did, or rethrow. */
   const reportAuthFailure = async (err: unknown): Promise<void> => {
     if (!(err instanceof OpAuthError) || onAuthFailure !== "skip") throw err;
+    noteFailure(`1Password auth unavailable: ${err.message}`);
     warnOnce(`[claudish] 1Password auth unavailable, skipping op:// keys: ${err.message}`);
     // Record before returning: this run's keys may live in 1Password, and the
     // missing-key error downstream must not tell the user to `export` a
@@ -962,30 +1114,17 @@ async function resolveOpKeyForEnvVarsInner(
     }
   }
 
-  const {
-    collectConfigImports,
-    resolveSecrets,
-    recordOpHydratedVars,
-    recordOpFailure,
-    withSdkRetry,
-    humanizeOpError,
-  } = await import("../../providers/onepassword.js");
+  const { resolveSecrets, recordOpHydratedVars, recordOpFailure, withSdkRetry, humanizeOpError } =
+    importedOnepassword;
 
-  const cfg = readConfigRaw();
   const out: Record<string, string> = {};
 
   try {
-    // 1. config single op:// refs + globs (apiKeys + onepassword[]).
+    // 1. config single op:// refs + globs (apiKeys + onepassword[]) — already
+    //    collected above, because applicability had to be decided before the
+    //    handshake. ONE parse, so the set the applicability check reasoned about
+    //    and the set resolution walks cannot drift apart.
     const importAccounts = importAccountLookup();
-    const collected = collectConfigImports(
-      {
-        apiKeys: cfg.apiKeys,
-        // collectConfigImports parses op:// strings; the account lives beside it
-        // in importAccounts, so only the VALUES go in here.
-        onepassword: parseOpSourceEntries(cfg.onepassword ?? [], "ref").map((e) => e.value),
-      },
-      process.env
-    );
     for (const w of collected.warnings) console.error(w);
 
     // Single refs whose derived env name is wanted.
@@ -1059,6 +1198,7 @@ async function resolveOpKeyForEnvVarsInner(
         // RECORD the raw message (wasOpAuthorizationDenied matches on it),
         // DISPLAY the humanized one — the SDK's Rust struct dump names no cause.
         const m = globErr instanceof Error ? globErr.message : String(globErr);
+        noteFailure(`1Password import failed: ${humanizeOpError(globErr)}`);
         warnOnce(`[claudish] 1Password import skipped: ${humanizeOpError(globErr)}`);
         recordOpFailure({ kind: "import", source: globPath, message: m });
       }
@@ -1116,6 +1256,7 @@ async function resolveOpKeyForEnvVarsInner(
           // never lock the user out. The failed resolution was evicted, so the
           // next resolve retries it.
           const m = envErr instanceof Error ? envErr.message : String(envErr);
+          noteFailure(`1Password environment "${envId}" failed: ${humanizeOpError(envErr)}`);
           warnOnce(`[claudish] 1Password environment skipped: ${humanizeOpError(envErr)}`);
           recordOpFailure({ kind: "environment", source: envId, message: m });
         }
@@ -1123,6 +1264,7 @@ async function resolveOpKeyForEnvVarsInner(
     }
   } catch (err) {
     if (err instanceof OpAuthError && onAuthFailure === "skip") {
+      noteFailure(`1Password resolution skipped: ${err.message}`);
       warnOnce(`[claudish] 1Password resolution skipped: ${err.message}`);
       recordOpFailure({ kind: "auth", message: err.message });
       return out;
@@ -1131,6 +1273,10 @@ async function resolveOpKeyForEnvVarsInner(
     warnOnce(`[claudish] 1Password secret resolution failed: ${humanizeOpError(err)}`);
     recordOpFailure({ kind: "reference", message });
     if (onAuthFailure === "throw") throw err;
+    // Only AFTER the rethrow: the sink reports failures this function swallows.
+    // A caller that asked to have it thrown is getting the error itself and
+    // must not also be told about it through the back channel.
+    noteFailure(`1Password secret resolution failed: ${humanizeOpError(err)}`);
   }
 
   // Provenance: record which env vars came from 1Password so the config TUI /

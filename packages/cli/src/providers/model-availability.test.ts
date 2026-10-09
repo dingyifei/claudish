@@ -1,19 +1,47 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { catalogRouteForProvider } from "./catalog-route-bindings.js";
 
 import { credentials } from "../auth/credentials/authority.js";
 import type { SlimModelEntry } from "./all-models-cache.js";
 import { _resetCatalogClient, _setCatalogEntriesForTest } from "./catalog-client.js";
+import { decodeModelConfigs } from "./devin/devin-models.js";
 import { providerServesModel } from "./model-availability.js";
-import { invalidateModelDiscovery } from "./model-discovery.js";
+import {
+  type DiscoveredModel,
+  getModelDiscoveryFetcher,
+  invalidateModelDiscovery,
+  registerModelDiscoveryFetcher,
+} from "./model-discovery.js";
+import "./model-discovery-builtins.js";
+import { devinModelsCatalogEntry } from "./model-resolvers/devin.js";
 import type { ProviderDefinition } from "./provider-definitions.js";
+import { route } from "./routing-rules.js";
 import { clearRuntimeRegistry, registerRuntimeProvider } from "./runtime-providers.js";
 
-const CATALOG_PROVIDER = "catalog-primary";
-const OTHER_CATALOG_PROVIDER = "catalog-secondary";
+const CATALOG_PROVIDER = "openrouter";
+const OTHER_CATALOG_PROVIDER = "fireworks";
 const DISCOVERY_PROVIDER = "availability-discovery-test";
 
 const realFetch = globalThis.fetch;
 const realGetRequestAuth = credentials.getRequestAuth;
+const realIsAvailable = credentials.isAvailable;
+const realDescribeReadiness = credentials.describeReadiness;
+const realDevinDiscovery = getModelDiscoveryFetcher("devin-connect");
+
+if (!realDevinDiscovery) throw new Error("Devin discovery fetcher was not registered");
+
+const DEVIN_BUG_UIDS = new Set(["swe-1-7", "swe-1-7-medium"]);
+const devinFixturePath = join(import.meta.dir, "../test-fixtures/devin/GetCliModelConfigs.res.bin");
+const devinModelsCatalog: DiscoveredModel[] = decodeModelConfigs(readFileSync(devinFixturePath))
+  .filter((model) => DEVIN_BUG_UIDS.has(model.uid))
+  .map(devinModelsCatalogEntry)
+  .map(({ wireId, ...rest }) => ({ id: wireId, ...rest }));
+
+if (devinModelsCatalog.length !== DEVIN_BUG_UIDS.size) {
+  throw new Error("Captured Devin fixture is missing the SWE-1.7 regression uids");
+}
 
 function catalogEntry(
   modelId: string,
@@ -23,10 +51,13 @@ function catalogEntry(
   return {
     modelId,
     aliases,
-    sources: { test: { externalId: modelId } },
+
     aggregators: providers.map(({ provider, externalId }) => ({
-      provider,
-      externalId: externalId ?? modelId,
+      sourceProviderId: provider,
+      sourceCollectorId: "test",
+      routeStatus: "mapped",
+      route: catalogRouteForProvider(provider),
+      externalModelId: externalId ?? modelId,
       confidence: "api_official",
     })),
   };
@@ -55,7 +86,7 @@ function discoveryProvider(): ProviderDefinition {
   };
 }
 
-function stubRoster(...ids: string[]): void {
+function stubModelsCatalog(...ids: string[]): void {
   globalThis.fetch = mock(
     async () =>
       new Response(JSON.stringify({ data: ids.map((id) => ({ id })) }), {
@@ -63,6 +94,13 @@ function stubRoster(...ids: string[]): void {
         headers: { "Content-Type": "application/json" },
       })
   ) as unknown as typeof fetch;
+}
+
+function stubDevinModelsCatalog(): void {
+  registerModelDiscoveryFetcher("devin-connect", async () => ({
+    kind: "models",
+    models: devinModelsCatalog,
+  }));
 }
 
 beforeEach(() => {
@@ -86,6 +124,9 @@ afterEach(() => {
   invalidateModelDiscovery();
   clearRuntimeRegistry();
   credentials.getRequestAuth = realGetRequestAuth;
+  credentials.isAvailable = realIsAvailable;
+  credentials.describeReadiness = realDescribeReadiness;
+  registerModelDiscoveryFetcher("devin-connect", realDevinDiscovery);
   globalThis.fetch = realFetch;
 });
 
@@ -108,7 +149,7 @@ describe("providerServesModel catalog evidence", () => {
 
     // Catalog coverage is partial, so absence from one row cannot deny service:
     // openai-codex appears on only 1 of ~760 rows yet genuinely serves gpt-5.
-    // Only a complete live roster may turn absence into "not-served".
+    // Only a complete dynamic models catalog may turn absence into "not-served".
     expect(await providerServesModel(CATALOG_PROVIDER, "model-one")).toBe("unknown");
   });
 
@@ -164,21 +205,21 @@ describe("providerServesModel catalog evidence", () => {
 });
 
 describe("providerServesModel live discovery", () => {
-  test("returns serves for exact and case-insensitive roster membership", async () => {
-    stubRoster("MiniMax-M3");
+  test("returns serves for exact and case-insensitive matches in the dynamic models catalog", async () => {
+    stubModelsCatalog("MiniMax-M3");
 
     expect(await providerServesModel(DISCOVERY_PROVIDER, "MiniMax-M3")).toBe("serves");
     expect(await providerServesModel(DISCOVERY_PROVIDER, "minimax-m3")).toBe("serves");
   });
 
-  test("returns not-served when a non-empty roster omits the model", async () => {
-    stubRoster("available-model");
+  test("returns not-served when a non-empty dynamic models catalog omits the model", async () => {
+    stubModelsCatalog("available-model");
 
     expect(await providerServesModel(DISCOVERY_PROVIDER, "missing-model")).toBe("not-served");
   });
 
-  test("returns unknown when discovery returns an empty roster", async () => {
-    stubRoster();
+  test("returns unknown when discovery returns an empty dynamic models catalog", async () => {
+    stubModelsCatalog();
 
     // A temporarily unavailable listing endpoint must not silently switch the
     // user away from the provider they selected and may already pay for.
@@ -187,8 +228,47 @@ describe("providerServesModel live discovery", () => {
 
   test("uses discovery before conflicting catalog evidence", async () => {
     _setCatalogEntriesForTest([catalogEntry("model-one", [{ provider: DISCOVERY_PROVIDER }])]);
-    stubRoster("different-model");
+    stubModelsCatalog("different-model");
 
     expect(await providerServesModel(DISCOVERY_PROVIDER, "model-one")).toBe("not-served");
+  });
+});
+
+describe("providerServesModel resolver-backed discovery", () => {
+  test("serves a canonical Devin family represented only by knob-encoded uids", async () => {
+    stubDevinModelsCatalog();
+
+    expect(devinModelsCatalog.map((model) => model.id)).toEqual(["swe-1-7", "swe-1-7-medium"]);
+    expect(devinModelsCatalog.some((model) => model.id === "swe-1.7")).toBe(false);
+    expect(await providerServesModel("devin", "swe-1.7")).toBe("serves");
+  });
+
+  test("does not turn an unknown Devin family into a served model", async () => {
+    stubDevinModelsCatalog();
+
+    expect(await providerServesModel("devin", "not-a-devin-model")).toBe("not-served");
+  });
+
+  test("preserves exact-match behavior for a provider with no resolver", async () => {
+    stubModelsCatalog("present-model");
+
+    expect(await providerServesModel(DISCOVERY_PROVIDER, "present-model")).toBe("serves");
+    expect(await providerServesModel(DISCOVERY_PROVIDER, "absent-model")).toBe("not-served");
+  });
+
+  test("keeps Devin primary when routing a bare canonical family", async () => {
+    stubDevinModelsCatalog();
+    credentials.isAvailable = async (provider: string) =>
+      provider === "devin" || provider === "openrouter";
+    credentials.describeReadiness = async (provider: string) => ({
+      readiness: provider === "devin" || provider === "openrouter" ? "present" : "absent",
+    });
+
+    const plan = await route("swe-1.7", {}, "openrouter");
+
+    expect(plan.kind).toBe("ok");
+    if (plan.kind !== "ok") return;
+    expect(plan.primary.provider).toBe("devin");
+    expect(plan.primary.modelSpec).toBe("dv@swe-1.7");
   });
 });

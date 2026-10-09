@@ -283,7 +283,7 @@ function alignToolRound(assistant: any, collected: any[]): any[] {
  * whether to emit its "[image returned…]" marker.
  *
  * The media type is validated for SHAPE (a non-empty string), not against a list
- * of accepted image types. An allowlist here would be a second roster to keep
+ * of accepted image types. An allowlist here would be a second list to keep
  * current, and a media type this converter has not heard of is the upstream
  * provider's judgement to make, not ours.
  */

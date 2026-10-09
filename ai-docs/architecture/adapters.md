@@ -60,7 +60,7 @@ inefficiency, so a shared value is not expected to fail, but it is less precise.
 `OpenCodeZenTransport` sends `User-Agent: claudish/<version>` beside the session
 id. OpenCode's docs ask a client to identify itself "rather than a generic SDK or
 HTTP-library name", and this relay enforces it: `providers/model-discovery.ts`
-records that a UA-less roster request to Zen Go answers `403 error code: 1010`,
+records that a UA-less discovery request to Zen Go answers `403 error code: 1010`,
 Cloudflare's browser-integrity block, while the identical request carrying one
 returns 200 with 26 models (measured 2026-08-18). The chat path sits behind the
 same edge and went without a UA until 2026-09-15.
@@ -203,7 +203,7 @@ that to 3/3.
 `openai-sse.ts` calls `extractToolCallsFromText` (`handlers/shared/tool-call-recovery.ts`)
 at finalization. That function scrapes tool calls out of assistant PROSE, for local models
 that cannot emit structured `tool_calls` at all. It is the only production caller, so this
-path is exactly the `openai-sse` roster: GLM, Kimi, Grok, DeepSeek, Qwen, OpenRouter, LiteLLM.
+path is exactly the `openai-sse` provider list: GLM, Kimi, Grok, DeepSeek, Qwen, OpenRouter, LiteLLM.
 
 Three properties are not obvious from the source and each one shipped as a defect
 (v7.68.0, `ai-docs/reports/grok-tool-name-mangling-20260827.md`):
@@ -247,11 +247,15 @@ Every retry hook in claudish keys off the HTTP **status** (`anthropic-compat.ts`
 `sniffResponsesStreamHead()` peeks at the stream head in `composed-handler.ts` step **7b**, which is the only window where the status code is still ours to choose (once Hono flushes the 200, a 503 is no longer expressible):
 
 - **Retryable** (`server_is_overloaded`, `server_error`, `service_unavailable_error`, prose "overloaded"/"try again later") → re-issue upstream with **progressive** backoff `3s → 15s → 30s` (`STREAM_RETRY_DELAYS_MS`). Progressive, not tight: the outage that motivated this ran ~6.5 minutes, so only the late attempts recover anything.
-- **All retries exhausted** → HTTP **503** `overloaded_error`. Safe specifically because `fallback-handler.ts`'s `isRetryableError` does NOT list 503 — it cannot silently switch the user off a pinned model, it reaches Claude Code, which runs its own retry loop.
+- **All retries exhausted** → HTTP **503** `overloaded_error`. For a pinned `provider@model` (no `FallbackHandler`) it reaches Claude Code, which runs its own retry loop. Inside a bare-name chain, `isRetryableError` advances on it to the next candidate (since 2026-09-24, see "An unavailable endpoint advances the chain" below).
 - **Terminal** in-stream errors (`context_length_exceeded`, `invalid_request_error`) are NOT retried — they keep the existing inline-text treatment, which is the actionable path for them.
 - **Anything else** (any content event) → `clean`, and the consumed bytes are **replayed byte-identically** so the real parser sees an unchanged stream.
 
-This is the one place the 400-not-503 doctrine (`composed-handler.ts` ~line 461) is deliberately inverted. That rule exists because a 503 makes Claude Code show "API error · Retrying · attempt N/10" with the real reason buried — correct for **terminal** faults, where retrying is theatre. An upstream overload is the opposite: genuinely transient, and the retry banner is the appropriate behaviour because retrying is the actual remedy. Terminal → 400 inline; transient-after-our-own-retries → 503.
+This is **one of two** places the 400-not-503 doctrine (`composed-handler.ts`'s `respondConnectionError`) is deliberately inverted. That rule exists because a 503 makes Claude Code show "API error · Retrying · attempt N/10" with the real reason buried — correct for **terminal** faults, where retrying is theatre. An upstream overload is the opposite: genuinely transient, and the retry banner is the appropriate behaviour because retrying is the actual remedy. Terminal → 400 inline; transient-after-our-own-retries → 503.
+
+The second inversion is network recovery's tier-2 handoff, which earns the same 503 by a different argument — not "the banner is the remedy" but "a pane is painting the reason, so the status no longer has to carry it". See [`network-recovery.md`](network-recovery.md).
+
+> This reference was `~line 461` until v9.2.x, then really `:665-675`, and is now inside a named method. **Cite the symbol, not the line.** Three separate readers have been sent to the wrong part of this 2,000-line file by a number that was correct when it was written.
 
 **Trade-off to know:** sniffing withholds response headers until the first decisive event, capped by `DEFAULT_SNIFF_BUDGET_MS` (12s, chosen above the 0.85s–7.7s error latencies observed in the real log). On a healthy xhigh-reasoning turn that delays `message_start` by however long the model thinks before its first output item. No content is lost or reordered — the client shows a spinner either way — but time-to-first-byte is genuinely later than before. Past the budget claudish flushes and degrades gracefully to the inline-text path.
 
@@ -359,6 +363,78 @@ remap happened rather than gaining a new special case.
 The general lesson: **any code that branches on an HTTP status downstream of the
 remap is suspect.** Grep for `status ===` under `handlers/` before assuming a new
 one is safe.
+
+### The status is not always enough: `x-claudish-recovery` (network recovery, Tier 2)
+
+There is now one response `FallbackHandler` must treat specially **before it looks
+at a status or a body at all**: the 503 an exhausted tier-1 connection hold hands
+back so Claude Code will re-POST (`handlers/shared/recovery-marker.ts`).
+
+The status cannot hold the chain: since 2026-09-24 `isRetryableError` ADVANCES on an
+upstream 502/503/504 (next section), so the marker is the only thing that keeps a
+recovery 503 in place. Even before that, when a 503 stopped the chain on status
+alone, the status was not enough, twice:
+
+- **`isRetryableError`'s FIRST statement is `hasQuotaExhaustionWording(errorBody)`**,
+  status-agnostic on purpose (it exists *because* of the remap above), and its list
+  carries the bare substring `"quota"`. A 503 whose MESSAGE happened to contain that
+  word advanced the chain — and per CLAUDE.md's standing invariant, advancing off a
+  `SUBSCRIPTION_PROVIDERS` candidate onto a metered one quotes real money, during an
+  outage, for a fault no provider caused.
+- **`exhaustedChainStatus` could demote it.** With an earlier candidate already
+  failed, a non-retryable response goes to `formatCombinedError`, whose status is 503
+  only if EVERY accumulated error is transient. One earlier auth/404 turns our 503
+  into a terminal 400 and the client never re-POSTs.
+
+So the marker is a **header**, checked in two independent places: `handle()` returns
+a marked response VERBATIM before reading the body (which is what defeats the
+combining), and `isRetryableError` returns `false` on it ABOVE the quota match
+(which is what defeats the wording). The second is unreachable in the shipped call
+graph and is kept anyway, so the guarantee belongs to the decision rather than to one
+call site.
+
+**Order is the property, not presence.** Moving the marker check below the quota
+match — present, but late — is a live billing bug, and is mutation-covered as one.
+
+It cannot be forged: every non-ok exit from `ComposedHandler` is `c.json(...)`, which
+builds headers from nothing, and the only path that copies upstream headers verbatim
+(`stream-head-sniffer.ts`'s `replayResponse()`) runs after `!response.ok` has already
+returned, i.e. on a 200. **If a future edit ever returns an upstream `Response` object
+on a non-ok path, the marker must be stripped there.**
+
+Evidence, including the live chain runs and the mutation set:
+`ai-docs/reports/network-recovery-phase4-status-flip-20260911.md`.
+
+### An unavailable endpoint advances the chain (2026-09-24)
+
+A bare `grok-4.7` failed on every request while OpenCode Zen Go, its first candidate,
+answered `503 {"type":"server_error","message":"Upstream request failed: Endpoint is
+unavailable."}`. `--probe grok-4.7` in the same minute showed the five candidates behind it
+answering (Grok Build, xAI, OpenRouter, OpenCode Zen, Poe). `isRetryableError` had no
+502/503/504 branch, so the first attempt's 503 was returned as-is with no `[Fallback]` line,
+and Claude Code's retry loop re-sent the same chain to the same dead hop, ten times.
+
+The exclusion rested on "a 503 cannot silently switch the user off a pinned model". A pinned
+`provider@model` builds no `FallbackHandler`, so inside a chain that protected nothing. Now:
+
+- `isRetryableError` returns `true` for 502, 503 and 504. A plain 500 still stops the chain
+  unless it carries billing wording: it can carry account state, and it is the one 5xx a
+  request's own payload can provoke on every provider alike.
+- `exhaustedChainStatus` counts 502 and 504 as transient beside 429 and 503, so a chain in
+  which every hop was unavailable still ends retryable (503), as the single 502 that used to be
+  returned as-is did.
+- Unchanged, and the reason this is safe: claudish's own connection verdicts
+  (`x-claudish-recovery` on the 503 arm, `x-claudish-connection-error` on the 400 arm) are
+  checked before any status, in `handle()` and on `isRetryableError`'s first line. A network
+  outage on this machine still holds the chain.
+- Changed on purpose: the stream sniffers' exhaustion 503 (overloaded after 3s → 15s → 30s of
+  retries) now advances a bare-name chain instead of returning to Claude Code.
+- Except when a retry could not REACH the provider. `settleResponsesStreamHead` and
+  `settleDevinStreamHead` return `exhausted` with `unreachable: true` when `reissue()` throws,
+  and the caller adds `x-claudish-connection-error` to that 503, so the chain holds. Without it a
+  DNS or connection failure on a Codex subscription hop advanced onto a metered OpenAI hop
+  (found by the 10.3.0 release review, source-traced; the status alone could not tell a
+  connection fault from an overload).
 
 ## The catalog's endpoint contract has two halves (v9.0.7)
 

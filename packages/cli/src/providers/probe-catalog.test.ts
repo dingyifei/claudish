@@ -30,7 +30,8 @@ function makeTmpPath(): { path: string; cleanup: () => void } {
 }
 
 const SAMPLE: ProbeModelsResponse = {
-  version: 1,
+  version: 3,
+  generationId: "test-generation",
   generatedAt: "2026-05-25T13:24:22.364Z",
   providers: {
     xai: "grok-build-0.1",
@@ -38,13 +39,43 @@ const SAMPLE: ProbeModelsResponse = {
     zhipu: "glm-4.5-air",
     moonshot: "moonshot-v1-auto",
   },
+  unavailable: {},
 };
 
 const REAL_426_BODY =
   '{"contractVersion":3,"error":{"code":"catalog_client_upgrade_required","message":"This endpoint requires catalog contract version 3","minimumContractVersion":3}}';
 
 const REAL_V3_PROBE_MODELS_BODY =
-  '{"contractVersion":3,"generationId":"g-20260918072314542-9c5a9567","generatedAt":"2026-09-18T07:23:14.542Z","data":{"routes":{"deepseek/direct-api":{"modelId":"deepseek-v4.1-flash","externalModelId":"deepseek-flash","route":{"routeId":"deepseek","routeProfileId":"direct-api"},"confidence":"api_official"}}}}';
+  '{"contractVersion":3,"generationId":"g-20260918072314542-9c5a9567","generatedAt":"2026-09-18T07:23:14.542Z","data":{"routes":{"deepseek/direct-api":{"modelId":"deepseek-v4.1-flash","externalModelId":"deepseek-flash","route":{"routeId":"deepseek","routeProfileId":"direct-api"},"confidence":"api_official"}},"unavailableRoutes":{"google/antigravity-subscription":{"route":{"routeId":"google","routeProfileId":"antigravity-subscription"},"reason":"client_model_selection_required"},"poe/gateway":{"route":{"routeId":"poe","routeProfileId":"gateway"},"reason":"no_verified_probe_model"}}}}';
+
+const STAGE8_PROBE_MODELS_BODY = JSON.stringify({
+  contractVersion: 3,
+  generationId: "stage8-probe-fixture",
+  generatedAt: "2026-09-24T00:00:00.000Z",
+  data: {
+    routes: {
+      "z-ai/direct-api": {
+        modelId: "glm-stage8",
+        externalModelId: "glm-stage8",
+        route: { routeId: "z-ai", routeProfileId: "direct-api" },
+        confidence: "api_official",
+      },
+      "moonshotai/direct-api": {
+        modelId: "kimi-stage8",
+        externalModelId: "kimi-stage8",
+        route: { routeId: "moonshotai", routeProfileId: "direct-api" },
+        confidence: "api_official",
+      },
+      "anthropic/direct-api": {
+        modelId: "claude-opus-stage8",
+        externalModelId: "claude-opus-stage8",
+        route: { routeId: "anthropic", routeProfileId: "direct-api" },
+        confidence: "api_official",
+      },
+    },
+    unavailableRoutes: {},
+  },
+});
 
 describe("readProbeModelsCache / writeProbeModelsCache", () => {
   let tmp: ReturnType<typeof makeTmpPath>;
@@ -139,11 +170,17 @@ describe("fetchProbeModels", () => {
 
   test("returns ok with parsed response on 200", async () => {
     globalThis.fetch = mock(
-      async () => new Response(JSON.stringify(SAMPLE), { status: 200 })
+      async () => new Response(REAL_V3_PROBE_MODELS_BODY, { status: 200 })
     ) as unknown as typeof fetch;
     const outcome = await fetchProbeModels("http://stub.local", 1000);
     expect(outcome.kind).toBe("ok");
-    if (outcome.kind === "ok") expect(outcome.data).toEqual(SAMPLE);
+    if (outcome.kind === "ok") {
+      expect(outcome.data.providers).toEqual({ deepseek: "deepseek-flash" });
+      expect(outcome.data.unavailable).toEqual({
+        antigravity: "client_model_selection_required",
+        poe: "no_verified_probe_model",
+      });
+    }
   });
 
   test("returns incompatible with the server contract version on 426", async () => {
@@ -162,12 +199,65 @@ describe("fetchProbeModels", () => {
     expect(outcome).toEqual({ kind: "incompatible", serverContractVersion: null });
   });
 
-  test("returns incompatible before validating the shape of a newer 200 response", async () => {
+  test("maps exact provider routes in a v3 response", async () => {
     globalThis.fetch = mock(
       async () => new Response(REAL_V3_PROBE_MODELS_BODY, { status: 200 })
     ) as unknown as typeof fetch;
     const outcome = await fetchProbeModels("http://stub.local", 1000);
-    expect(outcome).toEqual({ kind: "incompatible", serverContractVersion: 3 });
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      expect(outcome.data.providers).toEqual({ deepseek: "deepseek-flash" });
+      expect(outcome.data.unavailable).toEqual({
+        antigravity: "client_model_selection_required",
+        poe: "no_verified_probe_model",
+      });
+    }
+  });
+
+  test("keys shared and lookup-only routes under every catalog read name", () => {
+    const home = mkdtempSync(join(tmpdir(), "claudish-stage8-probe-"));
+    const probeModuleUrl = new URL("./probe-catalog.ts", import.meta.url).href;
+    const candidatesModuleUrl = new URL("./route-candidates.ts", import.meta.url).href;
+    const script = `
+      const { fetchProbeModels, writeProbeModelsCache } = await import(${JSON.stringify(probeModuleUrl)});
+      const { routeOwnership } = await import(${JSON.stringify(candidatesModuleUrl)});
+      globalThis.fetch = async () => new Response(${JSON.stringify(STAGE8_PROBE_MODELS_BODY)}, { status: 200 });
+      const outcome = await fetchProbeModels("http://stage8.invalid", 1000);
+      if (outcome.kind !== "ok") throw new Error(JSON.stringify(outcome));
+      writeProbeModelsCache(outcome.data);
+      process.stdout.write(JSON.stringify({
+        providers: outcome.data.providers,
+        glmOwnership: routeOwnership("glm"),
+      }));
+    `;
+
+    try {
+      const result = Bun.spawnSync([process.execPath, "-e", script], {
+        cwd: join(import.meta.dir, "../../../.."),
+        env: {
+          ...process.env,
+          HOME: home,
+          CLAUDISH_DISABLE_CATALOG_WARM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = result.stdout.toString();
+      const stderr = result.stderr.toString();
+      expect(result.exitCode, stderr || stdout).toBe(0);
+      expect(JSON.parse(stdout)).toEqual({
+        providers: {
+          "z-ai": "glm-stage8",
+          glm: "glm-stage8",
+          kimi: "kimi-stage8",
+          moonshotai: "kimi-stage8",
+          anthropic: "claude-opus-stage8",
+        },
+        glmOwnership: "backend-owned",
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("returns http with status on a non-contract non-2xx response with no body", async () => {

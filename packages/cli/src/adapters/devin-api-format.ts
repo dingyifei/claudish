@@ -31,7 +31,7 @@
  * - **No effort field.** Devin encodes the reasoning tier in the model UID
  *   suffix, not in a request field, so {@link applyNativeReasoning} only
  *   RECORDS the level on the payload; the transport folds it into field 21 via
- *   `resolveDevinModelUid` against the LIVE roster.
+ *   `resolveDevinModelUid` against the dynamic models catalog.
  * - **No vision.** {@link supportsVision} returns false, which routes images
  *   through ComposedHandler's existing vision-proxy path (described into text,
  *   or stripped). That is a working degradation for free, and it is why Devin's
@@ -143,7 +143,7 @@ export class DevinAPIFormat extends BaseAPIFormat {
   /**
    * Zero = "no opinion". The live per-uid window comes from the transport's
    * `getContextWindow()` (ComposedHandler step 5b, positive-only), which reads
-   * the backend's own `GetCliModelConfigs` roster — the only source that knows
+   * the backend's own `GetCliModelConfigs` dynamic models catalog — the only source that knows
    * what THIS subscription serves.
    */
   override getContextWindow(): number {
@@ -161,7 +161,7 @@ export class DevinAPIFormat extends BaseAPIFormat {
    * Devin exposes no effort parameter — the tier lives in the uid suffix — so
    * there is nothing to set on the wire here. Writing the level onto the
    * payload is the whole job; `DevinProviderTransport.serializeBody` resolves
-   * it against the live roster.
+   * it against the dynamic models catalog.
    */
   protected override applyNativeReasoning(request: any, originalRequest: any): any {
     const effort = this.resolveEffortLevel(originalRequest);
@@ -366,7 +366,7 @@ export class DevinAPIFormat extends BaseAPIFormat {
 
     const payload: DevinRequestPayload = {
       // The bare requested name. The transport resolves it to a SERVED uid
-      // (family + effort → tier) against the live roster before encoding.
+      // (family + effort → tier) against the dynamic models catalog before encoding.
       modelUid: this.modelId,
       messages: devinMessages,
     };

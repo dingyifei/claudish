@@ -9,7 +9,7 @@
  * `SUBSCRIPTION_PROVIDERS`.
  *
  * Everything here is derived from the live definitions rather than pinned to a
- * roster: which providers are local, and which carry an `oauthFallback`, are
+ * provider list: which providers are local, and which carry an `oauthFallback`, are
  * both read at run time, so adding a provider cannot leave a stale list behind.
  */
 
@@ -112,9 +112,9 @@ describe("describeMissingCredential — local providers", () => {
 });
 
 describe("describeMissingCredential — everything else is unchanged", () => {
-  const plain = BUILTIN_PROVIDERS.filter((d) => !d.oauthFallback && !isLocalTransport(d.name)).map(
-    (d) => d.name
-  );
+  const plain = BUILTIN_PROVIDERS.filter(
+    (d) => d.name !== "vertex" && !d.oauthFallback && !isLocalTransport(d.name)
+  ).map((d) => d.name);
 
   test("plain providers keep today's exact sentence", () => {
     expect(plain.length).toBeGreaterThan(0);
@@ -126,7 +126,7 @@ describe("describeMissingCredential — everything else is unchanged", () => {
       const signup = info?.url ? ` Get one at ${info.url}.` : "";
       // `siblingKeyEnvVars` appends one clause and is declared by almost nobody,
       // so the expectation is derived from the SAME field rather than pinned to
-      // a roster — a provider adopting it later must not have to edit this test,
+      // a provider list — a provider adopting it later must not have to edit this test,
       // and one that quietly LOSES the declaration must still fail below.
       const expected = keyNames
         ? `No API key for provider "${name}". Set ${keyNames} (env, config, or 1Password import).${signup}${siblingClause(name)}`
@@ -154,5 +154,14 @@ describe("describeMissingCredential — everything else is unchanged", () => {
     expect(describeMissingCredential("no-such-provider")).toBe(
       'No API key for provider "no-such-provider".'
     );
+  });
+});
+
+describe("describeMissingCredential — Vertex", () => {
+  test("names project remedies and ADC instead of asking for an API key", () => {
+    expect(describeMissingCredential("vertex")).toBe(
+      'No Google Cloud project for provider "vertex". set VERTEX_PROJECT or run `gcloud config set project <id>`. Application Default Credentials already handles the credential; Vertex takes no API key.'
+    );
+    expect(describeMissingCredential("vertex")).not.toContain("Get one at");
   });
 });

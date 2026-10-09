@@ -24,8 +24,9 @@
  * the bytes back is the part that actually saves them.
  *
  * GUARDED is a list rather than one path because the convention decayed again,
- * in exactly the shape the paragraph above describes. `all-models.json` is the
- * hosted model catalog's disk cache, and `effort-mapping.test.ts` seeds a
+ * in exactly the shape the paragraph above describes. `all-models.json` was the
+ * hosted model catalog's disk cache (since contract 3 it is
+ * `cloud-models-catalog-v3.json`), and `effort-mapping.test.ts` seeded a
  * fixture into it and restores in a `finally`. That is the same save/restore
  * pattern the config files used, with the same hole: a killed or timed-out run
  * skips the restore and the two-entry fixture becomes the machine's permanent
@@ -57,7 +58,7 @@ import { join } from "node:path";
 /**
  * Every real file a test run must give back unchanged. `label` names it in the
  * failure, and `remedy` states the isolation the author should have used — the
- * two files have different answers, so the message cannot be generic.
+ * files have different answers, so the message cannot be generic.
  */
 const GUARDED = [
   {
@@ -66,11 +67,23 @@ const GUARDED = [
     remedy: "isolate with setConfigFileOverride(<temp path>) instead of writing the real file",
   },
   {
-    path: join(homedir(), ".claudish", "all-models.json"),
-    label: "REAL MODEL CATALOG CACHE",
+    path: join(homedir(), ".claudish", "cloud-models-catalog-v3.json"),
+    label: "REAL CLOUD MODELS CATALOG CACHE",
     remedy:
       "pass a temp path to readAllModelsCache/writeAllModelsCache, or seed in memory the way " +
       "catalog-client.ts's _setCatalogEntriesForTest does, instead of writing the real cache",
+  },
+  {
+    // The pre-v3 cache file. This build no longer writes it, but older builds on the
+    // same machine still read it, so a test that touches it breaks them.
+    path: join(homedir(), ".claudish", "all-models.json"),
+    label: "REAL PRE-V3 MODEL CATALOG CACHE",
+    remedy: "nothing in this build writes all-models.json; find the test that still names it",
+  },
+  {
+    path: join(homedir(), ".claudish", "openrouter-models.json"),
+    label: "REAL OPENROUTER MODEL LIST",
+    remedy: "run the MCP search_models path against a temp HOME instead of the real cache dir",
   },
   {
     path: join(homedir(), ".claudish", "catalog-incompatible.json"),

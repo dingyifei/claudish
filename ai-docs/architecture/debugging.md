@@ -41,6 +41,20 @@ When `--debug` is active, both stream parsers log raw SSE events:
 
 These are greppable and extractable into test fixtures for regression testing.
 
+## grep reports nothing in two source files, and they are not empty
+
+`packages/cli/src/providers/model-resolvers/devin.ts` (1 NUL byte) and
+`packages/cli/src/adapters/grok-effort-support.ts` (2) contain literal NUL bytes, used as
+a group-key separator. **grep classifies both as binary and silently reports no matches
+in them.** `file(1)` calls them `data`. Measured 2026-09-19: `grep -n "catalog"
+devin.ts` prints nothing and exits 1, while `grep -na "catalog" devin.ts` prints seven
+lines. Found 2026-09-18 during the rename to *dynamic models catalog*: nineteen
+occurrences were invisible to every repo-wide `grep -rn` sweep, including the baseline
+counts quoted in that work, and surfaced only under a Bun scan that read the files as
+text. A grep that finds nothing in those two files looks exactly like a grep that found
+nothing because nothing was there. Any exhaustiveness claim over this repository is
+unverified until it is cross-checked with `grep -a` (`--text`) or a direct read.
+
 ## Debugging Failed Model Translations
 
 When a model produces wrong output (0 bytes, garbled, wrong format), use this workflow:

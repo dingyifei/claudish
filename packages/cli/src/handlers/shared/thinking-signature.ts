@@ -33,7 +33,7 @@
  * It never reaches the client. On the Anthropic wire, thinking is stripped at
  * EMIT: `shouldFilterThinking()` is true for every dialect there
  * (base-api-format.ts — it keys on the wire, deliberately, not on a model
- * roster), and `createAnthropicPassthroughStream` drops the blocks and
+ * list), and `createAnthropicPassthroughStream` drops the blocks and
  * re-indexes what remains. Replaying that MiniMax fixture through the real
  * composition yields 0 thinking blocks and 0 signature frames. Same answer for
  * kimi-k2.5, glm-5.2 and deepseek-v4 — all `filterThinking: true`.

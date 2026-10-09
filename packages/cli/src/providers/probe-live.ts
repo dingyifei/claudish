@@ -12,7 +12,7 @@
  * not a silent failover to something else.
  */
 
-import { extractUpstreamStatus } from "../handlers/shared/anthropic-error.js";
+import { extractUpstreamStatus, sseDataPayload } from "../handlers/shared/anthropic-error.js";
 import {
   hasActionableLink,
   hasModelUnsupportedWording,
@@ -115,10 +115,70 @@ export interface ProbeLinkInput {
  * stop a reasoning model spending the whole probe cap on hidden reasoning and
  * returning 200 with zero visible text. "low" preserves that intent and is
  * accepted (both verified against the live API).
+ *
+ * `google` is here for the Gemini 3 thinking levels. Measured 2026-09-19 on the
+ * direct API: gemini-3.8-flash answers `400 "Thinking level MINIMAL is not
+ * supported for this model"`, while "low" and "high" return 200; gemini-2.5-flash
+ * accepts all of them, since 2.5 takes a numeric budget instead. The probe pick
+ * for google is a Gemini 3 model, so every Gemini probe failed on its effort
+ * field. (Antigravity serves both families and needs no field at all — see
+ * EFFORT_OMITTED below.)
+ *
+ * `qwen-payg` validates the enum the same way Anthropic does, and says so:
+ * `400 InvalidParameter "Invalid value 'minimal' for output_config.effort.
+ * Supported values are: low, medium, high, xhigh, max."` (measured 2026-09-20 on
+ * dashscope-intl with qwen3.8-max-0902). Its sibling products do not: the Token
+ * Plan host accepts "minimal" on the same round of measurements, so this is one
+ * product's host, not a vendor-wide rule.
+ *
+ * The three Z.ai products (`glm`, `z-ai`, `glm-coding` — one endpoint, three key
+ * silos) are here for a DIFFERENT reason, and it is worth stating because the
+ * remedy looks the same while the cause is not. Z.ai accepts the word "minimal"
+ * perfectly well; what it refuses is the REQUEST that word produces. The GLM
+ * dialect maps "minimal" to `thinking: {type: "disabled"}`, and GLM-5.3 cannot
+ * be told to stop thinking. Measured 2026-09-22 against api.z.ai with glm-5.3:
+ *
+ *   {"thinking":{"type":"disabled"}}                    -> 400 code 1210
+ *     "This model always engages in thinking and cannot be disabled;
+ *      please use low, high, or max"
+ *   {"thinking":{"type":"enabled"},"reasoning_effort":"low"} -> 200
+ *
+ * Only `glm` failed Test All, because its probe pick discovers `glm-5.3` while
+ * `z-ai` and `glm-coding` pick the Flash variants, which still accept the
+ * off-switch. All three are listed anyway: the constraint belongs to the GLM
+ * family on this endpoint, not to whichever model discovery happens to rank
+ * first today, and pinning only the one that broke would make the next pick a
+ * new bug.
  */
-const MINIMAL_EFFORT_UNSUPPORTED = new Set(["native-anthropic", "anthropic"]);
+const MINIMAL_EFFORT_UNSUPPORTED = new Set([
+  "native-anthropic",
+  "anthropic",
+  "google",
+  "qwen-payg",
+  "glm",
+  "z-ai",
+  "glm-coding",
+]);
 
-function effortForProvider(provider: string): string {
+/**
+ * Providers where NO effort value is valid for every model they serve, so the
+ * probe sends none and lets each model use its default.
+ *
+ * Antigravity serves Gemini 2.5, Gemini 3 and Claude behind one request shape,
+ * and the probe knows only the provider, never the model family. Measured
+ * 2026-09-19 with the 512-token probe cap:
+ *   - "minimal" → `thinkingBudget: 0` on Gemini 2.5, which Antigravity rejects:
+ *     `400 INVALID_ARGUMENT` on gemini-2.5-flash and gemini-2.5-flash-lite.
+ *   - "low" → a 1024-token budget, which Claude rejects because it is not below
+ *     the cap: "`max_tokens` must be greater than `thinking.budget_tokens`".
+ *   - no field → 200 on all of them.
+ * Claude Code never sends "minimal" and sends a far larger max_tokens, so user
+ * sessions reach neither failure through this path.
+ */
+const EFFORT_OMITTED = new Set(["antigravity"]);
+
+function effortForProvider(provider: string): string | undefined {
+  if (EFFORT_OMITTED.has(provider)) return undefined;
   return MINIMAL_EFFORT_UNSUPPORTED.has(provider) ? "low" : "minimal";
 }
 
@@ -138,6 +198,7 @@ export async function probeLink(
   }
 
   const startedAt = Date.now();
+  const probeEffort = effortForProvider(link.provider);
   let response: Response;
 
   try {
@@ -145,6 +206,16 @@ export async function probeLink(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        // A probe must FAIL FAST. Every probe POSTs /v1/messages through the
+        // proxy, so it enters the same handler as a real turn — and a real
+        // turn now holds an unreachable provider open for the whole tier-1
+        // deadline. Without this header, probing an unreachable link would
+        // burn the probe's own timeout and then report `timeout` (the probe's
+        // abort fires first) instead of `network-error`, breaking `--probe`
+        // and the config TUI's Test All for exactly the failure they exist to
+        // diagnose — and multiplying a Test All run by that timeout per dead
+        // link.
+        "x-claudish-no-recovery": "1",
       },
       body: JSON.stringify({
         model: link.modelSpec,
@@ -174,7 +245,7 @@ export async function probeLink(
         // omitting the field both return 200. So EVERY native-anthropic probe
         // failed on the payload before the model id was even considered, which
         // is why that link could never report `live`.
-        output_config: { effort: effortForProvider(link.provider) },
+        ...(probeEffort ? { output_config: { effort: probeEffort } } : {}),
         stream: true,
       }),
       signal: AbortSignal.timeout(timeoutMs),
@@ -327,10 +398,23 @@ function extractErrorType(body: string): string | undefined {
 export function classifyHttpError(status: number, body: string, latencyMs: number): ProbeResult {
   const lowered = body.toLowerCase();
   // A proxy-side connection failure (DNS unresolved, connection refused, host
-  // unreachable) is tagged by composed-handler as a 503 connection_error. That's
-  // a LOCAL network problem, not an upstream server error — classify it as
-  // network-error so the row reads "network error" with the proxy's actionable
-  // message ("check your network/DNS") instead of a generic "server error · 503".
+  // unreachable) is tagged by composed-handler as a **400** connection_error —
+  // NOT a 503, whatever this comment said until v9.2.x. That matters twice
+  // over. The status is 400 because a 503 makes Claude Code retry with the
+  // reason buried behind its own banner, and because `isRetryableError` would
+  // otherwise walk the fallback chain. So the test below keys off the `type`,
+  // which is status-agnostic and therefore survives both that choice and the
+  // terminal-error remap that shares the same 400.
+  //
+  // Probes never reach the retry ladder at all: `probeLink` sends
+  // `x-claudish-no-recovery: 1` and `shouldSkipTier1` honours it, so an
+  // unreachable provider still answers here in milliseconds instead of holding
+  // for the full recovery deadline and misreporting as a timeout.
+  //
+  // It is a LOCAL network problem, not an upstream server error — classify it
+  // as network-error so the row reads "network error" with the proxy's
+  // actionable message ("check your network/DNS") instead of a generic
+  // "server error".
   if (extractErrorType(body) === "connection_error") {
     return {
       state: "network-error",
@@ -363,10 +447,27 @@ export function classifyHttpError(status: number, body: string, latencyMs: numbe
         errorMessage: extractErrorMessage(body) || `HTTP ${authStatus}`,
       };
     }
+    // Nor is it an auth failure when the provider accepted the credential and
+    // denied THIS MODEL. Alibaba's Model Studio answers
+    // `403 {"code":"Model.AccessDenied","message":"Model access denied."}` while
+    // the same key lists 169 models on the same host (measured 2026-09-19), so
+    // the credential is proven good by the provider itself. Reported as
+    // `auth-failed` it both blamed a working key and STOPPED Test All on the
+    // first candidate: the loop retries `error`, never `auth-failed`, so an
+    // account that may call some models but not the catalog's pick never got a
+    // second try. `error` keeps the failure without the false cause.
+    if (/model[^"]{0,24}access[ _-]?denied|access[ _-]?denied[^"]{0,24}model/i.test(body)) {
+      return {
+        state: "error",
+        latencyMs,
+        httpStatus: authStatus,
+        errorMessage: extractErrorMessage(body) || `HTTP ${authStatus}`,
+      };
+    }
     // Nor is it an auth failure when the provider handed back a link to act on.
     // Measured: Zen Go answers a model the account has not opted into with
     // `403 RegionError … requires explicit opt in: <url>` — the credential is
-    // fine, the model IS in its live roster, and the fix is a click. Reporting
+    // fine, the model IS in its dynamic models catalog, and the fix is a click. Reporting
     // `auth-failed` there points the user at a working key. `error` keeps the
     // failure semantics (it is in `isFailureState`) without the false cause.
     if (hasActionableLink(body)) {
@@ -499,19 +600,77 @@ function truncateKeepingLink(text: string, max = 400): string {
   return `${prose}... ${url}`;
 }
 
+/**
+ * ONE LINE, always. Every consumer of a probe error message renders it on a
+ * single row, and a newline is the one character none of them can survive: the
+ * TUI clips by character count, so a `\n` inside the clip ends the row early and
+ * everything after it paints over the row below. `truncateKeepingLink` bounds
+ * LENGTH, which is a different promise and was mistaken for this one.
+ */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The message a JSON error document carries, under any of the shapes seen.
+ *
+ * `error.provider_message` is read FIRST and it is the whole point of this
+ * order: it is the upstream's own sentence, while `error.message` beside it is
+ * claudish's composed one — the recovery hint, then the provider's text after an
+ * em dash. A probe row clips, so composing put the guess where the reader looks
+ * and the evidence where they never get to. "Model access denied." is three
+ * words and says what happened; "The provider accepted the credential but denied
+ * access to this model — check model access or activation for this account in
+ * the provider's console, not the key." is 150 characters of inference about it.
+ *
+ * The hint is not thrown away — `probe-results-printer` still word-wraps the
+ * full composed `message` in the Details box, which has the room for both.
+ */
+function messageFromJson(text: string): string | undefined {
+  try {
+    const parsed = JSON.parse(text);
+    const msg =
+      parsed?.error?.provider_message ||
+      parsed?.error?.message ||
+      parsed?.error?.error?.message ||
+      parsed?.message ||
+      parsed?.detail;
+    return typeof msg === "string" && msg.length > 0 ? msg : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Open an SSE frame if that is what this text is, otherwise hand it back.
+ *
+ * Applied to the EXTRACTED message and not only to the raw body, because the
+ * frame arrives both ways and the JSON ladder hides the second one. A provider
+ * answering a stream request with an error may send the frame as the body —
+ * caught by parsing the body — but claudish also re-wraps a raw upstream body
+ * into `{error:{message: <that body>}}` (`composed-handler.ts`, the auth-retry
+ * return). That parses as perfectly good JSON, so `messageFromJson` succeeded
+ * and returned a whole wire frame wearing a message field. Measured against
+ * dashscope-intl: the row read
+ *   `event:error data:{"code":"InvalidParameter","message":"Model access
+ *    denied.","request_id":"0d6a48d4-…"}`
+ * where "Model access denied." was the entire content.
+ */
+function unwrapFrame(text: string): string {
+  const payload = sseDataPayload(text);
+  if (!payload) return text;
+  return messageFromJson(payload) ?? payload;
+}
+
 function extractErrorMessage(body: string): string | undefined {
   if (!body) return undefined;
-  try {
-    const parsed = JSON.parse(body);
-    const msg =
-      parsed?.error?.message || parsed?.error?.error?.message || parsed?.message || parsed?.detail;
-    if (typeof msg === "string" && msg.length > 0) {
-      return truncateKeepingLink(msg);
-    }
-  } catch {
-    // not JSON, fall through
-  }
-  const trimmed = body.trim();
+
+  const direct = messageFromJson(body);
+  if (direct) return truncateKeepingLink(oneLine(unwrapFrame(direct)));
+
+  // Not a JSON document. It may still be an SSE frame carrying one.
+  const unwrapped = unwrapFrame(body);
+  const trimmed = oneLine(unwrapped);
   if (!trimmed) return undefined;
   return truncateKeepingLink(trimmed);
 }
@@ -790,7 +949,29 @@ function isContentEvent(parsed: any, eventType: string): boolean {
  * a bucket, not a diagnosis; the body is the diagnosis.
  */
 function withDetail(base: string, message?: string): string {
-  return message ? `${base} — ${message}` : base;
+  return message ? `${base} — ${stripRedundantHead(message)}` : base;
+}
+
+/**
+ * Drop the `"<Provider> error (HTTP <status>): "` head claudish put on its own
+ * message, because `base` has just said both of those things.
+ *
+ * The head is composed by `composeErrorMessage` for the proxy's stderr line and
+ * for the body it returns to Claude Code, where naming the provider and the code
+ * is the whole point — nothing else on that line does. A probe row is the
+ * opposite situation: the provider is the row's own left column and the status is
+ * the first thing `base` prints, so the head repeats 30 columns of what the
+ * reader can already see, and 30 columns is what the row has left for the part
+ * that says what to DO. Measured on `--probe qwen3.8-max` at 130 columns: the
+ * summary row ended at "…accepted the credential but c", cutting the sentence
+ * exactly where it turns actionable.
+ *
+ * Anchored to the full composed shape, not to " error" or the provider name: a
+ * provider's own prose has to match `(HTTP <3 digits>): ` to be touched, and no
+ * upstream message observed does.
+ */
+function stripRedundantHead(message: string): string {
+  return message.replace(/^.{1,40}? error \(HTTP \d{3}\): /, "");
 }
 
 export function describeProbeState(result: ProbeResult): string {

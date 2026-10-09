@@ -296,12 +296,12 @@ describe("discoverProviderModels", () => {
     expect(await discoverProviderModels("kimi-coding")).toEqual([]);
   });
 
-  test("classifies a 200 response with an empty data array as empty-roster", async () => {
+  test("classifies a 200 response with an empty data array as empty-models-catalog", async () => {
     stubJsonResponse({ data: [] });
 
     expect(await discoverProviderModels("kimi-coding")).toEqual([]);
     expect(getDiscoveryFailure("kimi-coding")).toMatchObject({
-      kind: "empty-roster",
+      kind: "empty-models-catalog",
       provider: "kimi-coding",
     });
   });
@@ -344,16 +344,16 @@ describe("model discovery cache and context lookup", () => {
     ) as unknown as typeof fetch;
 
     await discoverProviderModels("kimi-coding");
-    await discoverProviderModels("qwen-cloud");
+    await discoverProviderModels("qwen-token-plan");
     expect(getDiscoveryFailure("kimi-coding")?.kind).toBe("http-error");
-    expect(getDiscoveryFailure("qwen-cloud")?.kind).toBe("http-error");
+    expect(getDiscoveryFailure("qwen-token-plan")?.kind).toBe("http-error");
 
     invalidateModelDiscovery("kimi-coding");
     expect(getDiscoveryFailure("kimi-coding")).toBeUndefined();
-    expect(getDiscoveryFailure("qwen-cloud")?.kind).toBe("http-error");
+    expect(getDiscoveryFailure("qwen-token-plan")?.kind).toBe("http-error");
 
     invalidateModelDiscovery();
-    expect(getDiscoveryFailure("qwen-cloud")).toBeUndefined();
+    expect(getDiscoveryFailure("qwen-token-plan")).toBeUndefined();
   });
 
   test("caches within the TTL and provider invalidation forces a refetch", async () => {
@@ -455,9 +455,9 @@ describe("describeDiscoveryFailure", () => {
       substrings: ["not valid JSON", "https://example.test/models"],
     },
     {
-      kind: "empty-roster",
+      kind: "empty-models-catalog",
       failure: {
-        kind: "empty-roster",
+        kind: "empty-models-catalog",
         provider: "test",
         endpoint: "https://example.test/models",
       },
@@ -488,7 +488,7 @@ describe("rankDiscoveredModels", () => {
     expect(ranked).not.toBe(models);
   });
 
-  test("ranks k3 first for the real Kimi roster", () => {
+  test("ranks k3 first for the real Kimi dynamic models catalog", () => {
     const ranked = rankDiscoveredModels([
       { id: "kimi-for-coding-highspeed", contextWindow: 262_144 },
       { id: "k3-256k", contextWindow: 262_144 },
@@ -501,7 +501,7 @@ describe("rankDiscoveredModels", () => {
 });
 
 describe("OpenAI-compatible probe discovery", () => {
-  test("uses an authenticated account roster and advances past excluded models", async () => {
+  test("uses an authenticated dynamic models catalog and advances past excluded models", async () => {
     const provider: ProviderDefinition = {
       name: "account-scoped-openai-probe-test",
       displayName: "Account Scoped Probe Test",

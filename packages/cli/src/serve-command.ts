@@ -137,7 +137,7 @@ export async function serveCommand(args: string[]): Promise<void> {
   }
 
   // Before the slot map is read, so a slot naming a bundled endpoint resolves
-  // against a roster that already contains it. `createProxyServer` registers
+  // against a provider list that already contains it. `createProxyServer` registers
   // too and this is idempotent — the call is here so the guarantee belongs to
   // `serve` rather than to an implementation detail of the proxy it happens to
   // start.

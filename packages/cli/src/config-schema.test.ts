@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
-  BuiltinDefaultProviderSchema,
   CustomEndpointComplexSchema,
   CustomEndpointSchema,
   CustomEndpointSimpleSchema,
-  DefaultProviderSchema,
 } from "./config-schema.js";
 
 function invalidCustomEndpointMessage(input: unknown): string {
@@ -199,27 +197,5 @@ describe("CustomEndpointSchema (discriminated union)", () => {
         apiKey: "sk",
       })
     ).toThrow();
-  });
-});
-
-describe("BuiltinDefaultProviderSchema", () => {
-  // Pins the documented set of built-in provider names — an enum edit
-  // (dropped/renamed/typo'd member) would ship a broken user-facing config contract.
-  test.each(["openrouter", "litellm", "openai", "anthropic", "google"])("accepts %s", (name) => {
-    expect(BuiltinDefaultProviderSchema.parse(name)).toBe(name);
-  });
-
-  test("rejects unknown builtin name", () => {
-    expect(() => BuiltinDefaultProviderSchema.parse("not-a-builtin")).toThrow();
-  });
-});
-
-describe("DefaultProviderSchema", () => {
-  test("accepts a custom endpoint name like `my-vllm`", () => {
-    expect(DefaultProviderSchema.parse("my-vllm")).toBe("my-vllm");
-  });
-
-  test("rejects empty string", () => {
-    expect(() => DefaultProviderSchema.parse("")).toThrow();
   });
 });

@@ -1,3 +1,4 @@
+import { catalogRouteMatchesProvider, providerForCatalogRoute } from "./catalog-route-bindings.js";
 /**
  * CatalogClient — single entry point for all Firebase-backed model catalog
  * questions. Replaces the three independent slug maps and per-provider
@@ -18,7 +19,7 @@ import {
   getModelsByProvider,
   searchModels as searchModelsFromFirebase,
 } from "../model-loader.js";
-import { type SlimModelEntry, readAllModelsCache } from "./all-models-cache.js";
+import { type SlimModelEntry, readAllModelsCache, reasoningStatusOf } from "./all-models-cache.js";
 import { FIREBASE_CACHE_TTL_MS } from "./cache-ttl.js";
 
 // ─── Public types ────────────────────────────────────────────────────────────
@@ -64,7 +65,7 @@ export interface CatalogClient {
    *
    * For aggregator/gateway providers (e.g. "opencode-zen", "openrouter"):
    * returns models whose `aggregators[]` lists this vendor. Reads from the
-   * slim catalog cache at ~/.claudish/all-models.json (24h TTL).
+   * slim catalog cache at ~/.claudish/cloud-models-catalog-v3.json (24h TTL).
    *
    * For LiteLLM, Ollama, LM Studio: returns []. These have no Firebase
    * catalog by design — callers handle this with a free-text input prompt.
@@ -82,6 +83,29 @@ export interface CatalogClient {
    * Cross-vendor search. Delegates to Firebase `?search=...` for live results.
    */
   searchModels(term: string, limit?: number): Promise<CatalogModel[]>;
+
+  /**
+   * Every model the slim catalog says this vendor SERVES — synchronous, local,
+   * no network, for EVERY slug rather than only the aggregator ones.
+   *
+   * WHY IT EXISTS SEPARATELY FROM `modelsByVendor`. The picker draws ONE flat
+   * cross-provider list, so it asks this question about ~31 providers at once.
+   * `modelsByVendor` answers it for an owner slug with a live `?provider=` query,
+   * and 22 of those fired together took 10 s and returned nothing (measured:
+   * every one aborted on its shared timeout, while the same query alone takes
+   * ~1.1 s). A picker cannot spend that, and it must not degrade to "this
+   * provider has no models", which is the exact complaint this feature exists to
+   * remove.
+   *
+   * IT IS NOT A SECOND AUTHORITY. Each `aggregators[]` row's route binding is
+   * already the served-by index — `modelsByVendor`'s own owner branch filters its
+   * rich lineage list THROUGH it (`filterToServedByProvider`) precisely because
+   * lineage is not service. This applies the same rule to the same question and
+   * skips the lineage query, so its membership is the served-by set exactly. The
+   * cost is per-model richness: `description` and the owner slug are absent from
+   * the slim payload, so a row's blurb is derived rather than editorial.
+   */
+  servedByVendor(vendorSlug: string): CatalogModel[];
 }
 
 // ─── Slug classification ─────────────────────────────────────────────────────
@@ -92,9 +116,11 @@ export interface CatalogClient {
  * slug is in this set we prefer `getModelsByProvider()` which returns the
  * full ModelDoc shape.
  *
- * Note: a slug can be BOTH an owner and an aggregator (e.g. "anthropic" owns
- * Claude models AND appears in some `aggregators[]` lists). The owner path
- * wins because it returns more complete data.
+ * Note: a slug can be BOTH an owner and a name bound to a route. "anthropic"
+ * owns Claude models AND names Anthropic's native API route
+ * (`anthropic/direct-api`, a lookup-only binding in `catalog-route-bindings.ts`:
+ * no claudish provider calls it). The owner path wins because it returns more
+ * complete data.
  */
 const OWNER_PROVIDER_SLUGS = new Set<string>([
   "anthropic",
@@ -110,18 +136,23 @@ const OWNER_PROVIDER_SLUGS = new Set<string>([
 ]);
 
 /**
- * Cold-start seed for the aggregator set. NOT the roster — see
+ * Cold-start seed for the aggregator set. NOT the list itself — see
  * {@link aggregatorProviderSlugs}, which derives the real one from the catalog.
  *
  * Used only when the slim cache is empty (first run, before the first fetch),
  * where an empty set would make `modelsByVendor()` return nothing for everyone.
+ *
+ * Each seed is a claudish provider name, the spelling `modelsByVendor()` is asked
+ * in and the one the derived set holds. `together`, not the catalog's `routeId`
+ * `together-ai`: no caller asks for `together-ai`, so that seed matched nothing
+ * and a cold `modelsByVendor("together")` fell through to the owner query.
  */
 const AGGREGATOR_SLUG_SEED = new Set<string>([
   "openrouter",
   "opencode-zen",
   "opencode-zen-go",
   "fireworks",
-  "together-ai",
+  "together",
 ]);
 
 /**
@@ -149,7 +180,10 @@ function aggregatorProviderSlugs(
   const slugs = new Set<string>();
   for (const entry of cache.entries) {
     for (const agg of entry.aggregators ?? []) {
-      if (agg.provider) slugs.add(agg.provider.toLowerCase());
+      if (agg.routeStatus === "mapped") {
+        const provider = providerForCatalogRoute(agg.route!);
+        if (provider) slugs.add(provider.toLowerCase());
+      }
     }
   }
   // Union with the seed: a provider claudish knows how to reach should not
@@ -162,8 +196,9 @@ function aggregatorProviderSlugs(
 /**
  * Local-only / undocumented-catalog vendors. These have no Firebase catalog
  * by design; the picker shows a free-text input instead of a model list.
+ * claudish provider names only: LM Studio is `lmstudio`.
  */
-const NO_CATALOG_VENDOR_SLUGS = new Set<string>(["litellm", "ollama", "lmstudio", "lm-studio"]);
+const NO_CATALOG_VENDOR_SLUGS = new Set<string>(["litellm", "ollama", "lmstudio"]);
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
@@ -216,7 +251,7 @@ function filterToServedByProvider(
   const kept: CatalogModel[] = [];
   for (const model of models) {
     const slim = byId.get(model.modelId.toLowerCase());
-    const served = slim?.aggregators?.some((agg) => agg.provider.toLowerCase() === slug);
+    const served = slim?.aggregators?.some((agg) => catalogRouteMatchesProvider(agg.route, slug));
     if (served) {
       kept.push({ ...model, aggregators: slim?.aggregators ?? model.aggregators });
     }
@@ -224,7 +259,7 @@ function filterToServedByProvider(
   return kept;
 }
 
-function slimEntryToCatalogModel(entry: SlimModelEntry): CatalogModel {
+export function slimEntryToCatalogModel(entry: SlimModelEntry): CatalogModel {
   return {
     modelId: entry.modelId,
     displayName: entry.modelId,
@@ -235,6 +270,29 @@ function slimEntryToCatalogModel(entry: SlimModelEntry): CatalogModel {
     contextWindow: entry.contextWindow,
     supportsVision: entry.supportsVision,
     releaseDate: entry.releaseDate,
+    // THE TWO CAPABILITY FLAGS THE SLIM CACHE ACTUALLY CARRIES, forwarded in the
+    // shape every renderer reads. They were dropped here: `supportsVision` above
+    // goes into a field only the probe path reads, and `reasoning` was not mapped
+    // at all — so every aggregator-served list (OpenRouter's 349 models, and it is
+    // the default provider) rendered its capability column entirely dead while the
+    // data sat in the cache. Visible the moment a row carries a capability column.
+    //
+    // `supportsTools` IS carried by the slim payload (~97% of models, per its own
+    // field doc) and was left unmapped here, so every aggregator-served row showed
+    // a dead tools flag while the answer sat one property away. It is forwarded
+    // ONLY when present — `undefined` stays `undefined` rather than becoming
+    // `false`, because "the catalog does not say" and "this model cannot take
+    // tools" are different claims and only the second one disqualifies a model.
+    capabilities: {
+      ...(entry.supportsVision === undefined ? {} : { vision: entry.supportsVision }),
+      // v3 `reasoning` is an OBJECT, `{ supported: false }` included — reading its
+      // mere presence as "thinks" flagged 469 of 1137 non-reasoning entries as
+      // reasoning models. Same rule as the adapters: an UNKNOWN status says nothing.
+      ...(entry.reasoning === undefined || reasoningStatusOf(entry) === "unknown"
+        ? {}
+        : { thinking: entry.reasoning.supported }),
+      ...(entry.supportsTools === undefined ? {} : { tools: entry.supportsTools }),
+    },
   };
 }
 
@@ -270,7 +328,7 @@ export interface CatalogClientDeps {
   getModelsByProvider?: typeof getModelsByProvider;
   getModelByIdFromFirebase?: typeof getModelByIdFromFirebase;
   searchModels?: typeof searchModelsFromFirebase;
-  /** Returns the parsed slim cache or null. Default reads ~/.claudish/all-models.json. */
+  /** Returns the parsed slim cache or null. Default reads ~/.claudish/cloud-models-catalog-v3.json. */
   readSlimCache?: () => ReturnType<typeof readAllModelsCache>;
 }
 
@@ -316,7 +374,7 @@ export function createCatalogClient(deps: CatalogClientDeps = {}): CatalogClient
       if (aggregatorProviderSlugs(_readSlimCache).has(slug)) {
         const { entries } = readSlimCacheWithFreshness(_readSlimCache);
         const matches = entries.filter((entry) =>
-          entry.aggregators?.some((agg) => agg.provider.toLowerCase() === slug)
+          entry.aggregators?.some((agg) => catalogRouteMatchesProvider(agg.route, slug))
         );
         return matches.map(slimEntryToCatalogModel);
       }
@@ -359,6 +417,24 @@ export function createCatalogClient(deps: CatalogClientDeps = {}): CatalogClient
     async searchModels(term: string, limit = 50): Promise<CatalogModel[]> {
       const docs = await _searchModels(term, limit);
       return docs.map(modelDocToCatalogModel);
+    },
+
+    servedByVendor(vendorSlug: string): CatalogModel[] {
+      const slug = vendorSlug.toLowerCase();
+      // Local-only vendors are absent from the catalog BY DESIGN, so an empty
+      // answer here is a fact, not a miss. Their dynamic models catalogs come from their own
+      // daemons through `modelDiscovery`.
+      if (NO_CATALOG_VENDOR_SLUGS.has(slug)) return [];
+      const { entries } = readSlimCacheWithFreshness(_readSlimCache);
+      const out: CatalogModel[] = [];
+      for (const entry of entries) {
+        // The same rule `filterToServedByProvider` applies, so the two answers
+        // cannot drift: a v3 row names who serves it by its route binding.
+        if (entry.aggregators?.some((agg) => catalogRouteMatchesProvider(agg.route, slug))) {
+          out.push(slimEntryToCatalogModel(entry));
+        }
+      }
+      return out;
     },
   };
 }

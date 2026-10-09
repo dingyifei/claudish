@@ -8,7 +8,7 @@
  * It does NOT invent arguments. It used to: `inferMissingParameters` filled a
  * missing `Glob.pattern` with `**\/*` (walks the whole tree), took `Task.prompt`
  * from "the last meaningful sentence" of the model's prose, and rewrote
- * `subagent_type` against a hardcoded roster of eight agent names that claudish
+ * `subagent_type` against a hardcoded list of eight agent names that claudish
  * cannot discover and that was already stale. A MISSING argument surfaces as a
  * visible harness error; a FABRICATED one is a confident wrong action with no
  * error anywhere. The codebase already prices that asymmetry the same way for
@@ -88,7 +88,7 @@ export function hasExtractableFunctionTag(text: string): boolean {
  *     a shape rule that was never about it.
  *  3. **Allowlist.** Reject a well-shaped name the client never advertised —
  *     this is how a hallucinated tool is caught. The allowlist is the request's
- *     own tool list, so it is exact rather than a hardcoded roster.
+ *     own tool list, so it is exact rather than a hardcoded tool list.
  */
 function keepOnlyRealTools(
   extracted: ExtractedToolCall[],
@@ -301,7 +301,7 @@ function normalizeAgainstSchema(
  * carries no types, so every value arrives as a string.
  *
  * `decodeToolName`, when supplied, turns the name the MODEL wrote back into the
- * client's own. The model was given the encoded roster, so on a renaming wire
+ * client's own. The model was given the encoded tool list, so on a renaming wire
  * every recovered call carries an encoded name that `knownToolNames` — built
  * from the client's originals — would otherwise reject in silence.
  */
@@ -468,7 +468,7 @@ export function extractToolCallsFromText(
   // Matches: "I'll use the Task tool with subagent_type=Explore"
   // Matches: "I will use the Read tool to read /path/to/file"
   // Matches: "Let me use the Bash tool to run ls -la"
-  // The caller's own tool list is exact; this roster is the fallback for callers
+  // The caller's own tool list is exact; this fixed list is the fallback for callers
   // that have none in hand. Natural-language extraction is the loosest pattern
   // here, so it keeps its own guard even though `keepOnlyRealTools` runs after.
   const knownTools =

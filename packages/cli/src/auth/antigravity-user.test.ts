@@ -61,7 +61,7 @@ describe("getServedAntigravityModels", () => {
 
     const result = await getServedAntigravityModels("placeholder-token", "placeholder-project");
 
-    // The pre-existing served-set and backend-default contract must survive metadata enrichment.
+    // The pre-existing contract for the dynamic models catalog and the backend default must survive metadata enrichment.
     expect(result.servedIds).toEqual([
       "claude-sonnet-4-6",
       "gemini-3.1-flash-image",
@@ -85,7 +85,7 @@ describe("getServedAntigravityModels", () => {
     expect("contextWindow" in result.meta["string-window"]).toBe(false);
   });
 
-  test("returns an indexable empty meta object for an empty roster", async () => {
+  test("returns an indexable empty meta object for an empty dynamic models catalog", async () => {
     globalThis.fetch = mock(async () =>
       Response.json({ models: {}, defaultAgentModelId: "unused-default" })
     ) as unknown as typeof fetch;

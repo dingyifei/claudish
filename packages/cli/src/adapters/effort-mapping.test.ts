@@ -16,7 +16,7 @@ import { existsSync, readFileSync, rmSync, rmdirSync, writeFileSync } from "node
 import { dirname } from "node:path";
 import {
   ALL_MODELS_CACHE_PATH,
-  type DiskCacheV2,
+  type DiskCacheV3,
   writeAllModelsCache,
 } from "../providers/all-models-cache.js";
 import { type AdapterResult, BaseAPIFormat, type EffortLevel } from "./base-api-format.js";
@@ -31,7 +31,7 @@ import { QwenModelDialect } from "./qwen-model-dialect.js";
 
 const SYNTHETIC_FUGU_MODEL_ID = "fugu-acme-ultra";
 
-function seedDefaultCatalog(entries: DiskCacheV2["entries"]): () => void {
+function seedDefaultCatalog(entries: DiskCacheV3["entries"]): () => void {
   const cacheDir = dirname(ALL_MODELS_CACHE_PATH);
   const cacheDirExisted = existsSync(cacheDir);
   const previousContents = existsSync(ALL_MODELS_CACHE_PATH)
@@ -40,7 +40,9 @@ function seedDefaultCatalog(entries: DiskCacheV2["entries"]): () => void {
 
   writeAllModelsCache(
     {
-      version: 2,
+      catalogGenerationId: "test-generation",
+      plans: [],
+      version: 3,
       lastUpdated: new Date().toISOString(),
       entries,
       models: [],
@@ -177,7 +179,7 @@ describe("Sakana Fugu (OpenAI-compatible path) clamps UP to high", () => {
       {
         modelId: SYNTHETIC_FUGU_MODEL_ID,
         aliases: [],
-        sources: {},
+
         reasoning: {
           supported: true,
           control: "effort",
@@ -390,6 +392,23 @@ function qwenPrep(modelId: string, req: any): any {
   return (fmt as any).prepareRequest({}, req);
 }
 
+class StubbedQwen extends QwenModelDialect {
+  constructor(
+    modelId: string,
+    private readonly stub: any
+  ) {
+    super(modelId);
+  }
+
+  protected override lookupReasoningCapability(): any {
+    return this.stub;
+  }
+}
+
+function stubbedQwenPrep(modelId: string, stub: any, originalRequest: any): any {
+  return new StubbedQwen(modelId, stub).prepareRequest({}, originalRequest);
+}
+
 describe("Qwen enable_thinking + thinking_budget", () => {
   test("none/minimal → enable_thinking false", () => {
     expect(qwenPrep("qwen3-max", { output_config: { effort: "none" } }).enable_thinking).toBe(
@@ -416,10 +435,33 @@ describe("Qwen enable_thinking + thinking_budget", () => {
     );
   });
 
+  test("a laddered optional model maps minimal to the 1024-token floor below low", () => {
+    const minimal = stubbedQwenPrep("qwen3-laddered", OPTIONAL_REASONING_LADDER, {
+      output_config: { effort: "minimal" },
+    });
+    const low = stubbedQwenPrep("qwen3-laddered", OPTIONAL_REASONING_LADDER, {
+      output_config: { effort: "low" },
+    });
+
+    expect(minimal.enable_thinking).toBe(true);
+    expect(minimal.thinking_budget).toBe(1024);
+    expect(low.thinking_budget).toBe(2048);
+    expect(minimal.thinking_budget).toBeLessThan(low.thinking_budget);
+  });
+
   test("max omits the budget (model max)", () => {
     const out = qwenPrep("qwen3-max", { output_config: { effort: "max" } });
     expect(out.enable_thinking).toBe(true);
     expect(out.thinking_budget).toBeUndefined();
+  });
+
+  test("mandatory ladder never sets enable_thinking false", () => {
+    for (const effort of ["none", "minimal"] as const) {
+      const out = stubbedQwenPrep("qwen3-mandatory", MANDATORY_REASONING_LADDER, {
+        output_config: { effort },
+      });
+      expect(out.enable_thinking).toBe(true);
+    }
   });
 });
 
@@ -482,6 +524,25 @@ const CATALOG = {
     defaultEffort: "max",
   },
   "glm-4-plus": undefined,
+};
+
+const MANDATORY_REASONING_LADDER = {
+  supported: true,
+  control: "effort",
+  mandatory: true,
+  efforts: ["max", "high", "low"],
+  defaultEffort: "max",
+};
+
+const OPTIONAL_REASONING_LADDER = {
+  ...MANDATORY_REASONING_LADDER,
+  mandatory: false,
+};
+
+const OPTIONAL_THINKING_TOGGLE = {
+  supported: true,
+  control: "toggle",
+  mandatory: false,
 };
 
 function stubbedGlmPrep(
@@ -554,7 +615,7 @@ describe("GLM catalog-driven thinking toggles newer than 4.6", () => {
 describe("GLM-5.2 catalog-driven reasoning_effort", () => {
   test.each([
     ["none", { type: "disabled" }, undefined],
-    ["minimal", { type: "disabled" }, undefined],
+    ["minimal", { type: "enabled" }, "high"], // A ladder makes minimal the floor, unlike none.
     ["low", { type: "enabled" }, "high"],
     ["medium", { type: "enabled" }, "high"],
     ["high", { type: "enabled" }, "high"],
@@ -577,6 +638,27 @@ describe("GLM-5.2 catalog-driven reasoning_effort", () => {
     });
     expect(out.thinking).toEqual({ type: "enabled" });
     expect(out.reasoning_effort).toBe("max");
+  });
+
+  test("a pinned minimal is clamped to GLM-5.2's advertised high floor", () => {
+    const format = new StubbedGLM("glm-5.2", CATALOG["glm-5.2"]);
+    format.setEffortOverride("minimal");
+
+    const out = format.prepareRequest({}, { output_config: { effort: "max" } });
+
+    expect(out.thinking).toEqual({ type: "enabled" });
+    expect(out.reasoning_effort).toBe("high");
+    expect(out.reasoning_effort).not.toBe("minimal");
+  });
+
+  test("a pinned depth level remains a verbatim escape hatch", () => {
+    const format = new StubbedGLM("glm-5.2", CATALOG["glm-5.2"]);
+    format.setEffortOverride("xhigh");
+
+    const out = format.prepareRequest({}, { output_config: { effort: "minimal" } });
+
+    expect(out.thinking).toEqual({ type: "enabled" });
+    expect(out.reasoning_effort).toBe("xhigh");
   });
 
   test("glm-5.2-fast has the same effort mapping as glm-5.2", () => {
@@ -603,6 +685,83 @@ describe("GLM-5.2 catalog-driven reasoning_effort", () => {
     );
     expect(out.thinking).toEqual({ type: "disabled" });
     expect(out.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("shared reasoning-off rule on the GLM wire", () => {
+  test("mandatory ladder maps none and minimal to enabled low", () => {
+    for (const effort of ["none", "minimal"] as const) {
+      const out = stubbedGlmPrep("glm-5.3", MANDATORY_REASONING_LADDER, {
+        output_config: { effort },
+      });
+      expect(out.thinking).toEqual({ type: "enabled" });
+      expect(out.reasoning_effort).toBe("low");
+    }
+  });
+
+  test("optional ladder keeps none off but maps minimal to its lowest rung", () => {
+    const none = stubbedGlmPrep("glm-optional-ladder", OPTIONAL_REASONING_LADDER, {
+      output_config: { effort: "none" },
+    });
+    const minimal = stubbedGlmPrep("glm-optional-ladder", OPTIONAL_REASONING_LADDER, {
+      output_config: { effort: "minimal" },
+    });
+
+    expect(none.thinking).toEqual({ type: "disabled" });
+    expect(none.reasoning_effort).toBeUndefined();
+    expect(minimal.thinking).toEqual({ type: "enabled" });
+    expect(minimal.reasoning_effort).toBe("low");
+    expect(minimal.thinking).not.toEqual(none.thinking);
+  });
+
+  test("toggle-only keeps none and minimal off", () => {
+    const none = stubbedGlmPrep("glm-4.7", OPTIONAL_THINKING_TOGGLE, {
+      output_config: { effort: "none" },
+    });
+    const minimal = stubbedGlmPrep("glm-4.7", OPTIONAL_THINKING_TOGGLE, {
+      output_config: { effort: "minimal" },
+    });
+    const ladderMinimal = stubbedGlmPrep("glm-optional-ladder", OPTIONAL_REASONING_LADDER, {
+      output_config: { effort: "minimal" },
+    });
+
+    expect(none.thinking).toEqual({ type: "disabled" });
+    expect(minimal.thinking).toEqual({ type: "disabled" });
+    // The matching toggle results are deliberate, not a collapse of minimal into none.
+    expect(minimal.thinking).not.toEqual(ladderMinimal.thinking);
+  });
+
+  test("an Anthropic toggle whose lowest advertised rung is none turns minimal off", () => {
+    const out = stubbedGlmPrep(
+      "sakana-namazu",
+      {
+        supported: true,
+        control: "toggle",
+        mandatory: false,
+        efforts: ["high", "none"],
+      },
+      { output_config: { effort: "minimal" } },
+      {},
+      "anthropic-sse"
+    );
+
+    expect(out.thinking).toEqual({ type: "disabled" });
+  });
+
+  test("an Anthropic mandatory ladder never emits the off switch for none or minimal", () => {
+    for (const effort of ["none", "minimal"] as const) {
+      const out = stubbedGlmPrep(
+        "glm-5.3",
+        MANDATORY_REASONING_LADDER,
+        { output_config: { effort } },
+        {},
+        "anthropic-sse"
+      );
+
+      expect(out.thinking).toEqual({ type: "enabled" });
+      expect(out.thinking).not.toEqual({ type: "disabled" });
+      expect(out.output_config?.effort).toBe("low");
+    }
   });
 });
 
@@ -691,6 +850,23 @@ function dsPrep(modelId: string, req: any): any {
   return (fmt as any).prepareRequest({}, req);
 }
 
+class StubbedDeepSeek extends DeepSeekModelDialect {
+  constructor(
+    modelId: string,
+    private readonly stub: any
+  ) {
+    super(modelId);
+  }
+
+  protected override lookupReasoningCapability(): any {
+    return this.stub;
+  }
+}
+
+function stubbedDsPrep(modelId: string, stub: any, originalRequest: any): any {
+  return new StubbedDeepSeek(modelId, stub).prepareRequest({}, originalRequest);
+}
+
 describe("DeepSeek V4 reasoning_effort + thinking", () => {
   // Seed the catalog because the dialect consults it before its name rule.
   let cleanupCatalog: (() => void) | undefined;
@@ -700,7 +876,6 @@ describe("DeepSeek V4 reasoning_effort + thinking", () => {
       {
         modelId: SYNTHETIC_FUGU_MODEL_ID,
         aliases: [],
-        sources: {},
       },
     ]);
   });
@@ -764,7 +939,7 @@ describe("DeepSeek V4 reasoning_effort + thinking", () => {
       {
         modelId: "deepseek-chat",
         aliases: [],
-        sources: {},
+
         reasoning: { supported: false, control: "none" },
       },
     ]);
@@ -776,6 +951,16 @@ describe("DeepSeek V4 reasoning_effort + thinking", () => {
       expect(dsPrep("deepseek-chat", { thinking: { budget_tokens: 5 } }).thinking).toBeUndefined();
     } finally {
       cleanupOpinionCatalog();
+    }
+  });
+
+  test("mandatory ladder never sends thinking disabled", () => {
+    for (const effort of ["none", "minimal"] as const) {
+      const out = stubbedDsPrep("deepseek-v4-mandatory", MANDATORY_REASONING_LADDER, {
+        output_config: { effort },
+      });
+      expect(out.thinking).not.toEqual({ type: "disabled" });
+      expect(out.reasoning_effort).toBe("low");
     }
   });
 });

@@ -3,52 +3,58 @@
  *
  * New syntax: provider@model[:concurrency]
  * Examples:
- *   openrouter@google/gemini-3-pro-preview  - Explicit OpenRouter
- *   google@gemini-3-pro-preview             - Direct Google API
- *   g@gemini-3-pro-preview                  - Direct Google API (shortcut)
- *   ollama@llama3.2:3                       - Ollama with concurrency 3
- *   ollama@llama3.2:0                       - Ollama with no limits
- *   openai/gpt-5.3                          - Legacy syntax (auto-detected)
+ *   openrouter@<vendor>/<model>  - Explicit OpenRouter
+ *   google@<model>               - Direct Google API
+ *   g@<model>                    - Direct Google API (shortcut)
+ *   ollama@<model>:3             - Ollama with concurrency 3
+ *   ollama@<model>:0             - Ollama with no limits
+ *   oc/<model>                   - Legacy prefix syntax (explicit, deprecated)
  *
- * Provider shortcuts (case-insensitive):
- *   g, gemini     -> google (direct Gemini API)
- *   oai           -> openai (direct OpenAI API)
- *   or            -> openrouter
- *   mm, mmax      -> minimax
- *   kimi, moon    -> kimi/moonshot
- *   glm, zhipu    -> glm/zhipu
- *   z-ai, zai     -> z-ai (z.ai)
- *   x-ai, grok    -> x-ai (xAI / Grok)
- *   oc            -> ollamacloud
- *   zen           -> opencode-zen
- *   v, vertex     -> vertex
- *   ag, antigravity -> antigravity (shared OAuth token)
- *   go            -> antigravity (DEPRECATED alias — prints a notice)
+ * Provider shortcuts (case-insensitive) are each definition's `shortcuts` in
+ * BUILTIN_PROVIDERS ({@link PROVIDER_SHORTCUTS}); `claudish --help` lists them.
  *
- * Local provider shortcuts:
- *   ollama        -> ollama (local)
- *   lms, lmstudio -> lmstudio (local)
- *   vllm          -> vllm (local)
- *   mlx           -> mlx (local)
- *
- * Native model detection (when no provider prefix):
- *   google/*, gemini-*     -> google (direct)
- *   openai/*, gpt-*, o1-*  -> openai (direct)
- *   minimax/*              -> minimax (direct)
- *   moonshot/*, kimi-*     -> kimi (direct)
- *   zhipu/*, glm-*         -> glm (direct)
- *   deepseek/*, deepseek-*  -> auto-routed (no direct API, falls to OpenRouter)
- *   x-ai/*, grok-*         -> x-ai (direct with XAI_API_KEY, else OpenRouter)
- *   qwen/*,  qwen*         -> auto-routed (no direct API, falls to OpenRouter)
- *   anthropic/*            -> native-anthropic
- *   (anything else with /) -> openrouter
+ * A name with no provider is not ROUTED here. The parser's answer only decides
+ * whether it reaches `route()`, which calculates the chain from the user's rules
+ * and the cloud models catalog; `proxyRouteDecision` (native-route.ts) is that
+ * gate. What each form parses to:
+ *   URL, `provider@model`, legacy prefix -> that provider, explicit: no chain
+ *   a `nativeModelPatterns` match        -> that provider, a known `vendor/`
+ *                                           stripped (`openai/<id>` → `<id>`);
+ *                                           not explicit, so still routed
+ *   `anthropic/<id>`                     -> native-anthropic; the proxy sends the
+ *                                           id to OpenRouter verbatim
+ *   `poe:<id>`                           -> poe; the proxy's Poe step serves it
+ *   an unknown `vendor/`                 -> `unknown`; routed
+ *   Claude Code's own names (`opus`, `claude-*`), `""`, `@model`
+ *                                        -> native-anthropic: Claude Code's own
+ *                                           auth, never routed
+ *   anything else (`o4-mini`)            -> {@link AUTO_ROUTE_PROVIDER}; routed
  */
+
+/**
+ * The parser's answer for a bare name it cannot attribute to anyone: no `/`, no
+ * native pattern matched, and not a name Claude Code owns (`o4-mini`,
+ * `no-such-model-xyz`). It is NOT a claudish provider, and nothing may look it up
+ * as one: `route()` decides which provider serves the name, from the user's rules
+ * and the cloud models catalog.
+ *
+ * Why not `"unknown"`: that value already means "a `vendor/` with no known vendor"
+ * (`foo/bar`) to `getMissingKeyError` and the advisor label, and it keeps that
+ * meaning. `auto-route` is the code's existing word for "routing chooses" (the
+ * stats invocation mode), and no provider or provider shortcut carries the name.
+ */
+export const AUTO_ROUTE_PROVIDER = "auto-route";
 
 /**
  * Parsed model specification
  */
 export interface ParsedModel {
-  /** Normalized provider name (lowercase) */
+  /**
+   * Normalized provider name (lowercase). For a name with no explicit provider
+   * this may also be one of the parser's own values, none of them a provider:
+   * `custom-url`, `unknown` (a `vendor/` with no known vendor), or
+   * {@link AUTO_ROUTE_PROVIDER} (a bare name `route()` decides).
+   */
   provider: string;
   /** Model name/ID (without provider prefix) */
   model: string;
@@ -66,6 +72,7 @@ export interface ParsedModel {
  * Provider shortcut mappings — derived from BUILTIN_PROVIDERS.
  * Re-exported for backward compatibility.
  */
+import { isClaudeCodeModelName } from "./claude-code-aliases.js";
 import {
   getLegacyPrefixPatterns as _getLegacyPrefixPatterns,
   getNativeModelPatterns as _getNativeModelPatterns,
@@ -256,14 +263,31 @@ export function parseModelSpec(modelSpec: string): ParsedModel {
     };
   }
 
-  // No "/" - treat as native Anthropic model
+  // No "/" and no pattern matched. Claude Code's own names (`opus`, `opusplan`,
+  // `sonnet[1m]`, `best`) are served on its own auth by the native passthrough.
+  // `""` and `@model` are not model names at all: they keep the native answer
+  // they always had, and the harness rejects them. Every other bare name
+  // (`o4-mini`, a typo) is routed: the native passthrough serves none of them,
+  // so sending one there only ever earned an Anthropic 404.
   return {
-    provider: "native-anthropic",
+    provider: lastResortProvider(modelSpec),
     model: modelSpec,
     original,
     isLegacySyntax: false,
     isExplicitProvider: false,
   };
+}
+
+/**
+ * The provider for a bare name no `/` and no pattern claimed: native-anthropic
+ * for Claude Code's names and for `""` / `@model`, else {@link AUTO_ROUTE_PROVIDER}.
+ * Trimmed, as `isClaudeCodeModelName` is, so a whitespace-only value counts as
+ * empty.
+ */
+function lastResortProvider(modelSpec: string): string {
+  const name = modelSpec.trim();
+  const isNative = name === "" || name.startsWith("@") || isClaudeCodeModelName(name);
+  return isNative ? "native-anthropic" : AUTO_ROUTE_PROVIDER;
 }
 
 /**

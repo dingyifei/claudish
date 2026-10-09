@@ -8,7 +8,9 @@
  *
  * Network-light and fail-soft: every fetch is wrapped in a short timeout and
  * any error resolves to an empty list, so a missing/unreachable daemon never
- * throws — callers fall back to free-text entry.
+ * throws — callers fall back to free-text entry. The one caller that needs to
+ * TELL the user the daemon is down rather than absorb it passes
+ * `throwOnError: true`; see that option.
  */
 
 export interface OllamaModel {
@@ -34,37 +36,57 @@ export function ollamaBaseUrl(): string {
 
 interface FetchOllamaOptions {
   /**
-   * When true (default), enrich each model with capabilities via `/api/show`
-   * (adds the tools indicator but one extra request per model). Pass false to
-   * skip enrichment for a snappier interactive picker — embedding models are
-   * still filtered out by name in that case.
+   * When true (default), fall back to `POST /api/show` for any model whose
+   * `/api/tags` row carried no `capabilities` array — one extra request per
+   * such model. Pass false to skip that and accept the silence.
+   *
+   * Ollama publishes `capabilities` inline in `/api/tags` (verified against a
+   * live daemon, 2026-09-23: every one of 20 installed models carried it), so
+   * on a current daemon this fallback never fires and the fan-out costs
+   * nothing. It stays for older daemons, which omit the field.
    */
   enrichCapabilities?: boolean;
+  /**
+   * Re-throw a daemon failure instead of absorbing it into `[]`.
+   *
+   * Default `false`, so every existing caller is byte-identical. Opt in only
+   * when you can report the difference: "the daemon is not running" and "the
+   * daemon is running and nothing is pulled" are the same `[]` otherwise, and
+   * model discovery used to record both as `empty-models-catalog` — telling the user
+   * their local provider serves no models when in fact nothing answered.
+   */
+  throwOnError?: boolean;
 }
 
 /**
  * Fetch installed Ollama models. Returns `[]` when the daemon is unreachable,
- * returns an error, or has no models — never throws. Embedding models are
- * filtered out (they can't be used for chat/completion).
+ * returns an error, or has no models — never throws unless `throwOnError` is
+ * set. Embedding models are filtered out (they can't be used for
+ * chat/completion).
  */
 export async function fetchOllamaModels(options: FetchOllamaOptions = {}): Promise<OllamaModel[]> {
-  const { enrichCapabilities = true } = options;
+  const { enrichCapabilities = true, throwOnError = false } = options;
   const host = ollamaBaseUrl();
 
   try {
     const response = await fetch(`${host}/api/tags`, {
       signal: AbortSignal.timeout(3000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      if (throwOnError) throw new Error(`HTTP ${response.status} from ${host}/api/tags`);
+      return [];
+    }
 
     const data = (await response.json()) as { models?: Array<Record<string, any>> };
     const models = data.models || [];
 
     const enriched = await Promise.all(
       models.map(async (m) => {
-        let capabilities: string[] = [];
+        // `/api/tags` publishes `capabilities` inline on a current daemon, so
+        // ask the list before spending a request per model on `/api/show`.
+        let capabilities: string[] = Array.isArray(m.capabilities) ? m.capabilities : [];
 
-        if (enrichCapabilities) {
+        if (enrichCapabilities && capabilities.length === 0) {
           try {
             const showResponse = await fetch(`${host}/api/show`, {
               method: "POST",
@@ -77,13 +99,19 @@ export async function fetchOllamaModels(options: FetchOllamaOptions = {}): Promi
               capabilities = showData.capabilities || [];
             }
           } catch {
-            // Ignore capability-fetch errors — fall back to name heuristics.
+            // Ignore capability-fetch errors — the model stays undescribed, and
+            // that is reported rather than guessed at from its name.
           }
         }
 
-        const nameLower = String(m.name).toLowerCase();
         const supportsTools = capabilities.includes("tools");
-        const isEmbeddingModel = capabilities.includes("embedding") || nameLower.includes("embed");
+        // Ollama'"'"'s own word, and only Ollama'"'"'s word. This used to read
+        // `|| nameLower.includes("embed")`, which is the same class of guess as
+        // the deleted NON_CHAT_PATTERNS: it hides any model whose name happens to
+        // contain "embed" and misses every embedding model that does not say so.
+        // A daemon that reports nothing leaves `capabilities` empty, which reads
+        // as "not stated" everywhere downstream.
+        const isEmbeddingModel = capabilities.includes("embedding");
         const sizeInfo = m.details?.parameter_size || "unknown size";
         const toolsIndicator = supportsTools ? "✓ tools" : "✗ no tools";
 
@@ -104,8 +132,9 @@ export async function fetchOllamaModels(options: FetchOllamaOptions = {}): Promi
     );
 
     return enriched.filter((m) => !m.isEmbeddingModel);
-  } catch {
+  } catch (err) {
     // Ollama not running or not reachable.
+    if (throwOnError) throw err;
     return [];
   }
 }

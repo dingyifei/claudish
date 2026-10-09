@@ -38,7 +38,7 @@
  * ── Why registration itself is what gets gated ──────────────────────────────
  *
  * There is no "registered but hidden" state: `buildProviderDefinition` sets
- * `shortcuts: [name]`, and both the picker roster (`isPickableProvider`) and
+ * `shortcuts: [name]`, and both the picker's provider list (`isPickableProvider`) and
  * the `@prefix` alias table are DERIVED from that. The picker's own list is
  * credential-filtered, but `getProviderFilterAliases()` is not — so registering
  * every bundled vendor unconditionally would pollute the `@prefix` namespace
