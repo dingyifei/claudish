@@ -2325,19 +2325,15 @@ async function callAdvisorModel(
  * alias needs resolving; an id is passed through as the user wrote it, because
  * the API may serve a model newer than the catalog.
  */
-function anthropicTierAlias(model: string): "opus" | "sonnet" | "haiku" | null {
+function anthropicTierAlias(model: string): "fable" | "opus" | "sonnet" | "haiku" | null {
   const m = model.toLowerCase();
-  return m === "opus" || m === "sonnet" || m === "haiku" ? m : null;
+  return m === "fable" || m === "opus" || m === "sonnet" || m === "haiku" ? m : null;
 }
 
 function isAnthropicModel(parsed: ReturnType<typeof parseModelSpec>): boolean {
   const m = parsed.model.toLowerCase();
   return (
-    parsed.provider === "anthropic" ||
-    m.startsWith("claude-") ||
-    m === "haiku" ||
-    m === "sonnet" ||
-    m === "opus"
+    parsed.provider === "anthropic" || m.startsWith("claude-") || anthropicTierAlias(m) !== null
   );
 }
 

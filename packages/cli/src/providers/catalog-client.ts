@@ -93,7 +93,9 @@ export function latestOpusModelId(): string | null {
   return latestAnthropicTierModelId("opus");
 }
 
-export function latestAnthropicTierModelId(tier: "opus" | "sonnet" | "haiku"): string | null {
+export function latestAnthropicTierModelId(
+  tier: "fable" | "opus" | "sonnet" | "haiku"
+): string | null {
   const entries = getCatalogEntries();
   if (!entries) return null;
   const family = new RegExp(`^claude-${tier}-`, "i");

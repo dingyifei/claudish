@@ -92,6 +92,13 @@ describe("advisorRouteFor", () => {
     expect(openrouter.credential).toBe("openrouter");
     expect(new Set([openai.credential, google.credential, openrouter.credential]).size).toBe(3);
   });
+
+  it("treats the fable alias as a Claude model, not an OpenRouter name", () => {
+    const fable = advisorRouteFor("fable", "collector");
+    expect(fable.kind).toBe("anthropic");
+    // Empty catalog: the alias is never POSTed verbatim.
+    expect(fable.unresolvedAlias).toBe("fable");
+  });
 });
 
 describe("session-keyed pending advisor state", () => {
