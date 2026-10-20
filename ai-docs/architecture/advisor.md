@@ -315,6 +315,29 @@ notice says so on every launch:
 Subscription-aware panel routing is parked in `ROADMAP.md`: it rewrites the retrieval path, and
 the origin records above were built around one bare `fetch` per model.
 
+### `--advisor-auth subscription`: Claude panel models on the Claude login
+
+One narrow exception, opt-in only (`--advisor-auth subscription` or
+`CLAUDISH_ADVISOR_AUTH=subscription`; resolved in `advisor-auth.ts`). A Claude panel model
+(`claude-*`, `fable`/`opus`/`sonnet`/`haiku`, `anthropic@`) then routes to the Anthropic
+Messages API with `AdvisorRoute.subscription` set, and `buildSubscriptionAdvisorRequest` REPLAYS
+the inbound Claude Code request, the way the classifier passthrough replays the classifier:
+
+- kept verbatim: `system`, `tools`, `metadata`, and the `authorization`, `anthropic-version` and
+  `anthropic-beta` headers (minus the advisor beta), the same set `NativeHandler` forwards;
+- changed: `model`, the panel messages (`prepareAdvisorPanelMessages`), `max_tokens`,
+  `stream: false`, `tool_choice: none` (the Messages API rejects tool history without `tools`);
+- dropped: `thinking` and every other field. Nothing Claude Code did not send is added.
+
+The decorator passes the inbound headers as an `AdvisorSubscriptionReplay`, never through
+`AdvisorApiKeys`, so other panel routes and the collector cannot receive the bearer. A request
+without a usable bearer (none, or claudish's placeholder) is refused before sending. The
+collector keeps its metered route. The main tiers can run on any provider: `claude-runner`
+keeps the child's login (`shouldPreserveNativeAuth`, gated on `hasClaudeCodeLogin`) and hides an
+incidental `ANTHROPIC_API_KEY`, which would make Claude Code send `x-api-key` instead of a
+bearer. Startup refuses the launch without a login, and the notice warns on every launch that
+Anthropic's consumer terms may not permit claudish-built requests on a subscription login.
+
 Keys resolve through the credential authority (env, config, keychain, 1Password), and only for the
 routes the configuration uses, so an unused provider never triggers a 1Password handshake. The
 Anthropic collector never receives the inbound `authorization` header (Claude Code's OAuth bearer)

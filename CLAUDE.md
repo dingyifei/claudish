@@ -16,7 +16,7 @@ lives in `ROADMAP.md`.
   watchdog), why tier 2 answers 503 and never 429, why the banner is magmux's `overlay` and never a
   pane of ours (closing a pane wedged Claude Code), the five auth sites
 - `behavior-layer.md` — Layer 4, the harness-conformance supervisor
-- `advisor.md` — `--advisor` for any main model: independent of `--monitor`, decorator on the routed handler, ids by tool name, retained session state, stub paths S1-S10, Claude Code's gates, metered panel billing; read before editing advisor, decorator, monitor-launch or native-auth code
+- `advisor.md` — `--advisor` for any main model: independent of `--monitor`, decorator on the routed handler, ids by tool name, retained session state, stub paths S1-S10, Claude Code's gates, metered panel billing and the `--advisor-auth subscription` replay; read before editing advisor, decorator, monitor-launch or native-auth code
 - `providers/devin.md`, `providers/grok-subscription.md`, `providers/antigravity.md`, `providers/qwen-alibaba.md` — one per reverse-engineered provider
 - `providers/meta-muse-code.md`: `muse@` on a Muse Code subscription and its metered sibling `meta@`: the mint
   as entitlement evidence (per process, on 401, 30-min TTL), the Muse Keychain item read only by an

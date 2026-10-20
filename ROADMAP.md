@@ -411,6 +411,10 @@ vocabulary Claude Code emits, and the clamp table is what maps it onto each prov
 
 Status: not started. Deliberately out of scope for the any-model advisor work.
 
+Partly addressed for Claude only: `--advisor-auth subscription` replays the inbound Claude Code
+request for a Claude panel model on the user's Claude login (`ai-docs/architecture/advisor.md`,
+"`--advisor-auth subscription`"). Every other provider is still metered.
+
 Every `--advisor` panel model and collector is called through `advisorRouteFor`
 (`handlers/native-handler-advisor.ts`) with a raw metered API key: api.openai.com with
 `OPENAI_API_KEY`, the direct Gemini API with `GEMINI_API_KEY`, api.anthropic.com with
