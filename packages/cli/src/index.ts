@@ -15,6 +15,7 @@ config({ quiet: true }); // Loads .env from current working directory
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { resolveAdvisorAuth } from "./advisor-auth.js";
 import { resolveExplicitFlagAuth } from "./auth/credentials/op-source.js";
 import { resolveClassifierConfig } from "./classifier-passthrough.js";
 import {
@@ -1223,6 +1224,7 @@ async function runCli() {
           isInteractive: cliConfig.interactive,
           advisorModels: cliConfig.advisorModels,
           advisorCollector: cliConfig.advisorCollector,
+          advisorAuth: resolveAdvisorAuth(cliConfig, process.env).mode,
           // Present only when `--model` was a pinned chain; `explicitModel` above
           // is its first element, so the proxy can match the two.
           modelChain: cliConfig.monitor ? undefined : cliConfig.modelChain,

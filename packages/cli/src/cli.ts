@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EFFORT_LEVELS, isEffortLevel } from "./adapters/base-api-format.js";
+import { parseAdvisorAuth } from "./advisor-auth.js";
 import { setCredentialPromptRole } from "./auth/credentials/prompt-role.js";
 import { ENV } from "./config.js";
 import { setStderrQuiet } from "./logger.js";
@@ -248,6 +249,7 @@ export const CLAUDISH_FLAG_ARITY: Readonly<Record<string, ClaudishFlagArity>> = 
   "--json": "none",
   "--monitor": "none",
   "--advisor": "value",
+  "--advisor-auth": "value",
   "--stdin": "none",
   "--free": "none",
   "--models-refresh": "none",
@@ -673,6 +675,16 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       // independent flag now; the launch bits a no-model advisor session still
       // needs from monitor are handled by isAdvisorNativeSession().
       config.advisor = true;
+    } else if (arg === "--advisor-auth") {
+      // How a Claude panel model is signed. `subscription` is an explicit opt-in
+      // to replay Claude Code's own request with its OAuth login (advisor-auth.ts).
+      const authArg = args[++i];
+      const mode = parseAdvisorAuth(authArg);
+      if (!mode) {
+        console.error("--advisor-auth requires 'api-key' or 'subscription'");
+        process.exit(1);
+      }
+      config.advisorAuth = mode;
     } else if (arg === "--stdin") {
       config.stdin = true;
     } else if (arg === "--free") {
@@ -2263,6 +2275,7 @@ ${h("OPTIONS")}
   ${green("--free")}                   Show only FREE models in the interactive selector
   ${green("--monitor")}                Monitor mode - proxy to REAL Anthropic API and log traffic
   ${green("--advisor")} ${yellow('"m1,m2[:collector]"')}  Multi-model advisor replacement (works with any --model)
+  ${green("--advisor-auth")} ${yellow("<mode>")}  api-key (default) | subscription: Claude panel models replay the request on your Claude login
   ${green("--model-params")} ${yellow('"k=v,..."')}  Extra request params merged into the payload (e.g. reasoning.mode=pro)
   ${green("--effort-override")} ${yellow("<level>")}  Pin reasoning effort verbatim, skipping the per-model clamp
   ${green("--pro-on-ultracode")}       Apply the model's catalog preset while in ultracode (opt-in)

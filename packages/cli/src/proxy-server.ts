@@ -5,6 +5,7 @@ import { cors } from "hono/cors";
 import { isEffortLevel } from "./adapters/base-api-format.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
+import type { AdvisorAuthMode } from "./advisor-auth.js";
 import { credentials } from "./auth/credentials/authority.js";
 import { loadHookRules } from "./behavior/hooks.js";
 import { parseBehaviorConfig, registerHookRules } from "./behavior/index.js";
@@ -114,6 +115,8 @@ export interface ProxyServerOptions {
   isInteractive?: boolean; // Whether the current session is interactive (gates consent prompt)
   advisorModels?: string[]; // Advisor models from --advisor flag
   advisorCollector?: string | null; // Collector model (null = no synthesis)
+  /** `--advisor-auth` / CLAUDISH_ADVISOR_AUTH, resolved (advisor-auth.ts). */
+  advisorAuth?: AdvisorAuthMode;
   /**
    * Exact slot-id → real-model map for `claudish serve` (Claude Desktop
    * redirect). Consulted BEFORE the substring tier `modelMap` in
@@ -302,7 +305,7 @@ export async function createProxyServer(
   const withAdvisor = (handler: ModelHandler, presence?: AdvisorPresenceMonitor): ModelHandler =>
     withAdvisorSwap(
       handler,
-      loadAdvisorSwapConfig(options.advisorModels, options.advisorCollector),
+      loadAdvisorSwapConfig(options.advisorModels, options.advisorCollector, options.advisorAuth),
       {
         presence,
       }

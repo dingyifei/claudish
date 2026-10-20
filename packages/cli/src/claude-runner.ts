@@ -15,6 +15,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { isatty } from "node:tty";
 import { lookupModelForProvider } from "./adapters/model-catalog.js";
+import { advisorSubscriptionEnabled } from "./advisor-auth.js";
 import { classifierPassthroughEnabled } from "./classifier-passthrough.js";
 import { ENV } from "./config.js";
 import {
@@ -167,7 +168,10 @@ export function shouldHideIncidentalAnthropicKey(
   config: ClaudishConfig,
   env: NodeJS.ProcessEnv = process.env
 ): boolean {
-  if (!hasNativeAnthropicMapping(config)) return false;
+  // `--advisor-auth subscription` asked for the claude.ai login by name: a real
+  // ANTHROPIC_API_KEY would make Claude Code send `x-api-key` instead, and the
+  // advisor replay would have no bearer to sign with.
+  if (!hasNativeAnthropicMapping(config) && !advisorSubscriptionEnabled(config, env)) return false;
   if (!env.ANTHROPIC_API_KEY) return false;
   return !wantsAnthropicApiBilling(config, env);
 }
@@ -248,16 +252,31 @@ export function hasResolvableAnthropicAuth(
   } = {}
 ): boolean {
   const env = deps.env ?? process.env;
-  const fileExists = deps.fileExists ?? existsSync;
-  const keychainProbe = deps.keychainProbe ?? defaultKeychainAnthropicProbe;
   // claudish's own placeholders leak from a parent proxied session into every
   // process it starts. They authenticate nothing, so they do not count.
-  if (
-    isRealAnthropicEnvCredential(env, "ANTHROPIC_API_KEY") ||
-    isRealAnthropicEnvCredential(env, "ANTHROPIC_AUTH_TOKEN")
-  ) {
-    return true;
-  }
+  if (isRealAnthropicEnvCredential(env, "ANTHROPIC_API_KEY")) return true;
+  return hasClaudeCodeLogin(deps);
+}
+
+/**
+ * Does Claude Code have a BEARER login to send — a real ANTHROPIC_AUTH_TOKEN,
+ * its OAuth credentials file, or (macOS) its Keychain item? Narrower than
+ * `hasResolvableAnthropicAuth`: an ANTHROPIC_API_KEY alone does not count,
+ * because Claude Code would send it as `x-api-key`, not `authorization`.
+ * `--advisor-auth subscription` needs exactly this. Existence-only; no secret
+ * is read.
+ */
+export function hasClaudeCodeLogin(
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    fileExists?: (path: string) => boolean;
+    keychainProbe?: KeychainCredentialProbe;
+  } = {}
+): boolean {
+  const env = deps.env ?? process.env;
+  const fileExists = deps.fileExists ?? existsSync;
+  const keychainProbe = deps.keychainProbe ?? defaultKeychainAnthropicProbe;
+  if (isRealAnthropicEnvCredential(env, "ANTHROPIC_AUTH_TOKEN")) return true;
   if (fileExists(join(homedir(), ".claude", ".credentials.json"))) return true;
   return keychainProbe();
 }
@@ -272,11 +291,17 @@ export function hasResolvableAnthropicAuth(
  * resolvable — the latter guard prevents a pure-Codex user who enables the flag
  * without any Anthropic creds from being stranded at the login gate (we keep the
  * placeholder and warn instead; see runClaudeWithProxy).
+ *
+ * Also true for `--advisor-auth subscription` with a Claude Code login, for the
+ * same reason as the classifier: the advisor replay forwards the inbound OAuth
+ * bearer, so the child must keep it. Without a login, startup refuses the
+ * launch (advisor-startup.ts), so the placeholder path is never reached for it.
  */
 function shouldPreserveNativeAuth(config: ClaudishConfig): boolean {
   return (
     hasNativeAnthropicMapping(config) ||
-    (classifierPassthroughEnabled(config) && hasResolvableAnthropicAuth())
+    (classifierPassthroughEnabled(config) && hasResolvableAnthropicAuth()) ||
+    (advisorSubscriptionEnabled(config) && hasClaudeCodeLogin())
   );
 }
 

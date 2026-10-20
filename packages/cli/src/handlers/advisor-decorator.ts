@@ -50,6 +50,7 @@ import { log, logStderr } from "../logger.js";
 import {
   type AdvisorApiKeys,
   type AdvisorRouteKind,
+  type AdvisorSubscriptionReplay,
   type AdvisorSwapConfig,
   type AdvisorToolResult,
   NO_SESSION_BUCKET,
@@ -134,6 +135,26 @@ export async function resolveAdvisorKeys(
     needed.has("anthropic") ? anthropicKey() : undefined,
   ]);
   return { openrouter, google, openai, anthropic };
+}
+
+/**
+ * `--advisor-auth subscription`: the inbound request a Claude panel model
+ * replays (see `buildSubscriptionAdvisorRequest`). The `authorization` header
+ * is Claude Code's OAuth bearer; it goes ONLY into that replay, never into
+ * `AdvisorApiKeys`, so no other route or the collector can receive it.
+ */
+function subscriptionReplay(
+  c: Context,
+  payload: Record<string, unknown>
+): AdvisorSubscriptionReplay {
+  return {
+    headers: {
+      authorization: c.req.header("authorization"),
+      "anthropic-version": c.req.header("anthropic-version"),
+      "anthropic-beta": c.req.header("anthropic-beta"),
+    },
+    request: payload,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +335,7 @@ async function applyAdvisorRequestSide(
     // Bound once: TypeScript drops the narrowing of `cfg.models` inside the
     // async closure below, and `as string[]` there would hide a real change.
     const models = cfg.models;
+    const subscription = cfg.auth === "subscription";
     // Pass 1 restores advice already delivered on earlier turns, so the panel
     // below reads the conversation the model actually saw.
     rewriteAdvisorToolResults(payload, cachedResult, sessionId);
@@ -335,7 +357,7 @@ async function applyAdvisorRequestSide(
         // resolution is inside, so a retry cannot race past it either.
         const runPanel = async (): Promise<AdvisorToolResult> => {
           apiKeys ??= await resolveKeys(
-            advisorCredentialsFor(models, cfg.collector),
+            advisorCredentialsFor(models, cfg.collector, { subscription }),
             c.req.header("x-api-key")
           );
           const outcome = await runAdvisorCall({
@@ -346,6 +368,7 @@ async function applyAdvisorRequestSide(
             collector: cfg.collector ?? null,
             apiKeys,
             cfg,
+            ...(subscription ? { subscription: subscriptionReplay(c, payload) } : {}),
           });
           // The false return is honoured, never dropped: an answer claudish
           // cannot attach to the call is an answer the model will not receive,

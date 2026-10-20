@@ -35,6 +35,7 @@ import { catalogRouteMatchesProvider } from "../providers/catalog-route-bindings
  */
 
 import { appendFileSync } from "node:fs";
+import type { AdvisorAuthMode } from "../advisor-auth.js";
 import { credentials } from "../auth/credentials/authority.js";
 import { getAlwaysOnLogPath, getLogFilePath, log, logStderr } from "../logger.js";
 import { type SlimModelEntry, readAllModelsCache } from "../providers/all-models-cache.js";
@@ -56,11 +57,14 @@ export interface AdvisorSwapConfig {
   dumpBodies?: boolean;
   models?: string[];
   collector?: string | null;
+  /** How a Claude PANEL model is signed; see advisor-auth.ts. Absent = `api-key`. */
+  auth?: AdvisorAuthMode;
 }
 
 export function loadAdvisorSwapConfig(
   cliModels?: string[],
-  cliCollector?: string | null
+  cliCollector?: string | null,
+  auth?: AdvisorAuthMode
 ): AdvisorSwapConfig {
   return {
     enabled: process.env.CLAUDISH_SWAP_ADVISOR === "1" || (cliModels?.length ?? 0) > 0,
@@ -68,6 +72,7 @@ export function loadAdvisorSwapConfig(
     dumpBodies: process.env.CLAUDISH_SWAP_ADVISOR_DUMP === "1",
     models: cliModels,
     collector: cliCollector ?? undefined,
+    ...(auth ? { auth } : {}),
   };
 }
 
@@ -1526,6 +1531,19 @@ export interface AdvisorRoute {
    * and drops a DEFAULTED one; the runtime reports it as a collector failure.
    */
   unresolvedAlias?: string;
+  /**
+   * A Claude PANEL model under `--advisor-auth subscription`: the request is a
+   * replay of the inbound Claude Code request, signed with ITS OWN auth headers
+   * (`buildSubscriptionAdvisorRequest`), so no `AdvisorApiKeys` entry is read
+   * and no metered key is needed. Never set for the collector.
+   */
+  subscription?: true;
+}
+
+/** Options for `advisorRouteFor` that come from the launch, not the spec. */
+export interface AdvisorRouteOptions {
+  /** `--advisor-auth subscription`: route Claude panel models natively, on the inbound login. */
+  subscription?: boolean;
 }
 
 /**
@@ -1590,16 +1608,29 @@ function routeOf(kind: AdvisorRouteKind, wireModel: string): AdvisorRoute {
  * - `google@`/`gemini@` (and bare `gemini-*`) → the direct Gemini API.
  * - `openai@`/`oai@` (and bare `gpt-*`) → api.openai.com with the metered
  *   OPENAI_API_KEY, never the Codex login.
- * - a Claude model (`claude-*`, `haiku`, `sonnet`, `opus`, `anthropic@`) →
- *   the Anthropic Messages API, but ONLY as the collector. A Claude panel
- *   member goes to OpenRouter, as it always did.
+ * - a Claude model (`claude-*`, `haiku`, `sonnet`, `opus`, `fable`,
+ *   `anthropic@`) → the Anthropic Messages API as the collector. A Claude panel
+ *   member goes to OpenRouter, as it always did — unless `opts.subscription`
+ *   (`--advisor-auth subscription`), which sends it to the Messages API too,
+ *   on the inbound Claude Code login (`AdvisorRoute.subscription`).
  * - everything else (e.g. `grok-4.6` → `x-ai`) → OpenRouter, the id resolved
  *   through the catalog.
  *
  * Not subscription routing: the advisor never goes through `route()`.
  */
-export function advisorRouteFor(modelSpec: string, role: "panel" | "collector"): AdvisorRoute {
+export function advisorRouteFor(
+  modelSpec: string,
+  role: "panel" | "collector",
+  opts: AdvisorRouteOptions = {}
+): AdvisorRoute {
   const parsed = parseModelSpec(modelSpec);
+
+  // `--advisor-auth subscription`: a Claude PANEL model goes to the Anthropic
+  // Messages API like the collector, but signed by the inbound request's own
+  // login. Same id resolution as the collector below.
+  if (role === "panel" && opts.subscription && isAnthropicModel(parsed)) {
+    return { ...advisorRouteFor(modelSpec, "collector"), subscription: true };
+  }
 
   if (role === "collector" && isAnthropicModel(parsed)) {
     const model = parsed.model;
@@ -1819,12 +1850,15 @@ function openRouterWireModelFor(provider: string | null, model: string): string 
  */
 export function advisorCredentialsFor(
   models: string[],
-  collector: string | null | undefined
+  collector: string | null | undefined,
+  opts: AdvisorRouteOptions = {}
 ): Set<AdvisorRouteKind> {
   const needed = new Set<AdvisorRouteKind>();
   const add = (spec: string, role: "panel" | "collector") => {
     try {
-      needed.add(advisorRouteFor(spec, role).credential);
+      const route = advisorRouteFor(spec, role, opts);
+      // A subscription route signs with the inbound login, not a resolved key.
+      if (!route.subscription) needed.add(route.credential);
     } catch {
       // reported by the call itself
     }
@@ -2000,6 +2034,79 @@ function buildAdvisorRequest(
     mergeWireHeaders(headers, shaped.headers);
   }
   return { headers, body, extractText };
+}
+
+/**
+ * What a `--advisor-auth subscription` panel call replays: the inbound Claude
+ * Code request that consumed the advisor call. Built by the decorator from the
+ * live request; never stored.
+ */
+export interface AdvisorSubscriptionReplay {
+  /** The inbound auth/version/beta headers, as Claude Code sent them. */
+  headers: {
+    authorization?: string;
+    "anthropic-version"?: string;
+    "anthropic-beta"?: string;
+  };
+  /** The inbound body AFTER the swap: its `system`, `tools` and `metadata` are replayed. */
+  request: Record<string, unknown>;
+}
+
+/** Body fields of the inbound request a subscription replay carries over unchanged. */
+const SUBSCRIPTION_REPLAY_FIELDS = ["system", "tools", "metadata"] as const;
+
+/**
+ * One `--advisor-auth subscription` panel request: the inbound Claude Code
+ * request REPLAYED onto the advisor model, the way the classifier passthrough
+ * replays the auto-mode classifier (`rewriteClassifierForNative`).
+ *
+ * Kept verbatim: Claude Code's `system` array, its `tools` (the Messages API
+ * rejects `tool_use`/`tool_result` history without them; `tool_choice: none`
+ * keeps the advisor from calling one), `metadata`, and the `authorization` /
+ * `anthropic-version` / `anthropic-beta` headers — the same set NativeHandler
+ * forwards, minus the advisor beta it strips too. Changed: `model`, the
+ * messages (the panel's own: plumbing neutralised, question stated last), a
+ * fixed output limit, no streaming. Dropped: `thinking` and every other field.
+ *
+ * Nothing is added that Claude Code did not send. A request with no usable
+ * bearer is refused here rather than sent, so the failure names the cause.
+ */
+function buildSubscriptionAdvisorRequest(
+  route: AdvisorRoute,
+  messages: any[],
+  replay: AdvisorSubscriptionReplay
+): { headers: Record<string, string>; body: any; extractText: (data: any) => string | undefined } {
+  const authorization = replay.headers.authorization?.trim();
+  if (
+    !authorization ||
+    !/^Bearer\s+\S/i.test(authorization) ||
+    /placeholder/i.test(authorization)
+  ) {
+    throw new Error(
+      "--advisor-auth subscription needs the Claude Code login on the request, and this request " +
+        "carried none (no OAuth bearer, or claudish's placeholder). Log in with `claude` " +
+        "(claude.ai subscription) and relaunch, or drop --advisor-auth subscription."
+    );
+  }
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "anthropic-version": replay.headers["anthropic-version"] || "2023-06-01",
+    authorization,
+  };
+  const beta = stripAdvisorBeta(replay.headers["anthropic-beta"]).stripped;
+  if (beta) headers["anthropic-beta"] = beta;
+
+  const body: Record<string, unknown> = {
+    model: route.wireModel,
+    max_tokens: ADVISOR_MAX_OUTPUT_TOKENS,
+    stream: false,
+    messages,
+  };
+  for (const field of SUBSCRIPTION_REPLAY_FIELDS) {
+    if (replay.request[field] !== undefined) body[field] = replay.request[field];
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) body.tool_choice = { type: "none" };
+  return { headers, body, extractText: extractAnthropicText };
 }
 
 /**
@@ -2289,12 +2396,24 @@ async function callAdvisorModel(
   modelSpec: string,
   messages: any[],
   apiKeys: AdvisorApiKeys,
-  fetchImpl?: typeof fetch
+  fetchImpl?: typeof fetch,
+  subscription?: AdvisorSubscriptionReplay
 ): Promise<AdvisorModelOutcome> {
   let plan: AdvisorFetchPlan;
   try {
-    const route = advisorRouteFor(modelSpec, "panel");
-    const { headers, body, extractText } = buildAdvisorRequest(route, messages, apiKeys);
+    const route = advisorRouteFor(modelSpec, "panel", { subscription: Boolean(subscription) });
+    if (route.unresolvedAlias) {
+      throw new Error(
+        `"${route.unresolvedAlias}" is a claudish alias, not a model id ${route.host} accepts, and ` +
+          "the model catalog holds no id for it, so claudish refused to send it. Name the model " +
+          'by its full id (for example "claude-opus-5-5"), or refresh the catalog ' +
+          "(`claudish --models-refresh`)."
+      );
+    }
+    const { headers, body, extractText } =
+      route.subscription && subscription
+        ? buildSubscriptionAdvisorRequest(route, messages, subscription)
+        : buildAdvisorRequest(route, messages, apiKeys);
     plan = {
       role: "panel",
       requestedModel: modelSpec,
@@ -2602,6 +2721,11 @@ export interface RunAdvisorCallParams {
   /** When given, the P7 records are written to its advisor log. */
   cfg?: AdvisorSwapConfig;
   /**
+   * `--advisor-auth subscription`: the inbound request to replay for Claude
+   * panel models. Absent = every panel model signs with `apiKeys` as before.
+   */
+  subscription?: AdvisorSubscriptionReplay;
+  /**
    * Test seam: HTTP client for panel and collector calls. Defaults to the
    * global fetch, resolved at call time. Production callers leave it unset;
    * it exists so tests can drive the failure paths (S4-S9) without a network.
@@ -2636,7 +2760,7 @@ export async function runAdvisorCall(params: RunAdvisorCallParams): Promise<Advi
   const panelMessages = prepareAdvisorPanelMessages(messages, toolUseId);
 
   const panel = await Promise.all(
-    models.map((m) => callAdvisorModel(m, panelMessages, apiKeys, fetchImpl))
+    models.map((m) => callAdvisorModel(m, panelMessages, apiKeys, fetchImpl, params.subscription))
   );
   const successful = panel.filter(
     (o): o is AdvisorModelOutcome & { text: string } => o.origin === "upstream"

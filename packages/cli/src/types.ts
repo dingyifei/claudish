@@ -124,6 +124,12 @@ export interface ClaudishConfig {
    * advisor-startup.ts. Launch-only, like `advisor`: never in ClaudishProfileConfig.
    */
   advisorCollectorDefaulted?: boolean;
+  /**
+   * How a Claude panel model is signed (`--advisor-auth`). `subscription` replays
+   * the inbound Claude Code request with its own OAuth login; see advisor-auth.ts.
+   * Launch-only, like `advisor`.
+   */
+  advisorAuth?: "api-key" | "subscription";
 }
 
 // Anthropic API Types

@@ -42,12 +42,14 @@
  */
 
 import { OllamaAPIFormat } from "./adapters/ollama-api-format.js";
+import { ADVISOR_AUTH_ENV_VAR, resolveAdvisorAuth } from "./advisor-auth.js";
 import type { AdvisorToolEnv } from "./claude-runner.js";
-import { ADVISOR_TOOL_ENV_VAR } from "./claude-runner.js";
+import { ADVISOR_TOOL_ENV_VAR, hasClaudeCodeLogin } from "./claude-runner.js";
 import {
   ADVISOR_AUTHORITY_PROVIDER,
   type AdvisorRoute,
   type AdvisorRouteKind,
+  type AdvisorRouteOptions,
   advisorRouteFor,
   resolveAdvisorCredential,
 } from "./handlers/native-handler-advisor.js";
@@ -92,8 +94,12 @@ export type AdvisorRole = "panel" | "collector";
  * (the only case in which it runs), while startup checks a collector the user
  * named whatever the panel size.
  */
-export function routeAdvisorModel(modelSpec: string, role: AdvisorRole): AdvisorRoute {
-  return advisorRouteFor(modelSpec, role);
+export function routeAdvisorModel(
+  modelSpec: string,
+  role: AdvisorRole,
+  opts: AdvisorRouteOptions = {}
+): AdvisorRoute {
+  return advisorRouteFor(modelSpec, role, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,13 +181,23 @@ export interface AdvisorModelStatus {
   unresolved?: string;
 }
 
-/** Pure: status of one model given its route and credential presence. */
+/** What a subscription route signs with, as the notice and refusals name it. */
+const SUBSCRIPTION_CREDENTIAL_NAME = "your Claude Code login";
+
+/**
+ * Pure: status of one model given its route and credential presence.
+ * `hasLogin` decides a `--advisor-auth subscription` route, which needs the
+ * Claude Code login rather than a resolved key.
+ */
 export function advisorModelStatus(
   model: string,
   route: AdvisorRoute,
-  presence: AdvisorCredentialPresence
+  presence: AdvisorCredentialPresence,
+  hasLogin = false
 ): AdvisorModelStatus {
-  const credentialName = advisorCredentialEnvName(route.credential);
+  const credentialName = route.subscription
+    ? SUBSCRIPTION_CREDENTIAL_NAME
+    : advisorCredentialEnvName(route.credential);
   // A key cannot make an unsendable id sendable, so this outranks presence.
   if (route.unresolvedAlias) {
     return {
@@ -198,13 +214,20 @@ export function advisorModelStatus(
   return {
     model,
     route,
-    callable: presence[route.credential] === true,
+    callable: route.subscription ? hasLogin : presence[route.credential] === true,
     credentialName,
   };
 }
 
 /** The sentence a refusal uses for a model whose credential is missing. */
 export function describeMissingCredential(s: AdvisorModelStatus): string {
+  if (s.route.subscription) {
+    return (
+      `${s.model} replays Claude Code's request on ${s.route.host} with ${SUBSCRIPTION_CREDENTIAL_NAME} ` +
+      "(--advisor-auth subscription), and none was found (no ~/.claude/.credentials.json, " +
+      "Keychain item or ANTHROPIC_AUTH_TOKEN). Log in with `claude`, or drop --advisor-auth subscription"
+    );
+  }
   const also = alsoAcceptedEnvName(s.route.credential);
   return (
     `${s.model} calls ${s.route.host} and needs ${s.credentialName}${also ? ` (or ${also})` : ""}; ` +
@@ -364,6 +387,8 @@ export interface AdvisorLaunchFacts {
   toolEnv: AdvisorToolEnv;
   panelStatus: AdvisorModelStatus[];
   collectorStatus: AdvisorModelStatus | null;
+  /** `--advisor-auth` as resolved; absent reads as `api-key`. */
+  authMode?: "api-key" | "subscription";
 }
 
 export type AdvisorStartupDecision =
@@ -415,6 +440,9 @@ export function refusalBeforeCredentials(
 }
 
 function describeRoute(s: AdvisorModelStatus): string {
+  if (s.route.subscription) {
+    return `${s.model} -> ${s.route.host} (${s.credentialName}, replays Claude Code's own request)`;
+  }
   return `${s.model} -> ${s.route.host} (${s.credentialName}, billed per token)`;
 }
 
@@ -468,8 +496,24 @@ export function decideAdvisorStartup(facts: AdvisorLaunchFacts): AdvisorStartupD
   }
 
   const notice: string[] = ["[claudish] --advisor is on for this launch"];
-  notice.push("  panel (panel calls never use a subscription):");
+  const onSubscription = facts.panelStatus.filter((s) => s.route.subscription);
+  notice.push(
+    onSubscription.length > 0
+      ? "  panel (--advisor-auth subscription: Claude models use your Claude Code login):"
+      : "  panel (panel calls never use a subscription):"
+  );
   for (const s of facts.panelStatus) notice.push(`    ${describeRoute(s)}`);
+  if (onSubscription.length > 0) {
+    notice.push(
+      "  WARNING: claudish builds these advisor requests itself and signs them with your Claude " +
+        "subscription login. Anthropic's consumer terms may not permit that use; you opted in " +
+        "with --advisor-auth subscription."
+    );
+  } else if (facts.authMode === "subscription") {
+    notice.push(
+      "  note: --advisor-auth subscription has no effect: no panel model is a Claude model"
+    );
+  }
   notice.push(`  collector:  ${collectorLine}`);
 
   const main =
@@ -510,6 +554,8 @@ export interface AdvisorStartupDeps {
   resolveCredentials: (
     needed: ReadonlySet<AdvisorCredential>
   ) => Promise<AdvisorCredentialPresence>;
+  /** Whether Claude Code has a bearer login; only asked under `--advisor-auth subscription`. */
+  hasClaudeCodeLogin?: () => boolean;
 }
 
 /**
@@ -535,6 +581,17 @@ export async function evaluateAdvisorStartup(
   const early = refusalBeforeCredentials({ childEnv, mainModels, panel });
   if (early) return { kind: "refuse", reason: early };
 
+  const auth = resolveAdvisorAuth(config, childEnv);
+  if (auth.invalidEnvValue !== undefined) {
+    return {
+      kind: "refuse",
+      reason:
+        `${ADVISOR_AUTH_ENV_VAR}=${JSON.stringify(auth.invalidEnvValue)} is not a valid advisor ` +
+        "auth mode. Use 'api-key' or 'subscription', or unset it.",
+    };
+  }
+  const routeOpts: AdvisorRouteOptions = { subscription: auth.mode === "subscription" };
+
   // A spec the routing cannot turn into a valid wire id is refused HERE, with
   // the reason the router gave. `advisorRouteFor` throws for exactly that case
   // (e.g. a subscription prefix that is not an OpenRouter vendor namespace and
@@ -544,7 +601,7 @@ export async function evaluateAdvisorStartup(
   let panelRoutes: AdvisorRoute[];
   let collectorRoute: AdvisorRoute | null;
   try {
-    panelRoutes = panel.map((m) => routeAdvisorModel(m, "panel"));
+    panelRoutes = panel.map((m) => routeAdvisorModel(m, "panel", routeOpts));
     collectorRoute = collector ? routeAdvisorModel(collector, "collector") : null;
   } catch (err) {
     return {
@@ -552,9 +609,15 @@ export async function evaluateAdvisorStartup(
       reason: err instanceof Error ? err.message : String(err),
     };
   }
-  const needed = new Set<AdvisorCredential>(panelRoutes.map((r) => r.credential));
+  // A subscription route signs with the Claude Code login, never a resolved key.
+  const needed = new Set<AdvisorCredential>(
+    panelRoutes.filter((r) => !r.subscription).map((r) => r.credential)
+  );
   if (collectorRoute) needed.add(collectorRoute.credential);
   const presence = await deps.resolveCredentials(needed);
+  const hasLogin = panelRoutes.some((r) => r.subscription)
+    ? (deps.hasClaudeCodeLogin ?? (() => hasClaudeCodeLogin({ env: childEnv })))()
+    : false;
 
   return decideAdvisorStartup({
     panel,
@@ -563,7 +626,8 @@ export async function evaluateAdvisorStartup(
     mainModels,
     childEnv,
     toolEnv,
-    panelStatus: panel.map((m, i) => advisorModelStatus(m, panelRoutes[i], presence)),
+    panelStatus: panel.map((m, i) => advisorModelStatus(m, panelRoutes[i], presence, hasLogin)),
+    authMode: auth.mode,
     collectorStatus:
       collector && collectorRoute ? advisorModelStatus(collector, collectorRoute, presence) : null,
   });
